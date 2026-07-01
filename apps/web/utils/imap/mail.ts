@@ -9,6 +9,9 @@ function createSmtpTransport(config: ImapCredentialConfig) {
     host: config.smtpHost,
     port: config.smtpPort,
     secure: config.smtpSecurity === "tls",
+    // Force the STARTTLS upgrade so we never silently fall back to plaintext
+    // when the server fails to advertise/complete it.
+    requireTLS: config.smtpSecurity === "starttls",
     auth: {
       user: config.username,
       pass: config.password,
