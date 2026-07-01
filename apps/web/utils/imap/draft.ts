@@ -53,6 +53,8 @@ export async function saveDraft(
     new Date(),
   );
 
+  if (!result) return "unknown";
+
   return result.uid
     ? String(result.uid)
     : result.uidValidity

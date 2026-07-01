@@ -28,9 +28,14 @@ coverage
 .vscode
 
 # Local env files (do not bake secrets)
+# Patterns without a leading **/ only match at the context root, so include
+# both forms to also cover apps/web/.env etc.
 *.env
 *.env.*
 !.env.example
+**/.env
+**/.env.*
+!**/.env.example
 
 # Docker
 Dockerfile*
