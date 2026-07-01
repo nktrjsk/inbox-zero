@@ -144,7 +144,6 @@ export const createMockEmailProvider = (
   isReplyInThread: vi.fn().mockReturnValue(false),
   isSentMessage: vi.fn().mockReturnValue(false),
   getThreadsFromSenderWithSubject: vi.fn().mockResolvedValue([]),
-  processHistory: vi.fn().mockResolvedValue(undefined),
   moveThreadToFolder: vi.fn().mockResolvedValue(undefined),
   getOrCreateFolderIdByName: vi.fn().mockResolvedValue("folder1"),
   sendEmailWithHtml: vi.fn().mockResolvedValue(undefined),

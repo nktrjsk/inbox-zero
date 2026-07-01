@@ -32,10 +32,8 @@ export async function listFoldersAsOutlookFolders(
   return mailboxes.map((mb) => ({
     id: mb.path,
     displayName: mb.name,
-    parentFolderId: mb.parentPath || undefined,
+    childFolders: [],
     childFolderCount: 0,
-    unreadItemCount: 0,
-    totalItemCount: 0,
   }));
 }
 
