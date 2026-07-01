@@ -1,4 +1,3 @@
-import { notFound } from "next/navigation";
 import { cookies } from "next/headers";
 import { auth } from "@/utils/auth";
 import { redirect } from "next/navigation";
@@ -31,8 +30,10 @@ export async function redirectToEmailAccountPath(
     emailAccountId = emailAccount?.id ?? null;
   }
 
+  // Signed in but no mailbox connected yet (possible with email/password
+  // signup, which doesn't create an EmailAccount) — send them to add one.
   if (!emailAccountId) {
-    notFound();
+    redirect("/accounts");
   }
 
   const redirectUrl = buildRedirectUrl(
