@@ -109,7 +109,6 @@ export async function aiProcessAssistantChat({
   const pendingRuleDeletionNames = new Set<string>();
   const memoryConversationMessages = conversationMessagesForMemory ?? messages;
   const userTimezone = user.timezone || "UTC";
-  const currentTimestamp = new Date().toISOString();
   const system = buildResolvedSystemPrompt({
     emailSendToolsEnabled,
     draftReplyActionsEnabled,
@@ -118,7 +117,6 @@ export async function aiProcessAssistantChat({
     responseSurface,
     messagingPlatform,
     userTimezone,
-    currentTimestamp,
   });
   const toolOptions = {
     email: user.email,
@@ -217,7 +215,16 @@ export async function aiProcessAssistantChat({
         ]
       : [];
 
+  // The timestamp lives in a per-turn context message, not the system prompt:
+  // a changing system prompt invalidates provider prompt caches (and forces
+  // slow local models to re-read the entire prompt) on every message.
+  const timestampContextMessage = {
+    role: "user" as const,
+    content: `[Automated time context — not a message from the user] Current timestamp: ${new Date().toISOString()}`,
+  };
+
   const contextMessages = [
+    timestampContextMessage,
     ...inboxContextMessage,
     ...(memories && memories.length > 0
       ? [
@@ -651,7 +658,6 @@ export function buildResolvedSystemPrompt({
   responseSurface,
   messagingPlatform,
   userTimezone,
-  currentTimestamp,
 }: {
   emailSendToolsEnabled: boolean;
   draftReplyActionsEnabled: boolean;
@@ -660,7 +666,6 @@ export function buildResolvedSystemPrompt({
   responseSurface: "web" | "messaging";
   messagingPlatform?: MessagingPlatform;
   userTimezone: string;
-  currentTimestamp: string;
 }) {
   const providerPolicy = getAssistantChatProvider(provider);
   const sections = [
@@ -719,7 +724,7 @@ export function buildResolvedSystemPrompt({
 - If a rule write reports stale rule state, refresh with getUserRulesAndSettings and retry from that latest state.`,
     `Provider context:
 - Current provider: ${provider}.
-- User timezone: ${userTimezone}. Current timestamp: ${currentTimestamp}. Resolve relative dates like today, tomorrow, this afternoon, Monday, or Friday from this timezone before calling calendar or inbox date-range tools.`,
+- User timezone: ${userTimezone}. The current timestamp is provided in an automated time context message in the conversation. Resolve relative dates like today, tomorrow, this afternoon, Monday, or Friday from this timezone before calling calendar or inbox date-range tools.`,
     providerPolicy.searchSyntaxPolicy,
     `Search strategy:
 - If the user names a sender or brand but the actual email address is not known yet, search first, inspect the returned \`from\` values, and then refine with \`from:\` before writing when needed.
