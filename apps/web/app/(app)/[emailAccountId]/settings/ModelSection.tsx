@@ -17,6 +17,7 @@ import {
 } from "@/utils/actions/settings.validation";
 import { Select } from "@/components/Select";
 import type { OpenAiModelsResponse } from "@/app/api/ai/models/route";
+import type { GetDefaultModelResponse } from "@/app/api/ai/default-model/route";
 import { AlertBasic, AlertError } from "@/components/Alert";
 import {
   DEFAULT_PROVIDER,
@@ -83,6 +84,10 @@ function ModelSectionForm(props: {
 
   const aiProvider = watch("aiProvider");
   const aiApiKey = watch("aiApiKey");
+
+  const { data: defaultModel } = useSWR<GetDefaultModelResponse>(
+    aiProvider === DEFAULT_PROVIDER ? "/api/ai/default-model" : null,
+  );
   const hasStoredAiApiKey =
     props.hasAiApiKey && props.aiProvider === aiProvider;
   const hasAnyApiKey = !!aiApiKey || hasStoredAiApiKey;
@@ -125,6 +130,13 @@ function ModelSectionForm(props: {
         {...register("aiProvider")}
         error={errors.aiProvider}
       />
+
+      {aiProvider === DEFAULT_PROVIDER && defaultModel?.modelName && (
+        <p className="text-sm text-muted-foreground">
+          Currently using: {getProviderLabel(defaultModel.provider)} /{" "}
+          {defaultModel.modelName}
+        </p>
+      )}
 
       {aiProvider !== DEFAULT_PROVIDER && (
         <>
@@ -196,5 +208,13 @@ function ModelSectionForm(props: {
         </Button>
       </div>
     </form>
+  );
+}
+
+function getProviderLabel(provider: string | null) {
+  if (!provider) return null;
+  return (
+    providerOptions.find((option) => option.value === provider)?.label ??
+    provider
   );
 }
