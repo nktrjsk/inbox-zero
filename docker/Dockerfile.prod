@@ -92,8 +92,10 @@ RUN rm -f /app/apps/web/.env && touch /app/apps/web/.env
 
 RUN npx prisma generate --schema=apps/web/prisma/schema.prisma
 
+# Cap the build heap so `next build` fits in memory-constrained self-host builders
+ARG BUILD_NODE_OPTIONS=""
 RUN cd /app/apps/web \
- && pnpm exec next build \
+ && NODE_OPTIONS="$BUILD_NODE_OPTIONS" pnpm exec next build \
  && cd /app \
  && pnpm --filter inbox-zero-ai deploy --legacy --prod /tmp/apps/web \
  && pnpm --filter @inboxzero/worker deploy --legacy --prod /tmp/apps/worker \
