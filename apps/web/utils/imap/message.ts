@@ -170,12 +170,10 @@ export async function findUidInSelectedMailbox(
   messageId: string,
 ): Promise<number | null> {
   if (isLegacyUidMessageId(messageId)) return Number(messageId);
-  const uids = await client.search(
-    { header: { "Message-ID": messageId } },
-    { uid: true },
-  );
-  if (!uids || uids.length === 0) return null;
-  return uids[0];
+  const uid = await searchUidByMessageIdHeader(client, messageId);
+  if (uid) return uid;
+  const scanned = await scanSelectedMailboxForMessageIds(client, [messageId]);
+  return scanned.get(messageId) ?? null;
 }
 
 export interface ImapMessageLocation {
@@ -213,20 +211,76 @@ export async function locateMessages(
       continue;
     }
 
-    const stillUnresolved: string[] = [];
+    let stillUnresolved: string[] = [];
     for (const id of unresolved) {
-      const uid = await findUidInSelectedMailbox(client, id);
+      const uid = await searchUidByMessageIdHeader(client, id);
       if (uid) {
         locations.set(id, { folder, uid });
       } else {
         stillUnresolved.push(id);
       }
     }
+
+    if (stillUnresolved.length > 0) {
+      const scanned = await scanSelectedMailboxForMessageIds(
+        client,
+        stillUnresolved,
+      );
+      for (const [id, uid] of scanned) {
+        locations.set(id, { folder, uid });
+      }
+      stillUnresolved = stillUnresolved.filter((id) => !scanned.has(id));
+    }
+
     unresolved = stillUnresolved;
     if (unresolved.length === 0) break;
   }
 
   return locations;
+}
+
+async function searchUidByMessageIdHeader(
+  client: ImapFlow,
+  messageId: string,
+): Promise<number | null> {
+  const uids = await client.search(
+    { header: { "Message-ID": messageId } },
+    { uid: true },
+  );
+  if (!uids || uids.length === 0) return null;
+  return uids[0];
+}
+
+// Bounds the fallback scan so huge folders don't make lookups unbounded;
+// anything older than this many messages per folder won't be found by scan.
+const MESSAGE_ID_SCAN_LIMIT = 2000;
+
+/**
+ * Some servers (e.g. Stalwart) don't index Message-ID for SEARCH HEADER and
+ * return no matches even for messages present in the mailbox. Fall back to
+ * scanning envelopes of the selected mailbox (newest MESSAGE_ID_SCAN_LIMIT
+ * messages) and matching Message-IDs client-side.
+ */
+async function scanSelectedMailboxForMessageIds(
+  client: ImapFlow,
+  messageIds: string[],
+): Promise<Map<string, number>> {
+  const found = new Map<string, number>();
+  const exists = typeof client.mailbox === "object" ? client.mailbox.exists : 0;
+  if (!exists) return found;
+
+  const wanted = new Set(messageIds);
+  const start = Math.max(1, exists - MESSAGE_ID_SCAN_LIMIT + 1);
+  for await (const msg of client.fetch(`${start}:*`, {
+    uid: true,
+    envelope: true,
+  })) {
+    const id = msg.envelope?.messageId?.replace(/^<|>$/g, "").trim();
+    if (id && wanted.has(id) && !found.has(id)) {
+      found.set(id, msg.uid);
+    }
+  }
+  return found;
 }
 
 /**

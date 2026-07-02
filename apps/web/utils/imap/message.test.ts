@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
-import type { FetchMessageObject } from "imapflow";
+import { describe, expect, it, vi } from "vitest";
+import type { FetchMessageObject, ImapFlow } from "imapflow";
 import {
   convertImapMessage,
+  findUidInSelectedMailbox,
   isLegacyUidMessageId,
+  locateMessages,
   parseSearchQuery,
 } from "@/utils/imap/message";
 
@@ -53,6 +55,141 @@ describe("isLegacyUidMessageId", () => {
 
   it("treats RFC822 Message-IDs as non-legacy", () => {
     expect(isLegacyUidMessageId("abc-123@mail.example.com")).toBe(false);
+  });
+});
+
+function createFakeClient(options: {
+  // header-search results keyed by Message-ID; missing key = no hits
+  headerSearchUids?: Record<string, number[]>;
+  // messages visible to an envelope scan, per folder (INBOX for single-folder tests)
+  folderMessages?: Record<string, { uid: number; messageId?: string }[]>;
+}) {
+  const folderMessages = options.folderMessages ?? {};
+  let selectedFolder = "INBOX";
+
+  const client = {
+    mailbox: { exists: folderMessages[selectedFolder]?.length ?? 0 },
+    mailboxOpen: vi.fn(async (folder: string) => {
+      selectedFolder = folder;
+      client.mailbox = { exists: folderMessages[folder]?.length ?? 0 };
+    }),
+    search: vi.fn(async (criteria: { header?: Record<string, string> }) => {
+      const messageId = criteria.header?.["Message-ID"];
+      return (messageId && options.headerSearchUids?.[messageId]) || [];
+    }),
+    fetch: vi.fn(async function* () {
+      for (const msg of folderMessages[selectedFolder] ?? []) {
+        yield {
+          uid: msg.uid,
+          envelope: { messageId: msg.messageId },
+        };
+      }
+    }),
+    list: vi.fn(async () =>
+      Object.keys(folderMessages).map((path) => ({
+        path,
+        flags: new Set<string>(),
+        specialUse: undefined,
+      })),
+    ),
+  };
+
+  return client as unknown as ImapFlow & typeof client;
+}
+
+describe("findUidInSelectedMailbox", () => {
+  it("returns the header-search hit without scanning envelopes", async () => {
+    const client = createFakeClient({
+      headerSearchUids: { "abc@example.com": [42] },
+    });
+
+    await expect(
+      findUidInSelectedMailbox(client, "abc@example.com"),
+    ).resolves.toBe(42);
+    expect(client.fetch).not.toHaveBeenCalled();
+  });
+
+  it("falls back to an envelope scan when header search finds nothing", async () => {
+    // Stalwart returns no hits for SEARCH HEADER Message-ID even when the
+    // message is in the mailbox
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          { uid: 1, messageId: "<other@example.com>" },
+          { uid: 2, messageId: "<abc@example.com>" },
+        ],
+      },
+    });
+
+    await expect(
+      findUidInSelectedMailbox(client, "abc@example.com"),
+    ).resolves.toBe(2);
+  });
+
+  it("returns null when the message is not found by search or scan", async () => {
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [{ uid: 1, messageId: "<other@example.com>" }],
+      },
+    });
+
+    await expect(
+      findUidInSelectedMailbox(client, "missing@example.com"),
+    ).resolves.toBeNull();
+  });
+
+  it("resolves legacy numeric ids without talking to the server", async () => {
+    const client = createFakeClient({});
+
+    await expect(findUidInSelectedMailbox(client, "3117")).resolves.toBe(3117);
+    expect(client.search).not.toHaveBeenCalled();
+    expect(client.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("locateMessages", () => {
+  it("resolves messages via the scan fallback across folders", async () => {
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [{ uid: 5, messageId: "<in-inbox@example.com>" }],
+        GitHub: [{ uid: 9, messageId: "<in-github@example.com>" }],
+      },
+    });
+
+    const locations = await locateMessages(client, [
+      "in-inbox@example.com",
+      "in-github@example.com",
+      "missing@example.com",
+    ]);
+
+    expect(locations.get("in-inbox@example.com")).toEqual({
+      folder: "INBOX",
+      uid: 5,
+    });
+    expect(locations.get("in-github@example.com")).toEqual({
+      folder: "GitHub",
+      uid: 9,
+    });
+    expect(locations.has("missing@example.com")).toBe(false);
+  });
+
+  it("scans each folder once for all unresolved ids", async () => {
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          { uid: 1, messageId: "<a@example.com>" },
+          { uid: 2, messageId: "<b@example.com>" },
+        ],
+      },
+    });
+
+    const locations = await locateMessages(client, [
+      "a@example.com",
+      "b@example.com",
+    ]);
+
+    expect(locations.size).toBe(2);
+    expect(client.fetch).toHaveBeenCalledTimes(1);
   });
 });
 
