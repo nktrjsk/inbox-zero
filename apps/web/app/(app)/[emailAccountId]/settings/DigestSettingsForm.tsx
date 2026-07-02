@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useForm, type SubmitHandler } from "react-hook-form";
 import { useAction } from "next-safe-action/hooks";
@@ -7,18 +8,22 @@ import { z } from "zod";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { TimePicker } from "@/components/TimePicker";
+import { Toggle } from "@/components/Toggle";
+import { MutedText } from "@/components/Typography";
 import { toastError, toastSuccess } from "@/components/Toast";
 import { getActionErrorMessage } from "@/utils/error";
 import { LoadingContent } from "@/components/LoadingContent";
 import { useRules } from "@/hooks/useRules";
+import { useEmailAccountFull } from "@/hooks/useEmailAccountFull";
 import { MultiSelectFilter } from "@/components/MultiSelectFilter";
+import { prefixPath } from "@/utils/path";
+import { updateDigestEmailDeliveryAction } from "@/utils/actions/messaging-channels";
 import {
   updateDigestItemsAction,
   updateDigestScheduleAction,
 } from "@/utils/actions/settings";
 import { ActionType } from "@/generated/prisma/enums";
 import { useAccount } from "@/providers/EmailAccountProvider";
-import type { GetDigestSettingsResponse } from "@/app/api/user/digest-settings/route";
 import type { GetDigestScheduleResponse } from "@/app/api/user/digest-schedule/route";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -59,7 +64,13 @@ const daysOfWeek = [
   { value: "6", label: "Saturday" },
 ];
 
-export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
+export function DigestSettingsForm({
+  onSuccess,
+  showChannelsHint = true,
+}: {
+  onSuccess?: () => void;
+  showChannelsHint?: boolean;
+}) {
   const { emailAccountId } = useAccount();
   const {
     data: rules,
@@ -69,21 +80,14 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
   } = useRules();
 
   const {
-    data: digestSettings,
-    isLoading: digestLoading,
-    error: digestError,
-    mutate: mutateDigestSettings,
-  } = useSWR<GetDigestSettingsResponse>("/api/user/digest-settings");
-
-  const {
     data: scheduleData,
     isLoading: scheduleLoading,
     error: scheduleError,
     mutate: mutateSchedule,
   } = useSWR<GetDigestScheduleResponse>("/api/user/digest-schedule");
 
-  const isLoading = rulesLoading || digestLoading || scheduleLoading;
-  const error = rulesError || digestError || scheduleError;
+  const isLoading = rulesLoading || scheduleLoading;
+  const error = rulesError || scheduleError;
 
   const [selectedDigestItems, setSelectedDigestItems] = useState<Set<string>>(
     new Set(),
@@ -112,7 +116,6 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
     {
       onSuccess: () => {
         mutateRules();
-        mutateDigestSettings();
       },
       onError: (error) => {
         toastError({
@@ -140,7 +143,7 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
 
   // Initialize selected items and form data from API responses
   useEffect(() => {
-    if (rules && digestSettings && scheduleData) {
+    if (rules && scheduleData) {
       const selectedItems = new Set<string>();
 
       // Add rules that have digest actions
@@ -149,11 +152,6 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
           selectedItems.add(rule.id);
         }
       });
-
-      // Add cold email if enabled
-      if (digestSettings.coldEmail) {
-        selectedItems.add("cold-emails");
-      }
 
       setSelectedDigestItems(selectedItems);
 
@@ -164,7 +162,7 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
         ...initialScheduleProps,
       });
     }
-  }, [rules, digestSettings, scheduleData, reset]);
+  }, [rules, scheduleData, reset]);
 
   // Update form when selectedDigestItems changes
   useEffect(() => {
@@ -183,9 +181,7 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
 
       // Then set selected rules to true
       data.selectedItems.forEach((itemId) => {
-        if (itemId !== "cold-emails") {
-          ruleDigestPreferences[itemId] = true;
-        }
+        ruleDigestPreferences[itemId] = true;
       });
 
       // Handle schedule update
@@ -242,10 +238,6 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
       label: rule.name,
       value: rule.id,
     })) || []),
-    {
-      label: "Cold Emails",
-      value: "cold-emails",
-    },
   ];
 
   return (
@@ -336,9 +328,65 @@ export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
             </Button>
           </form>
         </LoadingContent>
+
+        <DigestDeliveryChannels
+          emailAccountId={emailAccountId}
+          showChannelsHint={showChannelsHint}
+        />
       </div>
 
       <EmailPreview selectedDigestItems={selectedDigestItems} />
+    </div>
+  );
+}
+
+function DigestDeliveryChannels({
+  emailAccountId,
+  showChannelsHint,
+}: {
+  emailAccountId: string;
+  showChannelsHint: boolean;
+}) {
+  const { data: account, isLoading, mutate } = useEmailAccountFull();
+
+  const { execute } = useAction(
+    updateDigestEmailDeliveryAction.bind(null, emailAccountId),
+    {
+      onSuccess: () => {
+        toastSuccess({ description: "Settings saved" });
+        mutate();
+      },
+      onError: (error) => {
+        toastError({
+          description: getActionErrorMessage(error.error) ?? "Failed to update",
+        });
+      },
+    },
+  );
+
+  return (
+    <div className="space-y-2 pt-2">
+      <div className="flex items-center justify-between gap-3">
+        <Label>Send digest to email</Label>
+        <Toggle
+          name="digestSendEmail"
+          enabled={account?.digestSendEmail ?? true}
+          disabled={isLoading}
+          onChange={(sendEmail) => execute({ sendEmail })}
+        />
+      </div>
+      {showChannelsHint && (
+        <MutedText>
+          Want digests in your chat app?{" "}
+          <Link
+            href={prefixPath(emailAccountId, "/channels")}
+            className="text-foreground underline"
+          >
+            Configure on the Channels page
+          </Link>
+          .
+        </MutedText>
+      )}
     </div>
   );
 }
@@ -350,10 +398,9 @@ function EmailPreview({
 }) {
   const { data: rules } = useRules();
 
-  const selectedDigestNames = Array.from(selectedDigestItems).map((itemId) => {
-    if (itemId === "cold-emails") return "Cold Emails";
-    return rules?.find((rule) => rule.id === itemId)?.name || itemId;
-  });
+  const selectedDigestNames = Array.from(selectedDigestItems).map(
+    (itemId) => rules?.find((rule) => rule.id === itemId)?.name || itemId,
+  );
 
   const { data: htmlContent } = useSWR<string>(
     selectedDigestNames.length > 0

@@ -1,7 +1,7 @@
 import type { OutlookClient } from "@/utils/outlook/client";
 import type { Logger } from "@/utils/logger";
 import { publishArchive, type TinybirdEmailAction } from "@inboxzero/tinybird";
-import { OutlookLabel, WELL_KNOWN_FOLDERS } from "./constants";
+import { WELL_KNOWN_FOLDERS } from "./constants";
 import { extractErrorInfo, withOutlookRetry } from "@/utils/outlook/retry";
 import {
   processThreadMessagesFallback,
@@ -586,6 +586,25 @@ export async function markImportantMessage({
         .patch({
           importance: important ? "high" : "normal",
         }),
+    logger,
+  );
+}
+
+export async function markStarredMessage({
+  client,
+  messageId,
+  logger,
+}: {
+  client: OutlookClient;
+  messageId: string;
+  logger: Logger;
+}) {
+  await withOutlookRetry(
+    () =>
+      client
+        .getClient()
+        .api(`/me/messages/${messageId}`)
+        .patch({ flag: { flagStatus: "flagged" } }),
     logger,
   );
 }

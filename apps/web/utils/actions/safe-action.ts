@@ -11,8 +11,7 @@ import prisma from "@/utils/prisma";
 import { isAdmin } from "@/utils/admin";
 import { captureException, SafeError } from "@/utils/error";
 import { env } from "@/env";
-
-// TODO: take functionality from `withActionInstrumentation` and move it here (apps/web/utils/actions/middleware.ts)
+import { runWithAuditContext, setAuditContext } from "@/utils/audit/context";
 
 const baseClient = createSafeActionClient({
   defineMetadataSchema() {
@@ -74,23 +73,32 @@ const baseClient = createSafeActionClient({
   const requestId = randomUUID();
   const logger = createScopedLogger(metadata.name).with({ requestId });
 
-  after(async () => {
-    await flushLoggerSafely(logger, {
-      action: metadata.name,
+  return runWithAuditContext(
+    {
+      actorType: "anonymous",
       requestId,
-    });
-  });
+      source: metadata.name,
+    },
+    async () => {
+      after(async () => {
+        await flushLoggerSafely(logger, {
+          action: metadata.name,
+          requestId,
+        });
+      });
 
-  const result = await next({ ctx: { logger, requestId } });
+      const result = await next({ ctx: { logger, requestId } });
 
-  if (result.validationErrors) {
-    logger.warn("Action validation error", {
-      action: metadata.name,
-      validationErrors: result.validationErrors,
-    });
-  }
+      if (result.validationErrors) {
+        logger.warn("Action validation error", {
+          action: metadata.name,
+          validationErrors: result.validationErrors,
+        });
+      }
 
-  return result;
+      return result;
+    },
+  );
 });
 
 export const actionClient = baseClient
@@ -104,6 +112,7 @@ export const actionClient = baseClient
 
     const userId = session.user.id;
     const emailAccountId = bindArgsClientInputs[0] as string;
+    setAuditContext({ actorType: "user", userId });
 
     // validate user owns this email
     const emailAccount = await prisma.emailAccount.findUnique({
@@ -125,6 +134,11 @@ export const actionClient = baseClient
 
     Sentry.setTag("emailAccountId", emailAccountId);
     Sentry.setUser({ id: userId, email: userEmail });
+    setAuditContext({
+      actorType: "email_account",
+      emailAccountId,
+      userId,
+    });
 
     const logger = ctx.logger.with({
       userId,
@@ -132,21 +146,23 @@ export const actionClient = baseClient
       emailAccountId,
       provider: emailAccount.account.provider,
     });
-    logger.info("Calling action");
 
-    return withServerActionInstrumentation(metadata.name, async () => {
-      return next({
-        ctx: {
-          ...ctx,
-          logger,
-          userId,
-          userEmail,
-          session,
-          emailAccountId,
-          emailAccount,
-          provider: emailAccount.account.provider,
-        },
-      });
+    return runInstrumentedAction({
+      actionName: metadata.name,
+      logger,
+      run: () =>
+        next({
+          ctx: {
+            ...ctx,
+            logger,
+            userId,
+            userEmail,
+            session,
+            emailAccountId,
+            emailAccount,
+            provider: emailAccount.account.provider,
+          },
+        }),
     });
   });
 
@@ -165,14 +181,17 @@ export const actionClientUser = baseClient.use(
 
     const userId = session.user.id;
     const userEmail = session.user.email;
+    setAuditContext({ actorType: "user", userId });
 
     const logger = ctx.logger.with({ userId, userEmail });
-    logger.info("Calling action");
 
-    return withServerActionInstrumentation(metadata?.name, async () => {
-      return next({
-        ctx: { ...ctx, userId, userEmail, logger },
-      });
+    return runInstrumentedAction({
+      actionName: metadata.name,
+      logger,
+      run: () =>
+        next({
+          ctx: { ...ctx, userId, userEmail, logger },
+        }),
     });
   },
 );
@@ -183,11 +202,27 @@ export const adminActionClient = baseClient.use(
     if (!session?.user) throw new SafeError("Unauthorized");
     if (!isAdmin({ email: session.user.email }))
       throw new SafeError("Unauthorized");
+    setAuditContext({ actorType: "admin", userId: session.user.id });
 
     const logger = ctx.logger.with({ admin: true });
 
-    return withServerActionInstrumentation(metadata?.name, async () => {
-      return next({ ctx: { ...ctx, logger } });
+    return runInstrumentedAction({
+      actionName: metadata.name,
+      logger,
+      run: () => next({ ctx: { ...ctx, logger } }),
     });
   },
 );
+
+function runInstrumentedAction<T>({
+  actionName,
+  logger,
+  run,
+}: {
+  actionName: string;
+  logger: ReturnType<typeof createScopedLogger>;
+  run: () => Promise<T>;
+}) {
+  logger.info("Calling action");
+  return withServerActionInstrumentation(actionName, run);
+}

@@ -1,6 +1,6 @@
 import type { ParsedMessage } from "@/utils/types";
 import type { InboxZeroLabel } from "@/utils/label";
-import type { ThreadsQuery } from "@/app/api/threads/validation";
+import type { ThreadsQuery } from "@/utils/threads/validation";
 import type { OutlookFolder } from "@/utils/outlook/folders";
 import type { Attachment as MailAttachment } from "nodemailer/lib/mailer";
 
@@ -40,6 +40,11 @@ export interface EmailSignature {
   email: string;
   isDefault: boolean;
   signature: string;
+}
+
+export interface SentMessagePage {
+  messages: { id: string; threadId: string }[];
+  nextPageToken?: string;
 }
 
 export interface EmailProvider {
@@ -101,7 +106,13 @@ export interface EmailProvider {
   ): Promise<{ draftId: string }>;
   forwardEmail(
     email: ParsedMessage,
-    args: { to: string; cc?: string; bcc?: string; content?: string },
+    args: {
+      to: string;
+      cc?: string;
+      bcc?: string;
+      content?: string;
+      from?: string;
+    },
   ): Promise<void>;
   getAccessToken(): string;
   getAttachment(
@@ -167,7 +178,8 @@ export interface EmailProvider {
     maxResults: number;
     after?: Date;
     before?: Date;
-  }): Promise<{ id: string; threadId: string }[]>;
+    pageToken?: string;
+  }): Promise<SentMessagePage>;
   getSentMessages(maxResults?: number): Promise<ParsedMessage[]>;
   getSentThreadsExcluding(options: {
     excludeToEmails?: string[];
@@ -235,6 +247,8 @@ export interface EmailProvider {
     query: string;
     maxResults?: number;
     pageToken?: string;
+    readState?: "read" | "unread";
+    labelName?: string;
   }): Promise<{
     messages: ParsedMessage[];
     nextPageToken?: string;
@@ -271,6 +285,7 @@ export interface EmailProvider {
     messageId: string;
     threadId: string;
   }>;
+  starMessage(messageId: string): Promise<void>;
   toJSON(): { name: string; type: string };
   trashThread(
     threadId: string,

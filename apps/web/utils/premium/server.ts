@@ -1,9 +1,14 @@
 import { after } from "next/server";
 import prisma from "@/utils/prisma";
-import type { PremiumTier } from "@/generated/prisma/enums";
+import { ActionType, type PremiumTier } from "@/generated/prisma/enums";
 import { createScopedLogger } from "@/utils/logger";
 import { ensureEmailAccountsWatched } from "@/utils/email/watch-manager";
-import { hasTierAccess, isPremium } from "@/utils/premium";
+import {
+  getUserTier,
+  hasTierAccess,
+  isPremiumRecord,
+  premiumEntitlementSelect,
+} from "@/utils/premium";
 import { SafeError } from "@/utils/error";
 import { env } from "@/env";
 
@@ -80,6 +85,58 @@ export async function extendPremiumLemon(options: {
   });
 }
 
+export async function grantPremiumAdmin(options: {
+  userId: string;
+  tier: PremiumTier;
+  adminGrantExpiresAt: Date | null;
+  emailAccountsAccess?: number;
+}) {
+  const { userId, ...data } = options;
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { premiumId: true },
+  });
+
+  if (!user) {
+    logger.error("User not found", { userId });
+    throw new Error("User not found");
+  }
+
+  const grantData = {
+    adminGrantTier: data.tier,
+    adminGrantExpiresAt: data.adminGrantExpiresAt,
+    emailAccountsAccess: data.emailAccountsAccess,
+  };
+
+  const premiumRecord = user.premiumId
+    ? await prisma.premium.update({
+        where: { id: user.premiumId },
+        data: grantData,
+        select: { users: { select: { id: true, email: true } } },
+      })
+    : await prisma.premium.create({
+        data: {
+          users: { connect: { id: userId } },
+          admins: { connect: { id: userId } },
+          ...grantData,
+        },
+        select: { users: { select: { id: true, email: true } } },
+      });
+
+  after(() => {
+    const userIds = premiumRecord.users.map((premiumUser) => premiumUser.id);
+    ensureEmailAccountsWatched({ userIds, logger }).catch((error) => {
+      logger.error("Failed to ensure email watches after premium grant", {
+        userIds,
+        error,
+      });
+    });
+  });
+
+  return premiumRecord;
+}
+
 export async function cancelPremiumLemon({
   premiumId,
   lemonSqueezyEndsAt,
@@ -107,6 +164,26 @@ export async function cancelPremiumLemon({
   });
 }
 
+export async function assertCanUseDigests(userId: string) {
+  const hasDigestAccess = await checkHasAccess({
+    userId,
+    minimumTier: "PLUS_MONTHLY",
+  });
+
+  if (!hasDigestAccess) {
+    throw new SafeError("Digests are available on the Plus plan.", 403);
+  }
+}
+
+export async function assertCanUseDigestsIfNeeded(
+  userId: string,
+  actions: { type: ActionType }[],
+) {
+  if (actions.some((action) => action.type === ActionType.DIGEST)) {
+    await assertCanUseDigests(userId);
+  }
+}
+
 export async function checkHasAccess({
   userId,
   minimumTier,
@@ -120,28 +197,19 @@ export async function checkHasAccess({
     where: { id: userId },
     select: {
       premium: {
-        select: {
-          tier: true,
-          stripeSubscriptionStatus: true,
-          lemonSqueezyRenewsAt: true,
-        },
+        select: premiumEntitlementSelect,
       },
     },
   });
 
   if (!user) throw new SafeError("User not found");
 
-  if (
-    !isPremium(
-      user?.premium?.lemonSqueezyRenewsAt || null,
-      user?.premium?.stripeSubscriptionStatus || null,
-    )
-  ) {
+  if (!isPremiumRecord(user?.premium)) {
     return false;
   }
 
   return hasTierAccess({
-    tier: user.premium?.tier || null,
+    tier: getUserTier(user.premium),
     minimumTier,
   });
 }

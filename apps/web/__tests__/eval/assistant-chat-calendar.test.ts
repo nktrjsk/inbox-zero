@@ -18,11 +18,11 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-calendar
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-calendar
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-calendar",
+});
 const logger = createScopedLogger("eval-assistant-chat-calendar");
 
 const today = new Date();
@@ -105,13 +105,15 @@ vi.mock("@/utils/email/provider", () => ({
   createEmailProvider: vi.fn(),
 }));
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 vi.mock("@/utils/calendar/event-provider", () => ({
   createCalendarEventProviders: vi.fn().mockResolvedValue([
@@ -258,48 +260,15 @@ function isGetCalendarEventsInput(
   );
 }
 
-function hasActivateCalendar(toolCalls: RecordedToolCall[]) {
-  return toolCalls.some((tc) => {
-    if (tc.toolName !== "activateTools") return false;
-    if (!isActivateToolsInput(tc.input)) return false;
-    return tc.input.capabilities.includes("calendar");
-  });
-}
-
-function hasActivateBeforeCalendarQuery(toolCalls: RecordedToolCall[]) {
-  const activateIndex = toolCalls.findIndex(
-    (tc) =>
-      tc.toolName === "activateTools" &&
-      isActivateToolsInput(tc.input) &&
-      tc.input.capabilities.includes("calendar"),
-  );
-  const calendarIndex = toolCalls.findIndex(
-    (tc) => tc.toolName === "getCalendarEvents",
-  );
-
-  return (
-    activateIndex >= 0 && calendarIndex >= 0 && activateIndex < calendarIndex
-  );
-}
-
 function evaluateScenario(
   result: Awaited<ReturnType<typeof runAssistantChat>>,
   expectation: ScenarioExpectation,
 ) {
-  const hasActivate = hasActivateCalendar(result.toolCalls);
   const hasCalendarQuery = result.toolCalls.some(
     (tc) => tc.toolName === "getCalendarEvents",
   );
-  const correctOrder = hasActivateBeforeCalendarQuery(result.toolCalls);
 
-  if (expectation.requiresActivateCalendar && !hasActivate) return false;
   if (expectation.requiresGetCalendarEvents && !hasCalendarQuery) return false;
-  if (
-    expectation.requiresActivateCalendar &&
-    expectation.requiresGetCalendarEvents &&
-    !correctOrder
-  )
-    return false;
 
   if (expectation.expectedStartDateContains) {
     const calendarCall = getFirstMatchingToolCall(

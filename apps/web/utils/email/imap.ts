@@ -1,12 +1,13 @@
 import type { Attachment as MailAttachment } from "nodemailer/lib/mailer";
 import type { ImapFlow } from "imapflow";
-import type { ThreadsQuery } from "@/app/api/threads/validation";
+import type { ThreadsQuery } from "@/utils/threads/validation";
 import type {
   EmailFilter,
   EmailLabel,
   EmailProvider,
   EmailSignature,
   EmailThread,
+  SentMessagePage,
 } from "@/utils/email/types";
 import type { OutlookFolder } from "@/utils/outlook/folders";
 import type { InboxZeroLabel } from "@/utils/label";
@@ -427,9 +428,7 @@ export class ImapProvider implements EmailProvider {
   async getLabels(_options?: {
     includeHidden?: boolean;
   }): Promise<EmailLabel[]> {
-    return this.withConnection(async (client) => {
-      return listFolders(client);
-    });
+    return this.withConnection(async (client) => listFolders(client));
   }
 
   async getLabelById(labelId: string): Promise<EmailLabel | null> {
@@ -595,6 +594,13 @@ export class ImapProvider implements EmailProvider {
     return this.markReadThread(threadId, true);
   }
 
+  async starMessage(messageId: string): Promise<void> {
+    return this.withConnection(async (client) => {
+      await client.mailboxOpen("INBOX");
+      await client.messageFlagsAdd(messageId, ["\\Flagged"], { uid: true });
+    });
+  }
+
   async markSpam(threadId: string): Promise<void> {
     // Move to Junk/Spam folder
     const messages = await this.getThreadMessages(threadId);
@@ -690,7 +696,8 @@ export class ImapProvider implements EmailProvider {
     maxResults: number;
     after?: Date;
     before?: Date;
-  }): Promise<{ id: string; threadId: string }[]> {
+    pageToken?: string;
+  }): Promise<SentMessagePage> {
     return this.withConnection(async (client) => {
       const sentFolder = await findSentFolder(client);
       await client.mailboxOpen(sentFolder, { readOnly: true });
@@ -705,7 +712,9 @@ export class ImapProvider implements EmailProvider {
         options.maxResults,
       );
       const messages = await fetchMessagesByUids(client, uids);
-      return messages.map((m) => ({ id: m.id, threadId: m.threadId }));
+      return {
+        messages: messages.map((m) => ({ id: m.id, threadId: m.threadId })),
+      };
     });
   }
 
@@ -959,15 +968,15 @@ ${email.textHtml || email.textPlain || ""}
   // --- Folders ---
 
   async getFolders(): Promise<OutlookFolder[]> {
-    return this.withConnection(async (client) => {
-      return listFoldersAsOutlookFolders(client);
-    });
+    return this.withConnection(async (client) =>
+      listFoldersAsOutlookFolders(client),
+    );
   }
 
   async getOrCreateFolderIdByName(folderName: string): Promise<string> {
-    return this.withConnection(async (client) => {
-      return getOrCreateFolder(client, folderName);
-    });
+    return this.withConnection(async (client) =>
+      getOrCreateFolder(client, folderName),
+    );
   }
 
   // --- Filters (not supported) ---

@@ -1,4 +1,4 @@
-[![](apps/web/app/opengraph-image.png)](https://www.getinboxzero.com)
+[![](apps/web/app/opengraph-image.jpg)](https://www.getinboxzero.com)
 
 <p align="center">
   <a href="https://www.getinboxzero.com">
@@ -24,6 +24,8 @@
 
 <a href="https://trendshift.io/repositories/6400" target="_blank"><img src="https://trendshift.io/api/badge/repositories/6400" alt="elie222%2Finbox-zero | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
+[![Sponsor](https://readme.cash/i/hg3bchcqpo.svg)](https://readme.cash/c/hg3bchcqpo)
+
 [![Vercel OSS Program](https://vercel.com/oss/program-badge.svg)](https://vercel.com/oss)
 
 </div>
@@ -36,7 +38,7 @@ To help you spend less time in your inbox, so you can focus on what matters most
 
 - **IMAP/SMTP Support:** Connect any standard IMAP mailbox - Amazon WorkMail, Fastmail, Yahoo, iCloud, ProtonMail Bridge, self-hosted servers. No Google or Microsoft account needed.
 - **AI Personal Assistant:** Organizes your inbox and pre-drafts replies in your tone and style.
-- **Cursor Rules for email:** Explain in plain English how your AI should handle your inbox.
+- **AI Rules for email:** Explain in plain English how your AI should handle your inbox.
 - **Reply Zero:** Track emails to reply to and those awaiting responses.
 - **Bulk Unsubscriber:** One-click unsubscribe and archive emails you never read.
 - **Bulk Archiver:** Clean up your inbox by bulk archiving old emails.
@@ -49,10 +51,6 @@ To help you spend less time in your inbox, so you can focus on what matters most
 
 Learn more in our [docs](https://docs.getinboxzero.com).
 
-### Cursor plugin (API CLI)
-
-This repo is packaged as a [Cursor plugin](https://cursor.com/docs/reference/plugins) (`.cursor-plugin/plugin.json`): install from the directory to use the **inbox-zero-api** skill and agent. Skill source lives in [`clawhub/inbox-zero-api`](clawhub/inbox-zero-api) (same as OpenClaw); `skills/inbox-zero-api` is a symlink for discovery. Requires [`@inbox-zero/api`](https://www.getinboxzero.com/api-reference/cli); set `INBOX_ZERO_API_KEY` for authenticated CLI commands (e.g. rules, stats). `openapi --json` does not need a key.
-
 ## Feature Screenshots
 
 | ![AI Assistant](.github/screenshots/email-assistant.png) |        ![Reply Zero](.github/screenshots/reply-zero.png)        |
@@ -63,7 +61,7 @@ This repo is packaged as a [Cursor plugin](https://cursor.com/docs/reference/plu
 
 ## Demo Video
 
-[![Inbox Zero demo](/video-thumbnail.png)](http://www.youtube.com/watch?v=hfvKvTHBjG0)
+[![Inbox Zero demo](https://img.youtube.com/vi/UusnveLKwWM/maxresdefault.jpg)](https://youtu.be/UusnveLKwWM)
 
 ## Built with
 

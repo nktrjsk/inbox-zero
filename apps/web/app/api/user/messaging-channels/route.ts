@@ -4,9 +4,14 @@ import { withEmailAccount } from "@/utils/middleware";
 import { env } from "@/env";
 import type { MessagingProvider } from "@/generated/prisma/enums";
 import { MessagingRoutePurpose } from "@/generated/prisma/enums";
+import {
+  isMessagingChannelOperational,
+  isOperationalSlackChannel,
+} from "@/utils/messaging/channel-validity";
 import { getMessagingRouteSummary } from "@/utils/messaging/routes";
 import { listChannels } from "@/utils/messaging/providers/slack/channels";
 import { createSlackClient } from "@/utils/messaging/providers/slack/client";
+import { isTeamsBotConfigured } from "@/utils/messaging/chat-sdk/teams-config";
 
 export type GetMessagingChannelsResponse = Awaited<ReturnType<typeof getData>>;
 
@@ -53,27 +58,51 @@ async function getData({ emailAccountId }: { emailAccountId: string }) {
 
   return {
     channels: channels.map(
-      ({ routes, providerUserId, accessToken: _accessToken, ...channel }) => ({
-        ...channel,
-        canSendAsDm: channel.provider === "SLACK" && Boolean(providerUserId),
-        destinations: {
-          ruleNotifications: getMessagingRouteSummary(
-            routes,
-            MessagingRoutePurpose.RULE_NOTIFICATIONS,
-            slackTargetNamesByChannelId[channel.id],
-          ),
-          meetingBriefs: getMessagingRouteSummary(
-            routes,
-            MessagingRoutePurpose.MEETING_BRIEFS,
-            slackTargetNamesByChannelId[channel.id],
-          ),
-          documentFilings: getMessagingRouteSummary(
-            routes,
-            MessagingRoutePurpose.DOCUMENT_FILINGS,
-            slackTargetNamesByChannelId[channel.id],
-          ),
-        },
-      }),
+      ({ routes, providerUserId, accessToken: _accessToken, ...channel }) => {
+        const isConnected = isMessagingChannelOperational({
+          ...channel,
+          providerUserId,
+          accessToken: _accessToken,
+        });
+
+        return {
+          ...channel,
+          isConnected,
+          canSendAsDm: channel.provider === "SLACK" && isConnected,
+          destinations: {
+            ruleNotifications: getMessagingRouteSummary(
+              routes,
+              MessagingRoutePurpose.RULE_NOTIFICATIONS,
+              slackTargetNamesByChannelId[channel.id],
+            ),
+            scheduledCheckIns: getMessagingRouteSummary(
+              routes,
+              MessagingRoutePurpose.SCHEDULED_CHECK_INS,
+              slackTargetNamesByChannelId[channel.id],
+            ),
+            meetingBriefs: getMessagingRouteSummary(
+              routes,
+              MessagingRoutePurpose.MEETING_BRIEFS,
+              slackTargetNamesByChannelId[channel.id],
+            ),
+            documentFilings: getMessagingRouteSummary(
+              routes,
+              MessagingRoutePurpose.DOCUMENT_FILINGS,
+              slackTargetNamesByChannelId[channel.id],
+            ),
+            digests: getMessagingRouteSummary(
+              routes,
+              MessagingRoutePurpose.DIGESTS,
+              slackTargetNamesByChannelId[channel.id],
+            ),
+            followUps: getMessagingRouteSummary(
+              routes,
+              MessagingRoutePurpose.FOLLOW_UPS,
+              slackTargetNamesByChannelId[channel.id],
+            ),
+          },
+        };
+      },
     ),
     availableProviders: getAvailableProviders(),
   };
@@ -82,8 +111,7 @@ async function getData({ emailAccountId }: { emailAccountId: string }) {
 function getAvailableProviders(): MessagingProvider[] {
   const providers: MessagingProvider[] = [];
   if (env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET) providers.push("SLACK");
-  if (env.TEAMS_BOT_APP_ID && env.TEAMS_BOT_APP_PASSWORD)
-    providers.push("TEAMS");
+  if (isTeamsBotConfigured()) providers.push("TEAMS");
   if (env.TELEGRAM_BOT_TOKEN) providers.push("TELEGRAM");
   return providers;
 }
@@ -94,21 +122,15 @@ async function getSlackTargetNames(
     provider: MessagingProvider;
     isConnected: boolean;
     accessToken: string | null;
+    providerUserId: string | null;
   }>,
 ) {
-  const targetNamesByChannelId = Object.fromEntries(
-    channels.map((channel) => [channel.id, {} as Record<string, string>]),
-  );
+  const targetNamesByChannelId: Record<string, Record<string, string>> = {};
 
-  const slackChannels = channels.filter(
-    (channel) =>
-      channel.provider === "SLACK" &&
-      channel.isConnected &&
-      Boolean(channel.accessToken),
-  );
   const channelIdsByToken = new Map<string, string[]>();
-  for (const channel of slackChannels) {
-    const accessToken = channel.accessToken!;
+  for (const channel of channels.filter(isOperationalSlackChannel)) {
+    const accessToken = channel.accessToken;
+    if (!accessToken) continue;
     const channelIds = channelIdsByToken.get(accessToken) ?? [];
     channelIds.push(channel.id);
     channelIdsByToken.set(accessToken, channelIds);
@@ -127,7 +149,7 @@ async function getSlackTargetNames(
             targetNamesByChannelId[channelId] = targetNames;
           }
         } catch {
-          // Empty objects were already initialized; nothing to do.
+          // Leave channelId unset so callers fall back to the raw target id.
         }
       },
     ),

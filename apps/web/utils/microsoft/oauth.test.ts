@@ -33,6 +33,9 @@ describe("microsoft oauth helpers", () => {
     expect(oauth.getMicrosoftGraphUrl("/me")).toBe(
       "https://graph.microsoft.com/v1.0/me",
     );
+    expect(oauth.getMicrosoftOidcUserInfoUrl()).toBe(
+      "https://graph.microsoft.com/oidc/userinfo",
+    );
     expect(oauth.getMicrosoftGraphClientOptions("token")).toEqual({});
   });
 
@@ -57,6 +60,9 @@ describe("microsoft oauth helpers", () => {
     );
     expect(oauth.getMicrosoftGraphUrl("me/photo/$value")).toBe(
       "http://localhost:4003/v1.0/me/photo/$value",
+    );
+    expect(oauth.getMicrosoftOidcUserInfoUrl()).toBe(
+      "http://localhost:4003/oidc/userinfo",
     );
     expect(oauth.getMicrosoftGraphClientOptions("emulator-token")).toEqual({
       baseUrl: "http://localhost:4003/",
@@ -96,6 +102,127 @@ describe("microsoft oauth helpers", () => {
       },
     );
   });
+
+  it("retries Microsoft token requests with IPv4 after an IPv6 reachability failure", async () => {
+    const oauth = await importMicrosoftOauthModule();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(createFetchFailedError("ENETUNREACH"))
+      .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await oauth.requestMicrosoftToken({
+      client_id: "client-id",
+      grant_type: "refresh_token",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    );
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        dispatcher: expect.any(Object),
+        method: "POST",
+      }),
+    );
+    await expect(response.json()).resolves.toEqual({});
+  });
+
+  it("returns the Microsoft user profile and derived email", async () => {
+    const oauth = await importMicrosoftOauthModule();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: "user-id",
+        userPrincipalName: "user@example.com",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      oauth.fetchMicrosoftUserProfile("access-token"),
+    ).resolves.toEqual({
+      profile: {
+        id: "user-id",
+        userPrincipalName: "user@example.com",
+      },
+      email: "user@example.com",
+    });
+  });
+
+  it("returns Microsoft OIDC user info with the Better Auth account subject", async () => {
+    const oauth = await importMicrosoftOauthModule();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        sub: "better-auth-subject",
+        email: "user@example.com",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      oauth.fetchMicrosoftOidcUserInfo("access-token"),
+    ).resolves.toEqual({
+      sub: "better-auth-subject",
+      email: "user@example.com",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://graph.microsoft.com/oidc/userinfo",
+      {
+        headers: {
+          Authorization: "Bearer access-token",
+        },
+      },
+    );
+  });
+
+  it("throws when Microsoft OIDC user info is missing the subject", async () => {
+    const oauth = await importMicrosoftOauthModule();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ email: "user@example.com" }),
+      }),
+    );
+
+    await expect(
+      oauth.fetchMicrosoftOidcUserInfo("access-token"),
+    ).rejects.toThrow("OIDC user info missing required subject");
+  });
+
+  it("throws a typed error when the Microsoft OIDC user info request fails", async () => {
+    const oauth = await importMicrosoftOauthModule();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: false, status: 503 }),
+    );
+
+    await expect(
+      oauth.fetchMicrosoftOidcUserInfo("access-token"),
+    ).rejects.toMatchObject({
+      message: "Failed to fetch Microsoft OIDC user info",
+      status: 503,
+    });
+  });
+
+  it("throws a typed error when the Microsoft profile request fails", async () => {
+    const oauth = await importMicrosoftOauthModule();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: false, status: 503 }),
+    );
+
+    await expect(
+      oauth.fetchMicrosoftUserProfile("access-token"),
+    ).rejects.toMatchObject({
+      message: "Failed to fetch Microsoft user profile",
+      status: 503,
+    });
+  });
 });
 
 async function importMicrosoftOauthModule(
@@ -113,4 +240,15 @@ async function importMicrosoftOauthModule(
   }));
 
   return import("./oauth");
+}
+
+function createFetchFailedError(code: string) {
+  const connectError = Object.assign(new Error(`connect ${code}`), { code });
+  const error = new TypeError("fetch failed") as TypeError & {
+    cause: AggregateError;
+  };
+
+  error.cause = new AggregateError([connectError], `connect ${code}`);
+
+  return error;
 }

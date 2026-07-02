@@ -2,9 +2,11 @@ import type { ModelMessage } from "ai";
 import { afterAll, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   captureAssistantChatToolCalls,
-  getLastMatchingToolCall,
+  getLastRuleConditionUpdate,
   summarizeRecordedToolCalls,
   type RecordedToolCall,
+  isUpdateRuleConditionsInput,
+  isUpdateRuleInput,
 } from "@/__tests__/eval/assistant-chat-eval-utils";
 import {
   describeEvalMatrix,
@@ -28,11 +30,11 @@ import { createScopedLogger } from "@/utils/logger";
 // pnpm test-ai eval/assistant-chat-rule-editing
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-rule-editing
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-rule-editing-condition-updates",
+});
 const logger = createScopedLogger(
   "eval-assistant-chat-rule-editing-condition-updates",
 );
@@ -112,13 +114,15 @@ vi.mock("@/utils/senders/unsubscribe", () => ({
 
 vi.mock("@/utils/prisma");
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 describe.runIf(shouldRunEval)(
   "Eval: assistant chat rule editing condition updates",
@@ -164,15 +168,7 @@ describe.runIf(shouldRunEval)(
               ],
             });
 
-            const updateCall = getLastMatchingToolCall(
-              toolCalls,
-              "updateRuleConditions",
-              isUpdateRuleConditionsInput,
-            )?.input;
-            const updateCallIndex = getLastToolCallIndex(
-              toolCalls,
-              "updateRuleConditions",
-            );
+            const updateCall = getLastRuleConditionUpdate(toolCalls);
             const judgeResult = updateCall
               ? await judgeEvalOutput({
                   input:
@@ -192,7 +188,7 @@ describe.runIf(shouldRunEval)(
               !!updateCall &&
               !!judgeResult?.pass &&
               updateCall.ruleName === "To Reply" &&
-              hasRuleReadBeforeUpdate(toolCalls, updateCallIndex) &&
+              hasRuleReadBeforeUpdate(toolCalls, updateCall.index) &&
               !toolCalls.some(
                 (toolCall) => toolCall.toolName === "createRule",
               ) &&
@@ -244,30 +240,6 @@ async function runAssistantChat({
   };
 }
 
-type UpdateRuleConditionsInput = {
-  ruleName: string;
-  condition: {
-    aiInstructions?: string | null;
-  };
-};
-
-function isUpdateRuleConditionsInput(
-  input: unknown,
-): input is UpdateRuleConditionsInput {
-  if (!input || typeof input !== "object") return false;
-
-  const value = input as {
-    ruleName?: unknown;
-    condition?: unknown;
-  };
-
-  return (
-    typeof value.ruleName === "string" &&
-    !!value.condition &&
-    typeof value.condition === "object"
-  );
-}
-
 function summarizeToolCall(toolCall: RecordedToolCall) {
   if (isUpdateRuleConditionsInput(toolCall.input)) {
     return (
@@ -276,6 +248,17 @@ function summarizeToolCall(toolCall: RecordedToolCall) {
       toolCall.input.ruleName +
       ", aiInstructions=" +
       truncate(toolCall.input.condition.aiInstructions) +
+      ")"
+    );
+  }
+
+  if (isUpdateRuleInput(toolCall.input)) {
+    return (
+      toolCall.toolName +
+      "(ruleName=" +
+      toolCall.input.ruleName +
+      ", aiInstructions=" +
+      truncate(toolCall.input.updates.condition?.aiInstructions) +
       ")"
     );
   }

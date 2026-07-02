@@ -3,15 +3,43 @@ import { cookies } from "next/headers";
 import { createReferral } from "@/utils/referral/referral-code";
 import { captureException } from "@/utils/error";
 import { saveTokens } from "@/utils/auth/save-tokens";
-import { handleLinkAccount, handleReferralOnSignUp } from "@/utils/auth";
+import { createOutlookClient } from "@/utils/outlook/client";
+import {
+  betterAuthConfig,
+  handleLinkAccount,
+  handleReferralOnSignUp,
+} from "@/utils/auth";
 import prisma from "@/utils/__mocks__/prisma";
-import { clearSpecificErrorMessages } from "@/utils/error-messages";
+import { clearAccountDisconnectedErrorIfResolved } from "@/utils/error-messages";
 
-vi.mock("server-only", () => ({}));
+vi.mock("better-auth", () => {
+  class APIError extends Error {
+    body?: { code?: string; message?: string };
+
+    constructor(_status: string, body?: { code?: string; message?: string }) {
+      super(body?.message);
+      this.body = body;
+    }
+
+    static from(status: string, body?: { code?: string; message?: string }) {
+      return new APIError(status, body);
+    }
+  }
+
+  return {
+    APIError,
+    betterAuth: vi.fn((options: unknown) => ({
+      api: {
+        getSession: vi.fn(),
+      },
+      options,
+    })),
+  };
+});
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/error-messages", () => ({
   addUserErrorMessage: vi.fn().mockResolvedValue(undefined),
-  clearSpecificErrorMessages: vi.fn().mockResolvedValue(undefined),
+  clearAccountDisconnectedErrorIfResolved: vi.fn().mockResolvedValue(undefined),
   ErrorType: {
     ACCOUNT_DISCONNECTED: "Account disconnected",
   },
@@ -23,6 +51,9 @@ vi.mock("@googleapis/gmail", () => ({
   auth: {
     OAuth2: vi.fn(),
   },
+}));
+vi.mock("@/utils/outlook/client", () => ({
+  createOutlookClient: vi.fn(),
 }));
 vi.mock("@/utils/encryption", () => ({
   encryptToken: vi.fn((t) => t),
@@ -39,6 +70,14 @@ vi.mock("@/utils/referral/referral-code", () => ({
 vi.mock("@/utils/error", () => ({
   captureException: vi.fn(),
 }));
+
+describe("betterAuthConfig", () => {
+  it("does not trust Microsoft for implicit social account linking", () => {
+    expect(
+      (betterAuthConfig as any).options.account.accountLinking.trustedProviders,
+    ).toEqual(["google", "apple"]);
+  });
+});
 
 describe("handleReferralOnSignUp", () => {
   const mockCookies = vi.mocked(cookies);
@@ -145,12 +184,77 @@ describe("saveTokens", () => {
         }),
       }),
     );
-    expect(clearSpecificErrorMessages).toHaveBeenCalledWith(
+    expect(clearAccountDisconnectedErrorIfResolved).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user_1",
-        errorTypes: ["Account disconnected"],
       }),
     );
+  });
+
+  it("uses optimistic concurrency when saving refreshed email account tokens", async () => {
+    const expectedExpiresAt = 1_700_000_000_000;
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      userId: "user_1",
+    } as any);
+    prisma.account.updateMany.mockResolvedValue({ count: 1 } as any);
+
+    const result = await saveTokens({
+      emailAccountId: "ea_1",
+      tokens: {
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_at: 123_456_789,
+      },
+      accountRefreshToken: "old-refresh",
+      provider: "google",
+      expectedExpiresAt,
+    });
+
+    expect(result).toEqual({ status: "saved" });
+    expect(prisma.account.updateMany).toHaveBeenCalledWith({
+      where: {
+        provider: "google",
+        emailAccount: { id: "ea_1" },
+        expires_at: {
+          gte: new Date(expectedExpiresAt),
+          lt: new Date(expectedExpiresAt + 1),
+        },
+      },
+      data: expect.objectContaining({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_at: new Date(123_456_789_000),
+        disconnectedAt: null,
+      }),
+    });
+    expect(prisma.emailAccount.update).not.toHaveBeenCalled();
+    expect(clearAccountDisconnectedErrorIfResolved).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "user_1",
+      }),
+    );
+  });
+
+  it("reports a conflict instead of overwriting newer email account tokens", async () => {
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      userId: "user_1",
+    } as any);
+    prisma.account.updateMany.mockResolvedValue({ count: 0 } as any);
+
+    const result = await saveTokens({
+      emailAccountId: "ea_1",
+      tokens: {
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_at: 123_456_789,
+      },
+      accountRefreshToken: "old-refresh",
+      provider: "google",
+      expectedExpiresAt: 1_700_000_000_000,
+    });
+
+    expect(result).toEqual({ status: "conflict" });
+    expect(clearAccountDisconnectedErrorIfResolved).not.toHaveBeenCalled();
   });
 
   it("clears disconnectedAt and error messages when saving tokens via providerAccountId", async () => {
@@ -180,10 +284,9 @@ describe("saveTokens", () => {
         }),
       }),
     );
-    expect(clearSpecificErrorMessages).toHaveBeenCalledWith(
+    expect(clearAccountDisconnectedErrorIfResolved).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: "user_1",
-        errorTypes: ["Account disconnected"],
       }),
     );
   });
@@ -206,7 +309,7 @@ describe("handleLinkAccount", () => {
 
     expect(prisma.emailAccount.findUnique).not.toHaveBeenCalled();
     expect(prisma.emailAccount.upsert).not.toHaveBeenCalled();
-    expect(clearSpecificErrorMessages).not.toHaveBeenCalled();
+    expect(clearAccountDisconnectedErrorIfResolved).not.toHaveBeenCalled();
   });
 
   it("still requires an access token for mailbox providers", async () => {
@@ -220,5 +323,36 @@ describe("handleLinkAccount", () => {
     ).rejects.toThrow("Missing access token during account linking.");
 
     expect(prisma.emailAccount.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("raises a Better Auth error code when the mailbox belongs to another user", async () => {
+    vi.mocked(createOutlookClient).mockReturnValue({
+      getUserProfile: vi.fn().mockResolvedValue({
+        mail: "user@example.com",
+        displayName: "Test User",
+      }),
+      getUserPhoto: vi.fn().mockResolvedValue(null),
+    } as any);
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      id: "email_account_1",
+      userId: "existing_user",
+      accountId: "existing_account",
+      account: { provider: "microsoft" },
+    } as any);
+
+    await expect(
+      handleLinkAccount({
+        id: "account_1",
+        userId: "new_user",
+        providerId: "microsoft",
+        accessToken: "access_token",
+      } as any),
+    ).rejects.toMatchObject({
+      message: "email_already_linked",
+      body: {
+        code: "email_already_linked",
+        message: "email_already_linked",
+      },
+    });
   });
 });

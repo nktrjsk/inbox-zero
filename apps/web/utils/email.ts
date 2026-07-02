@@ -76,6 +76,30 @@ export function isSameEmailAddress(left: string, right: string) {
   );
 }
 
+export function messageRepliesToSourceSender({
+  sentMessage,
+  sourceMessage,
+}: {
+  sentMessage: Pick<ParsedMessage, "headers">;
+  sourceMessage: Pick<ParsedMessage, "headers">;
+}) {
+  const replyTargetEmails = extractEmailAddresses(
+    sourceMessage.headers["reply-to"] || sourceMessage.headers.from,
+  ).map((email) => email.toLowerCase());
+  if (!replyTargetEmails.length) return null;
+
+  const recipientEmails = [
+    ...extractEmailAddresses(sentMessage.headers.to),
+    ...extractEmailAddresses(sentMessage.headers.cc ?? ""),
+    ...extractEmailAddresses(sentMessage.headers.bcc ?? ""),
+  ].map((email) => email.toLowerCase());
+
+  if (!recipientEmails.length) return null;
+
+  const recipientEmailSet = new Set(recipientEmails);
+  return replyTargetEmails.some((email) => recipientEmailSet.has(email));
+}
+
 export function isValidEmail(email: string): boolean {
   return emailSchema.safeParse(email).success;
 }
@@ -92,6 +116,22 @@ export function normalizeEmailAddress(email: string) {
   // Remove all dots and whitespace from local part
   const normalizedLocal = localPart.trim().replace(/[\s.]+/g, "");
   return `${normalizedLocal}@${domain}`;
+}
+
+export function extractUniqueEmailAddresses(
+  emails: string[],
+  options?: { lowercase?: boolean },
+) {
+  const lowercase = options?.lowercase ?? false;
+
+  return [
+    ...new Set(
+      emails
+        .map((email) => extractEmailAddress(email))
+        .filter(Boolean)
+        .map((email) => (lowercase ? email.toLowerCase() : email)),
+    ),
+  ];
 }
 
 // Converts "Name <hey@domain.com>" to "domain.com"
@@ -138,6 +178,26 @@ export function formatEmailWithName(
   return `${name} <${address}>`;
 }
 
+export function getNewsletterSenderDisplayName({
+  email,
+  fromName,
+  minFromName,
+  maxFromName,
+}: {
+  email: string;
+  fromName?: string | null;
+  minFromName?: string | null;
+  maxFromName?: string | null;
+}) {
+  const hasMultipleDisplayNames =
+    !!minFromName && !!maxFromName && minFromName !== maxFromName;
+  const domain = extractDomainFromEmail(email);
+
+  if (hasMultipleDisplayNames && domain) return domain;
+
+  return fromName?.trim() || "";
+}
+
 // Public email providers where we should search by full email address
 // For company domains, we search by domain to catch emails from different people at same company
 export const PUBLIC_EMAIL_DOMAINS = new Set([
@@ -157,6 +217,10 @@ export const PUBLIC_EMAIL_DOMAINS = new Set([
   "mail.com",
 ]);
 
+export function isPublicEmailDomain(domain: string): boolean {
+  return PUBLIC_EMAIL_DOMAINS.has(domain.trim().toLowerCase());
+}
+
 // Returns the search term to use when checking for previous communications
 // For public email providers (gmail, yahoo, etc), returns the full email address
 // For company domains, returns just the domain to catch emails from different people at same company
@@ -164,7 +228,7 @@ export function getSearchTermForSender(email: string): string {
   const domain = extractDomainFromEmail(email);
   if (!domain) return email;
 
-  return PUBLIC_EMAIL_DOMAINS.has(domain.toLowerCase())
+  return isPublicEmailDomain(domain)
     ? extractEmailAddress(email) || email
     : domain;
 }

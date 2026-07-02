@@ -1,3 +1,4 @@
+import { NextResponse, after } from "next/server";
 import {
   convertToModelMessages,
   createUIMessageStream,
@@ -5,8 +6,8 @@ import {
   type UIMessage,
 } from "ai";
 import { withEmailAccount } from "@/utils/middleware";
+import { FIRST_TIME_EVENTS, trackFirstTimeEvent } from "@/utils/posthog";
 import { getEmailAccountWithAi } from "@/utils/user/get";
-import { NextResponse } from "next/server";
 import { aiProcessAssistantChat } from "@/utils/ai/assistant/chat";
 import type { Logger } from "@/utils/logger";
 import prisma from "@/utils/prisma";
@@ -32,6 +33,7 @@ import {
   saveLastSeenRulesRevision,
 } from "@/utils/ai/assistant/chat-seen-rules-revision";
 import { getToolFailureWarning } from "@/utils/ai/assistant/chat-response-guard";
+import { flushLoggerSafely } from "@/utils/logger-flush";
 
 export const maxDuration = 120;
 
@@ -40,7 +42,12 @@ export const POST = withEmailAccount("chat", async (request) => {
 
   const user = await getEmailAccountWithAi({ emailAccountId });
 
-  if (!user) return NextResponse.json({ error: "Not authenticated" });
+  if (!user) {
+    return NextResponse.json(
+      { error: "Email account not found" },
+      { status: 404 },
+    );
+  }
 
   const inboxStatsPromise = getInboxStatsForChatContext({
     emailAccountId,
@@ -51,7 +58,7 @@ export const POST = withEmailAccount("chat", async (request) => {
   const json = await request.json();
   const { data, error } = assistantInputSchema.safeParse(json);
 
-  if (error) return NextResponse.json({ error: error.errors }, { status: 400 });
+  if (error) return NextResponse.json({ error: error.issues }, { status: 400 });
 
   const chat =
     (await getChatWithCompactions(data.id)) ||
@@ -75,6 +82,13 @@ export const POST = withEmailAccount("chat", async (request) => {
     );
   }
 
+  if (chat.deletedAt) {
+    return NextResponse.json(
+      { error: "This chat has been deleted." },
+      { status: 410 },
+    );
+  }
+
   const chatHasHistory =
     chat.messages.length > 0 || chat.compactions.length > 0;
   const { message, context, inlineActions } = data;
@@ -88,6 +102,13 @@ export const POST = withEmailAccount("chat", async (request) => {
     role: "user",
     parts: message.parts,
   });
+
+  after(() =>
+    trackFirstTimeEvent({
+      emailAccountId,
+      event: FIRST_TIME_EVENTS.FIRST_CHAT_MESSAGE,
+    }),
+  );
 
   const latestCompaction = chat.compactions[0];
 
@@ -213,7 +234,6 @@ export const POST = withEmailAccount("chat", async (request) => {
   try {
     const inboxStats = await inboxStatsPromise;
     let seenRulesRevision: number | null = null;
-
     const result = await aiProcessAssistantChat({
       messages: modelMessages,
       conversationMessagesForMemory: conversationModelMessages,
@@ -250,6 +270,10 @@ export const POST = withEmailAccount("chat", async (request) => {
         const warning = getToolFailureWarning(responseMessage);
         if (!warning) return;
 
+        request.logger.warn("Assistant chat completed with tool failures", {
+          chatId: chat.id,
+        });
+
         const warningPartId = crypto.randomUUID();
         writer.write({ type: "text-start", id: warningPartId });
         writer.write({
@@ -260,7 +284,20 @@ export const POST = withEmailAccount("chat", async (request) => {
         writer.write({ type: "text-end", id: warningPartId });
       },
       onFinish: async ({ messages }) => {
-        await saveChatMessages(messages, chat.id, request.logger);
+        const persistableMessages = messages.filter(
+          isPersistableAssistantMessage,
+        );
+
+        if (persistableMessages.length < messages.length) {
+          request.logger.error("Skipping empty assistant chat messages", {
+            chatId: chat.id,
+            skippedCount: messages.length - persistableMessages.length,
+          });
+        }
+
+        if (persistableMessages.length > 0) {
+          await saveChatMessages(persistableMessages, chat.id, request.logger);
+        }
 
         if (seenRulesRevision != null) {
           await saveLastSeenRulesRevision({
@@ -269,12 +306,23 @@ export const POST = withEmailAccount("chat", async (request) => {
             logger: request.logger,
           });
         }
+
+        await flushLoggerSafely(request.logger, {
+          action: "assistant-chat",
+          flushReason: "chat-stream-finish",
+          chatId: chat.id,
+        });
       },
     });
 
     return createUIMessageStreamResponse({ stream });
   } catch (error) {
     request.logger.error("Error in assistant chat", { error });
+    await flushLoggerSafely(request.logger, {
+      action: "assistant-chat",
+      flushReason: "chat-error",
+      chatId: chat.id,
+    });
     return NextResponse.json(
       { error: "Error in assistant chat" },
       { status: 500 },
@@ -303,7 +351,7 @@ async function createNewChat({
     return newChat;
   } catch (error) {
     logger.error("Failed to create new chat", { error, emailAccountId });
-    return undefined;
+    return;
   }
 }
 
@@ -327,10 +375,31 @@ async function saveChatMessages(
   logger: Logger,
 ) {
   try {
-    return prisma.chatMessage.createMany({
-      data: mapUiMessagesToChatMessageRows(messages, chatId),
+    const rows = mapUiMessagesToChatMessageRows(messages, chatId);
+    const assistantMessages = messages.filter(
+      (message) => message.role === "assistant",
+    );
+
+    logger.info("Persisting chat messages", {
+      chatId,
+      messageCount: messages.length,
+      assistantMessageIds: assistantMessages.map((message) => message.id),
+      assistantToolCallIds: assistantMessages.flatMap((message) =>
+        getToolCallIdsFromUiParts(message.parts),
+      ),
+    });
+
+    const result = await prisma.chatMessage.createMany({
+      data: rows,
       skipDuplicates: true,
     });
+
+    logger.info("Persisted chat messages", {
+      chatId,
+      insertedCount: result.count,
+    });
+
+    return result;
   } catch (error) {
     logger.error("Failed to save chat messages", { error, chatId });
     captureException(error, { extra: { chatId } });
@@ -349,4 +418,29 @@ function buildHiddenInlineActionMessage(
     role: "system" as const,
     parts: [{ type: "text" as const, text }],
   } satisfies UIMessage;
+}
+
+function isPersistableAssistantMessage(message: UIMessage) {
+  if (message.role !== "assistant") return true;
+
+  return hasRenderableAssistantResponse(message);
+}
+
+function hasRenderableAssistantResponse(
+  message: Pick<UIMessage, "parts"> | null | undefined,
+) {
+  const parts = message?.parts;
+  if (!parts?.length) return false;
+
+  return parts.some((part) => {
+    if (part.type !== "text") return true;
+    return part.text.trim().length > 0;
+  });
+}
+
+function getToolCallIdsFromUiParts(parts: UIMessage["parts"] | undefined) {
+  return (
+    parts?.flatMap((part) => ("toolCallId" in part ? [part.toolCallId] : [])) ||
+    []
+  );
 }

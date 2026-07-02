@@ -6,7 +6,6 @@ import { GroupItemType } from "@/generated/prisma/enums";
 import prisma from "@/utils/__mocks__/prisma";
 import { extractEmailAddress } from "@/utils/email";
 
-vi.mock("server-only", () => ({}));
 vi.mock("@/utils/prisma");
 
 vi.mock("./cold-email-rule", () => ({
@@ -42,7 +41,10 @@ describe("isColdEmail", () => {
     // Mock groupItem lookup
     vi.mocked(prisma.groupItem.findFirst).mockResolvedValue({
       id: "group-item-id",
+      type: GroupItemType.FROM,
+      value: normalizedEmail,
       exclude: false,
+      group: { id: groupId, name: "Cold Email" },
     } as any);
 
     const email: EmailForLLM = {
@@ -63,6 +65,15 @@ describe("isColdEmail", () => {
 
     expect(result.isColdEmail).toBe(true);
     expect(result.reason).toBe("ai-already-labeled");
+    expect(result.patternMatch).toEqual({
+      group: { id: groupId, name: "Cold Email" },
+      groupItem: {
+        id: "group-item-id",
+        type: GroupItemType.FROM,
+        value: normalizedEmail,
+        exclude: false,
+      },
+    });
 
     // Verify that findFirst was called with the normalized email address
     expect(prisma.groupItem.findFirst).toHaveBeenCalledWith({
@@ -71,7 +82,13 @@ describe("isColdEmail", () => {
         type: GroupItemType.FROM,
         value: normalizedEmail,
       },
-      select: { exclude: true },
+      select: {
+        id: true,
+        type: true,
+        value: true,
+        exclude: true,
+        group: { select: { id: true, name: true } },
+      },
     });
   });
 
@@ -83,7 +100,10 @@ describe("isColdEmail", () => {
     // Mock groupItem lookup with exclude: true
     vi.mocked(prisma.groupItem.findFirst).mockResolvedValue({
       id: "group-item-id",
+      type: GroupItemType.FROM,
+      value: normalizedEmail,
       exclude: true,
+      group: { id: groupId, name: "Cold Email" },
     } as any);
 
     const email: EmailForLLM = {
@@ -111,7 +131,13 @@ describe("isColdEmail", () => {
         type: GroupItemType.FROM,
         value: normalizedEmail,
       },
-      select: { exclude: true },
+      select: {
+        id: true,
+        type: true,
+        value: true,
+        exclude: true,
+        group: { select: { id: true, name: true } },
+      },
     });
   });
 
@@ -137,7 +163,10 @@ describe("isColdEmail", () => {
       vi.clearAllMocks();
       vi.mocked(prisma.groupItem.findFirst).mockResolvedValue({
         id: "group-item-id",
+        type: GroupItemType.FROM,
+        value: normalizedEmail,
         exclude: false,
+        group: { id: groupId, name: "Cold Email" },
       } as any);
 
       const email: EmailForLLM = {
@@ -167,7 +196,13 @@ describe("isColdEmail", () => {
           type: GroupItemType.FROM,
           value: expectedNormalized,
         },
-        select: { exclude: true },
+        select: {
+          id: true,
+          type: true,
+          value: true,
+          exclude: true,
+          group: { select: { id: true, name: true } },
+        },
       });
     }
   });

@@ -29,10 +29,8 @@ export type BatchError = {
   };
 };
 
-export function isBatchError(
-  message: MessageWithPayload | BatchError,
-): message is BatchError {
-  return (message as BatchError).error !== undefined;
+export function isBatchError<T>(item: T | BatchError): item is BatchError {
+  return (item as BatchError).error !== undefined;
 }
 
 export type MessageWithPayload = {
@@ -56,6 +54,7 @@ export interface ParsedMessage {
   bodyContentType?: "text" | "html"; // For Outlook: indicates which format the body was originally in
   conversationIndex?: string | null;
   date: string;
+  externalUrl?: string;
   headers: ParsedMessageHeaders;
   historyId: string;
   id: string;

@@ -16,6 +16,7 @@ import { Provider } from "@/utils/llms/config";
 import type { UserAIFields } from "@/utils/llms/types";
 import { createScopedLogger } from "@/utils/logger";
 import { SafeError } from "../error";
+import { assertCliLlmEnabled, createCliLanguageModel } from "./cli-provider";
 
 const DEFAULT_GOOGLE_THINKING_BUDGET = 128;
 
@@ -27,6 +28,7 @@ export type ResolvedModel = {
   provider: string;
   modelName: string;
   model: LanguageModelV3;
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   providerOptions?: Record<string, any>;
 };
 
@@ -43,18 +45,27 @@ type AiGatewayProviderOptions = {
   };
 };
 
+type ParsedModelEntry = { provider: string; modelName: string | null };
+
+type ModelEntryWarningMessages = {
+  unsupportedProvider: string;
+  missingCredentials: string;
+  missingModel: string;
+  duplicate?: string;
+};
+
 export function getModel(
   userAi: UserAIFields,
   modelType: ModelType = "default",
   online = false,
 ): SelectModel {
-  const primaryModel = selectModelByType(userAi, modelType, online);
-  const fallbackModels = getFallbackModels({
-    userAi,
-    modelType,
-    primaryModel,
-    online,
-  });
+  const selectedModel = userAi.aiApiKey
+    ? {
+        primaryModel: selectUserModel(userAi, online),
+        fallbackModels: [],
+      }
+    : selectDeploymentModelByType(modelType, online);
+  const { primaryModel, fallbackModels } = selectedModel;
 
   logger.info("Using model", {
     modelType,
@@ -69,27 +80,6 @@ export function getModel(
   return { ...primaryModel, fallbackModels, hasUserApiKey: !!userAi.aiApiKey };
 }
 
-function selectModelByType(
-  userAi: UserAIFields,
-  modelType: ModelType,
-  online = false,
-): ResolvedModel {
-  if (userAi.aiApiKey) return selectDefaultModel(userAi, online);
-
-  switch (modelType) {
-    case "economy":
-      return selectEconomyModel(userAi, online);
-    case "chat":
-      return selectChatModel(userAi, online);
-    case "nano":
-      return selectNanoModel(userAi, online);
-    case "draft":
-      return selectDraftModel(userAi, online);
-    default:
-      return selectDefaultModel(userAi, online);
-  }
-}
-
 function selectModel(
   {
     aiProvider,
@@ -100,6 +90,7 @@ function selectModel(
     aiModel: string | null;
     aiApiKey: string | null;
   },
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   providerOptions?: Record<string, any>,
   online = false,
 ): ResolvedModel {
@@ -147,6 +138,41 @@ function selectModel(
           ...baseOptions,
           openai: { ...(baseOptions.openai ?? {}), reasoningEffort: "low" },
         },
+      };
+    }
+    case Provider.AZURE_FOUNDRY: {
+      const modelName = aiModel;
+      if (!modelName) throw new SafeError("LLM model name is not set");
+
+      // The process.env fallbacks are for eval/test runs, where `@/env` is
+      // mocked with a minimal object that omits the Azure Foundry vars.
+      const apiKey =
+        aiApiKey ||
+        env.AZURE_FOUNDRY_API_KEY ||
+        process.env.AZURE_FOUNDRY_API_KEY;
+      if (!apiKey) {
+        throw new SafeError(
+          "AZURE_FOUNDRY_API_KEY environment variable is not set",
+        );
+      }
+      const baseURL =
+        env.AZURE_FOUNDRY_BASE_URL || process.env.AZURE_FOUNDRY_BASE_URL;
+      if (!baseURL) {
+        throw new SafeError(
+          "AZURE_FOUNDRY_BASE_URL environment variable is not set",
+        );
+      }
+
+      const azureFoundry = createOpenAICompatible({
+        name: "azure-foundry",
+        baseURL,
+        supportsStructuredOutputs: true,
+        headers: { "api-key": apiKey },
+      });
+      return {
+        provider: Provider.AZURE_FOUNDRY,
+        modelName,
+        model: azureFoundry(modelName),
       };
     }
     case Provider.GOOGLE: {
@@ -228,10 +254,7 @@ function selectModel(
     }
     case "ollama": {
       const modelName = aiModel || env.OLLAMA_MODEL;
-      if (!modelName)
-        throw new SafeError(
-          "DEFAULT_LLM_MODEL environment variable is not set",
-        );
+      if (!modelName) throw new SafeError("LLM model name is not set");
       return {
         provider: Provider.OLLAMA,
         modelName,
@@ -240,23 +263,41 @@ function selectModel(
     }
     case Provider.OPENAI_COMPATIBLE: {
       const modelName = aiModel || env.OPENAI_COMPATIBLE_MODEL;
-      if (!modelName)
-        throw new SafeError(
-          "DEFAULT_LLM_MODEL environment variable is not set",
-        );
-      const baseURL =
-        env.OPENAI_COMPATIBLE_BASE_URL || "http://localhost:1234/v1";
+      if (!modelName) throw new SafeError("LLM model name is not set");
+      const baseURL = getOpenAiCompatibleBaseUrl();
       const openAiCompatibleApiKey = resolveApiKey(aiApiKey, undefined);
       const openaiCompatible = createOpenAICompatible({
         name: "openai-compatible",
         baseURL,
         supportsStructuredOutputs: true,
-        ...(openAiCompatibleApiKey ? { apiKey: openAiCompatibleApiKey } : {}),
+        ...getOpenAiCompatibleAuthOptions(openAiCompatibleApiKey),
       });
       return {
         provider: Provider.OPENAI_COMPATIBLE,
         modelName,
         model: openaiCompatible(modelName),
+      };
+    }
+    case Provider.CODEX_CLI: {
+      const modelName = aiModel || "gpt-5.3-codex";
+      return {
+        provider: Provider.CODEX_CLI,
+        modelName,
+        model: createCliLanguageModel({
+          provider: Provider.CODEX_CLI,
+          modelName,
+        }),
+      };
+    }
+    case Provider.CLAUDE_CODE: {
+      const modelName = aiModel || "sonnet";
+      return {
+        provider: Provider.CLAUDE_CODE,
+        modelName,
+        model: createCliLanguageModel({
+          provider: Provider.CLAUDE_CODE,
+          modelName,
+        }),
       };
     }
 
@@ -301,6 +342,7 @@ function selectModel(
 function createOpenRouterProviderOptions(
   providers: string,
   modelName?: string | null,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 ): Record<string, any> {
   const order = providers
     .split(",")
@@ -317,199 +359,165 @@ function createOpenRouterProviderOptions(
   };
 }
 
-/**
- * Selects the appropriate economy model for high-volume or context-heavy tasks
- * By default, uses a cheaper model like Gemini Flash for tasks that don't require the most powerful LLM
- *
- * Use cases:
- * - Processing large knowledge bases
- * - Analyzing email history
- * - Bulk processing emails
- * - Any task with large context windows where cost efficiency matters
- */
-function selectEconomyModel(
-  userAi: UserAIFields,
+function selectDeploymentModelByType(
+  modelType: ModelType,
   online = false,
-): ResolvedModel {
-  if (env.ECONOMY_LLM_PROVIDER && env.ECONOMY_LLM_MODEL) {
-    const apiKey = getProviderApiKey(env.ECONOMY_LLM_PROVIDER);
-    if (!apiKey) {
-      logger.warn("Economy LLM provider configured but API key not found", {
-        provider: env.ECONOMY_LLM_PROVIDER,
-      });
-      return selectDefaultModel(userAi, online);
-    }
+): { primaryModel: ResolvedModel; fallbackModels: ResolvedModel[] } {
+  const selectedModel =
+    resolveRoleModelList(modelType, online) ??
+    getDeploymentModelFallbackTypes(modelType)
+      .map((fallbackType) => resolveRoleModelList(fallbackType, online))
+      .find((modelList) => !!modelList);
 
-    // Configure OpenRouter provider options if using OpenRouter for economy
-    let providerOptions: Record<string, any> | undefined;
-    if (
-      env.ECONOMY_LLM_PROVIDER === Provider.OPENROUTER &&
-      env.ECONOMY_OPENROUTER_PROVIDERS
-    ) {
-      providerOptions = createOpenRouterProviderOptions(
-        env.ECONOMY_OPENROUTER_PROVIDERS,
-        env.ECONOMY_LLM_MODEL,
-      );
-    }
-
-    return selectModel(
-      {
-        aiProvider: env.ECONOMY_LLM_PROVIDER,
-        aiModel: env.ECONOMY_LLM_MODEL,
-        aiApiKey: apiKey,
-      },
-      providerOptions,
-      online,
-    );
+  if (!selectedModel) {
+    throw new Error(`No configured LLM model list resolved for ${modelType}`);
   }
 
-  return selectDefaultModel(userAi, online);
+  return selectedModel;
 }
 
-/**
- * Selects the appropriate chat model for fast conversational tasks
- */
-function selectChatModel(userAi: UserAIFields, online = false): ResolvedModel {
-  if (env.CHAT_LLM_PROVIDER && env.CHAT_LLM_MODEL) {
-    const apiKey = getProviderApiKey(env.CHAT_LLM_PROVIDER);
-    if (!apiKey) {
-      logger.warn("Chat LLM provider configured but API key not found", {
-        provider: env.CHAT_LLM_PROVIDER,
-      });
-      return selectDefaultModel(userAi, online);
-    }
-
-    // Configure OpenRouter provider options if using OpenRouter for chat
-    let providerOptions: Record<string, any> | undefined;
-    if (
-      env.CHAT_LLM_PROVIDER === Provider.OPENROUTER &&
-      env.CHAT_OPENROUTER_PROVIDERS
-    ) {
-      providerOptions = createOpenRouterProviderOptions(
-        env.CHAT_OPENROUTER_PROVIDERS,
-        env.CHAT_LLM_MODEL,
-      );
-    }
-
-    return selectModel(
-      {
-        aiProvider: env.CHAT_LLM_PROVIDER,
-        aiModel: env.CHAT_LLM_MODEL,
-        aiApiKey: apiKey,
-      },
-      providerOptions,
-      online,
-    );
+function getDeploymentModelFallbackTypes(modelType: ModelType): ModelType[] {
+  switch (modelType) {
+    case "economy":
+    case "chat":
+    case "draft":
+      return ["default"];
+    case "nano":
+      return ["economy", "default"];
+    default:
+      return [];
   }
-
-  return selectDefaultModel(userAi, online);
 }
 
-function selectNanoModel(userAi: UserAIFields, online = false): ResolvedModel {
-  if (env.NANO_LLM_PROVIDER && env.NANO_LLM_MODEL) {
-    const apiKey = getProviderApiKey(env.NANO_LLM_PROVIDER);
-    if (!apiKey) {
-      logger.warn("Nano LLM provider configured but API key not found", {
-        provider: env.NANO_LLM_PROVIDER,
-      });
-      return selectEconomyModel(userAi, online);
-    }
+function selectUserModel(userAi: UserAIFields, online = false): ResolvedModel {
+  const configuredDefault = getFirstSupportedModelListEntry("default");
+  const aiProvider = userAi.aiProvider || configuredDefault?.provider;
+  const aiModel = userAi.aiProvider
+    ? userAi.aiModel || null
+    : configuredDefault?.modelName || null;
 
-    return selectModel(
-      {
-        aiProvider: env.NANO_LLM_PROVIDER,
-        aiModel: env.NANO_LLM_MODEL,
-        aiApiKey: apiKey,
-      },
-      env.NANO_LLM_PROVIDER === Provider.OPENROUTER
-        ? getOpenRouterProviderOptionsByType("nano", env.NANO_LLM_MODEL)
-        : undefined,
-      online,
-    );
-  }
-
-  return selectEconomyModel(userAi, online);
-}
-
-function selectDraftModel(userAi: UserAIFields, online = false): ResolvedModel {
-  if (env.DRAFT_LLM_PROVIDER && env.DRAFT_LLM_MODEL) {
-    const apiKey = getProviderApiKey(env.DRAFT_LLM_PROVIDER);
-    if (!apiKey) {
-      logger.warn("Draft LLM provider configured but API key not found", {
-        provider: env.DRAFT_LLM_PROVIDER,
-      });
-      return selectDefaultModel(userAi, online);
-    }
-
-    return selectModel(
-      {
-        aiProvider: env.DRAFT_LLM_PROVIDER,
-        aiModel: env.DRAFT_LLM_MODEL,
-        aiApiKey: apiKey,
-      },
-      env.DRAFT_LLM_PROVIDER === Provider.OPENROUTER
-        ? getOpenRouterProviderOptionsByType("draft", env.DRAFT_LLM_MODEL)
-        : undefined,
-      online,
-    );
-  }
-
-  return selectDefaultModel(userAi, online);
-}
-
-function selectDefaultModel(
-  userAi: UserAIFields,
-  online = false,
-): ResolvedModel {
-  let aiProvider: string;
-  let aiModel: string | null = null;
-  const aiApiKey = userAi.aiApiKey;
-
-  const providerOptions: Record<string, any> = {};
-
-  // If user has not api key set, then use default model
-  // If they do they can use the model of their choice
-  if (aiApiKey) {
-    aiProvider = userAi.aiProvider || env.DEFAULT_LLM_PROVIDER;
-    aiModel = userAi.aiModel || null;
-  } else {
-    aiProvider = env.DEFAULT_LLM_PROVIDER;
-    aiModel = env.DEFAULT_LLM_MODEL || null;
-  }
-
-  if (aiProvider === Provider.OPENROUTER) {
-    const openRouterOptions = createOpenRouterProviderOptions(
-      env.DEFAULT_OPENROUTER_PROVIDERS || "",
-      aiModel,
-    );
-
-    // Preserve any custom options set earlier.
-    const existingOpenRouterOptions = providerOptions.openrouter || {};
-    providerOptions.openrouter = {
-      ...openRouterOptions.openrouter,
-      ...existingOpenRouterOptions,
-    };
-
-    if (
-      openRouterOptions.openrouter.reasoning ||
-      existingOpenRouterOptions.reasoning
-    ) {
-      providerOptions.openrouter.reasoning = {
-        ...(openRouterOptions.openrouter.reasoning ?? {}),
-        ...(existingOpenRouterOptions.reasoning ?? {}),
-      };
-    }
+  if (!aiProvider) {
+    throw new Error("No configured default LLM model is available");
   }
 
   return selectModel(
     {
       aiProvider,
       aiModel,
-      aiApiKey,
+      aiApiKey: userAi.aiApiKey,
     },
-    providerOptions,
+    getOpenRouterProviderOptions("default", aiProvider, aiModel),
     online,
   );
+}
+
+function resolveRoleModelList(
+  modelType: ModelType,
+  online = false,
+): { primaryModel: ResolvedModel; fallbackModels: ResolvedModel[] } | null {
+  const modelListConfig = getConfiguredModelListByType(modelType);
+  if (!modelListConfig) return null;
+
+  const resolvedModels = resolveDeploymentModelEntries({
+    entries: parseModelListConfig(modelListConfig),
+    modelType,
+    online,
+    getOpenRouterProviderOptions,
+    warningMessages: {
+      unsupportedProvider: "Skipping unsupported LLM list provider",
+      missingCredentials:
+        "Skipping LLM list provider without configured credentials",
+      missingModel: "Skipping LLM list entry without explicit model",
+      duplicate: "Skipping duplicate LLM list entry",
+    },
+  });
+
+  const primaryModel = resolvedModels[0];
+  if (!primaryModel) return null;
+
+  return {
+    primaryModel,
+    fallbackModels: resolvedModels.slice(1),
+  };
+}
+
+export function getConfiguredRolePrimaryModel(
+  modelType: ModelType,
+  online = false,
+): ResolvedModel | null {
+  return resolveRoleModelList(modelType, online)?.primaryModel ?? null;
+}
+
+export function getConfiguredRolePrimaryModelEntry(
+  modelType: ModelType,
+): { provider: string; modelName: string } | null {
+  const resolvedModel = getConfiguredRolePrimaryModel(modelType);
+  if (!resolvedModel) return null;
+
+  return {
+    provider: resolvedModel.provider,
+    modelName: resolvedModel.modelName,
+  };
+}
+
+export function getResolvedDeploymentRolePrimaryModelEntry(
+  modelType: ModelType,
+): { provider: string; modelName: string } | null {
+  try {
+    const { primaryModel } = selectDeploymentModelByType(modelType);
+    return {
+      provider: primaryModel.provider,
+      modelName: primaryModel.modelName,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getFirstSupportedModelListEntry(
+  modelType: ModelType,
+): ParsedModelEntry | null {
+  const modelListConfig = getConfiguredModelListByType(modelType);
+  if (!modelListConfig) return null;
+
+  for (const entry of parseModelListConfig(modelListConfig)) {
+    if (!isSupportedProvider(entry.provider)) {
+      logger.warn("Skipping unsupported LLM list provider", {
+        provider: entry.provider,
+        modelType,
+      });
+      continue;
+    }
+
+    if (!entry.modelName) {
+      logger.warn("Skipping LLM list entry without explicit model", {
+        provider: entry.provider,
+        modelType,
+      });
+      continue;
+    }
+
+    return entry;
+  }
+
+  return null;
+}
+
+function getConfiguredModelListByType(
+  modelType: ModelType,
+): string | undefined {
+  switch (modelType) {
+    case "economy":
+      return env.ECONOMY_LLMS;
+    case "chat":
+      return env.CHAT_LLMS;
+    case "nano":
+      return env.NANO_LLMS;
+    case "draft":
+      return env.DRAFT_LLMS;
+    default:
+      return env.DEFAULT_LLMS;
+  }
 }
 
 function getProviderApiKey(provider: string) {
@@ -518,6 +526,10 @@ function getProviderApiKey(provider: string) {
     [Provider.ANTHROPIC]: resolveApiKey(null, env.ANTHROPIC_API_KEY),
     [Provider.AZURE]:
       azureApiKey && env.AZURE_RESOURCE_NAME ? azureApiKey : undefined,
+    [Provider.AZURE_FOUNDRY]:
+      env.AZURE_FOUNDRY_API_KEY && env.AZURE_FOUNDRY_BASE_URL
+        ? env.AZURE_FOUNDRY_API_KEY
+        : undefined,
     [Provider.BEDROCK]:
       env.BEDROCK_ACCESS_KEY && env.BEDROCK_SECRET_KEY
         ? "bedrock-credentials"
@@ -535,17 +547,53 @@ function getProviderApiKey(provider: string) {
     [Provider.OLLAMA]: "ollama-local",
     // Returns a placeholder so the fallback chain doesn't skip this provider
     // when no API key is configured (many OpenAI-compatible servers don't require one)
-    [Provider.OPENAI_COMPATIBLE]: env.LLM_API_KEY || "not-required",
+    [Provider.OPENAI_COMPATIBLE]:
+      env.LLM_API_KEY || process.env.LLM_API_KEY || "not-required",
+    [Provider.CODEX_CLI]: getCliProviderAvailability(Provider.CODEX_CLI),
+    [Provider.CLAUDE_CODE]: getCliProviderAvailability(Provider.CLAUDE_CODE),
   };
 
   return providerApiKeys[provider];
+}
+
+function getCliProviderAvailability(provider: string) {
+  try {
+    assertCliLlmEnabled(provider);
+    return "cli-provider";
+  } catch {
+    return;
+  }
 }
 
 function resolveApiKey(
   aiApiKey: string | null | undefined,
   providerApiKey: string | undefined,
 ) {
-  return aiApiKey || providerApiKey || env.LLM_API_KEY;
+  return (
+    aiApiKey || providerApiKey || env.LLM_API_KEY || process.env.LLM_API_KEY
+  );
+}
+
+function getOpenAiCompatibleBaseUrl() {
+  return (
+    env.OPENAI_COMPATIBLE_BASE_URL ||
+    process.env.OPENAI_COMPATIBLE_BASE_URL ||
+    "http://localhost:1234/v1"
+  );
+}
+
+function getOpenAiCompatibleAuthOptions(apiKey: string | undefined) {
+  if (!apiKey) return {};
+
+  const authHeader =
+    env.OPENAI_COMPATIBLE_AUTH_HEADER ||
+    process.env.OPENAI_COMPATIBLE_AUTH_HEADER;
+
+  if (authHeader === "api-key") {
+    return { headers: { "api-key": apiKey } };
+  }
+
+  return { apiKey };
 }
 
 function getVertexConfig(): {
@@ -589,107 +637,14 @@ function normalizePrivateKey(value: string | undefined): string | undefined {
   return value?.replace(/\\n/g, "\n");
 }
 
-function getFallbackModels({
-  userAi,
-  modelType,
-  primaryModel,
-  online,
-}: {
-  userAi: UserAIFields;
-  modelType: ModelType;
-  primaryModel: ResolvedModel;
-  online: boolean;
-}): ResolvedModel[] {
-  // Keep user-selected API key behavior strict and predictable.
-  if (userAi.aiApiKey) return [];
-
-  const fallbackConfig = getFallbackConfig(modelType);
-  if (!fallbackConfig) return [];
-
-  const fallbackDefinitions = parseFallbackConfig(fallbackConfig);
-  if (!fallbackDefinitions.length) return [];
-
-  const fallbacks: ResolvedModel[] = [];
-
-  for (const fallback of fallbackDefinitions) {
-    if (!isSupportedProvider(fallback.provider)) {
-      logger.warn("Skipping unsupported fallback provider", {
-        provider: fallback.provider,
-      });
-      continue;
-    }
-
-    const apiKey = getProviderApiKey(fallback.provider);
-    if (!apiKey) {
-      logger.warn("Skipping fallback provider without configured credentials", {
-        provider: fallback.provider,
-      });
-      continue;
-    }
-
-    if (!fallback.modelName) {
-      logger.warn("Skipping fallback provider without explicit model", {
-        provider: fallback.provider,
-        modelType,
-      });
-      continue;
-    }
-
-    const providerOptions =
-      fallback.provider === Provider.OPENROUTER
-        ? getOpenRouterProviderOptionsByType(modelType, fallback.modelName)
-        : undefined;
-
-    const resolvedFallback = selectModel(
-      {
-        aiProvider: fallback.provider,
-        aiModel: fallback.modelName,
-        aiApiKey: apiKey,
-      },
-      providerOptions,
-      online,
-    );
-
-    const isDuplicateOfPrimary =
-      resolvedFallback.provider === primaryModel.provider &&
-      resolvedFallback.modelName === primaryModel.modelName;
-    const isDuplicateFallback = fallbacks.some(
-      (existing) =>
-        existing.provider === resolvedFallback.provider &&
-        existing.modelName === resolvedFallback.modelName,
-    );
-
-    if (isDuplicateOfPrimary || isDuplicateFallback) continue;
-
-    fallbacks.push(resolvedFallback);
-  }
-
-  return fallbacks;
-}
-
-function getFallbackConfig(modelType: ModelType): string | undefined {
-  return getConfiguredFallbacksByType(modelType);
-}
-
-function getConfiguredFallbacksByType(
+function getOpenRouterProviderOptions(
   modelType: ModelType,
-): string | undefined {
-  switch (modelType) {
-    case "economy":
-      return env.ECONOMY_LLM_FALLBACKS || env.DEFAULT_LLM_FALLBACKS;
-    case "chat":
-      return env.CHAT_LLM_FALLBACKS || env.DEFAULT_LLM_FALLBACKS;
-    case "nano":
-      return env.ECONOMY_LLM_FALLBACKS || env.DEFAULT_LLM_FALLBACKS;
-    default:
-      return env.DEFAULT_LLM_FALLBACKS;
-  }
-}
-
-function getOpenRouterProviderOptionsByType(
-  modelType: ModelType,
+  provider: string,
   modelName?: string | null,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 ): Record<string, any> | undefined {
+  if (provider !== Provider.OPENROUTER) return;
+
   const providersByType: Record<ModelType, string | undefined> = {
     default: env.DEFAULT_OPENROUTER_PROVIDERS,
     economy: env.ECONOMY_OPENROUTER_PROVIDERS,
@@ -697,8 +652,13 @@ function getOpenRouterProviderOptionsByType(
     nano: env.ECONOMY_OPENROUTER_PROVIDERS,
     draft: env.DEFAULT_OPENROUTER_PROVIDERS,
   };
-
   const providers = providersByType[modelType];
+
+  // The default role always applies OpenRouter options (empty providers still
+  // configures reasoning); other roles only when explicitly configured.
+  if (modelType === "default") {
+    return createOpenRouterProviderOptions(providers || "", modelName);
+  }
   if (!providers) return;
   return createOpenRouterProviderOptions(providers, modelName);
 }
@@ -776,10 +736,8 @@ function normalizeGoogleModelName(modelName: string): string {
   return modelName.toLowerCase().replace(/^google\//, "");
 }
 
-function parseFallbackConfig(
-  fallbackConfig: string,
-): Array<{ provider: string; modelName: string | null }> {
-  return fallbackConfig
+function parseModelListConfig(modelListConfig: string): ParsedModelEntry[] {
+  return modelListConfig
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean)
@@ -798,6 +756,103 @@ function parseFallbackConfig(
       };
     })
     .filter((entry) => !!entry.provider);
+}
+
+function resolveDeploymentModelEntries({
+  entries,
+  modelType,
+  primaryModel,
+  online,
+  getOpenRouterProviderOptions,
+  warningMessages,
+}: {
+  entries: ParsedModelEntry[];
+  modelType: ModelType;
+  primaryModel?: ResolvedModel;
+  online: boolean;
+  getOpenRouterProviderOptions: (
+    modelType: ModelType,
+    provider: string,
+    modelName: string,
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
+  ) => Record<string, any> | undefined;
+  warningMessages: ModelEntryWarningMessages;
+}): ResolvedModel[] {
+  const resolvedModels: ResolvedModel[] = [];
+
+  for (const entry of entries) {
+    if (!isSupportedProvider(entry.provider)) {
+      logger.warn(warningMessages.unsupportedProvider, {
+        provider: entry.provider,
+        modelType,
+      });
+      continue;
+    }
+
+    const apiKey = getProviderApiKey(entry.provider);
+    if (!apiKey) {
+      logger.warn(warningMessages.missingCredentials, {
+        provider: entry.provider,
+        modelType,
+      });
+      continue;
+    }
+
+    if (!entry.modelName) {
+      logger.warn(warningMessages.missingModel, {
+        provider: entry.provider,
+        modelType,
+      });
+      continue;
+    }
+
+    const providerOptions = getOpenRouterProviderOptions(
+      modelType,
+      entry.provider,
+      entry.modelName,
+    );
+
+    const resolvedModel = selectModel(
+      {
+        aiProvider: entry.provider,
+        aiModel: entry.modelName,
+        aiApiKey: null,
+      },
+      providerOptions,
+      online,
+    );
+
+    if (
+      isDuplicateResolvedModel(resolvedModel, primaryModel) ||
+      resolvedModels.some((existing) =>
+        isDuplicateResolvedModel(resolvedModel, existing),
+      )
+    ) {
+      if (warningMessages.duplicate) {
+        logger.warn(warningMessages.duplicate, {
+          provider: resolvedModel.provider,
+          modelName: resolvedModel.modelName,
+          modelType,
+        });
+      }
+      continue;
+    }
+
+    resolvedModels.push(resolvedModel);
+  }
+
+  return resolvedModels;
+}
+
+function isDuplicateResolvedModel(
+  model: ResolvedModel,
+  existingModel?: ResolvedModel,
+): boolean {
+  return (
+    !!existingModel &&
+    model.provider === existingModel.provider &&
+    model.modelName === existingModel.modelName
+  );
 }
 
 function isSupportedProvider(provider: string): boolean {

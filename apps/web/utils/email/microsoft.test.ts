@@ -2,9 +2,8 @@ import type { Message } from "@microsoft/microsoft-graph-types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as outlookMessageModule from "@/utils/outlook/message";
 import * as outlookLabelModule from "@/utils/outlook/label";
+import { createTestLogger } from "@/__tests__/helpers";
 import { OutlookProvider } from "./microsoft";
-
-vi.mock("server-only", () => ({}));
 
 const { envMock, outlookMailMock, getFolderIdsMock } = vi.hoisted(() => ({
   envMock: {
@@ -137,6 +136,34 @@ describe("OutlookProvider.getLatestMessageInThread", () => {
 
     expect(result).toEqual({ draftId: "" });
     expect(outlookMailMock.draftEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe("OutlookProvider.getSentMessageIds", () => {
+  it("queries sent items with sentDateTime bounds", async () => {
+    const client = createMockOutlookClient([
+      createMessage({
+        id: "message-1",
+        conversationId: "thread-1",
+      }),
+    ]);
+    const provider = new OutlookProvider(client);
+
+    const result = await provider.getSentMessageIds({
+      maxResults: 50,
+      after: new Date("2026-03-31T12:00:00.000Z"),
+      before: new Date("2026-04-30T17:00:00.000Z"),
+    });
+
+    expect(client.getRequestLog()).toContainEqual({
+      apiPath: "/me/mailFolders('sentitems')/messages",
+      filter:
+        "sentDateTime ge 2026-03-31T12:00:00.000Z and sentDateTime le 2026-04-30T17:00:00.000Z",
+    });
+    expect(result).toEqual({
+      messages: [{ id: "message-1", threadId: "thread-1" }],
+      nextPageToken: undefined,
+    });
   });
 });
 
@@ -604,6 +631,38 @@ describe("OutlookProvider.getThreadsWithQuery", () => {
   });
 });
 
+describe("OutlookProvider.getThreadsWithParticipant", () => {
+  it("filters broad search results to exact participant matches", async () => {
+    const participantEmail = "participant@example.com";
+    const unrelatedMessage = createMessage({
+      id: "unrelated-message",
+      conversationId: "thread-unrelated",
+    });
+    const client = createMockOutlookClient([], {
+      responsesByApiPath: {
+        "/me/messages": ({ search }) => {
+          if (search) {
+            return {
+              value: [unrelatedMessage],
+              "@odata.nextLink": "https://graph.example.com/next-page",
+            };
+          }
+          return { value: [] };
+        },
+      },
+    });
+    const logger = createTestLogger();
+    const provider = new OutlookProvider(client, logger);
+
+    const threads = await provider.getThreadsWithParticipant({
+      participantEmail,
+      maxThreads: 1,
+    });
+
+    expect(threads).toEqual([]);
+  });
+});
+
 function createMockOutlookClient(
   messages: Message[],
   options?: {
@@ -611,7 +670,11 @@ function createMockOutlookClient(
     folderIdCache?: Record<string, string> | null;
     responsesByApiPath?: Record<
       string,
-      { value: Message[]; "@odata.nextLink"?: string }
+      | { value: Message[]; "@odata.nextLink"?: string }
+      | ((request: { filter?: string; search?: string }) => {
+          value: Message[];
+          "@odata.nextLink"?: string;
+        })
     >;
   },
 ) {
@@ -623,19 +686,30 @@ function createMockOutlookClient(
     getClient: () => ({
       api: (apiPath: string) => {
         let filterValue: string | undefined;
+        let searchValue: string | undefined;
         const request = {
           filter: (value: string) => {
             filterValue = value;
             return request;
           },
+          search: (value: string) => {
+            searchValue = value;
+            return request;
+          },
           select: () => request,
+          expand: () => request,
           top: () => request,
           orderby: () => request,
           get: async () => {
-            requestLog.push({ apiPath, filter: filterValue });
-            return (
-              options?.responsesByApiPath?.[apiPath] || { value: messages }
-            );
+            requestLog.push({
+              apiPath,
+              filter: filterValue,
+            });
+            const response = options?.responsesByApiPath?.[apiPath];
+            if (typeof response === "function") {
+              return response({ filter: filterValue, search: searchValue });
+            }
+            return response || { value: messages };
           },
         };
 

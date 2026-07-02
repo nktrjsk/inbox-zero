@@ -19,33 +19,43 @@ import {
   getPremiumTierName,
   shouldShowLegacyStripePricingNotice,
 } from "@/app/(app)/premium/config";
+import { hasActiveAppleSubscription } from "@/utils/premium";
 
 export function BillingSection() {
-  const { premium, isPremium, isLoading } = usePremium();
+  const { premium, isPremium, isLoading, tier } = usePremium();
   const isLegacyStripePlan = shouldShowLegacyStripePricingNotice(premium);
+  const hasAppleSubscription = hasActiveAppleSubscription(
+    premium?.appleExpiresAt || null,
+    premium?.appleRevokedAt || null,
+    premium?.appleSubscriptionStatus || null,
+  );
 
   return (
     <LoadingContent loading={isLoading}>
-      {premium &&
-      (isPremium ||
-        premium.lemonSqueezyCustomerId ||
-        premium.stripeSubscriptionId) ? (
+      {premium && isPremium ? (
         <Item size="sm">
           <ItemContent>
-            <ItemTitle>{getPremiumTierName(premium.tier)} plan</ItemTitle>
-            {isLegacyStripePlan && (
+            <ItemTitle>{getPremiumTierName(tier)} plan</ItemTitle>
+            {hasAppleSubscription ? (
+              <ItemDescription>
+                This subscription is billed through Apple. Manage or cancel it
+                from your iPhone or iPad subscription settings.
+              </ItemDescription>
+            ) : isLegacyStripePlan ? (
               <ItemDescription>
                 You&apos;re on grandfathered Stripe pricing. The current plan
                 prices shown elsewhere in the app are for new subscriptions.
               </ItemDescription>
-            )}
+            ) : null}
           </ItemContent>
           <ItemActions>
             <ManageSubscription premium={premium} />
             <ViewInvoicesButton premium={premium} />
-            <Button asChild variant="outline" size="sm">
-              <Link href="/premium">Change plan</Link>
-            </Button>
+            {!hasAppleSubscription && (
+              <Button asChild variant="outline" size="sm">
+                <Link href="/premium">Change plan</Link>
+              </Button>
+            )}
           </ItemActions>
         </Item>
       ) : (

@@ -15,7 +15,35 @@ import { createScopedLogger } from "@/utils/logger";
 
 const logger = createScopedLogger("usage");
 
+export type AiUsageEvent = {
+  cachedInputTokens: number;
+  estimatedCost: number;
+  inputTokens: number;
+  label: string;
+  model: string;
+  outputTokens: number;
+  platformCost: number;
+  provider: string;
+  providerCostSource?: string;
+  providerReportedCost?: number;
+  providerUpstreamInferenceCost?: number;
+  reasoningTokens: number;
+  totalTokens: number;
+};
+
+type AiUsageListener = (event: AiUsageEvent) => void;
+
+const aiUsageListeners = new Set<AiUsageListener>();
+
+export function subscribeToAiUsage(listener: AiUsageListener): () => void {
+  aiUsageListeners.add(listener);
+  return () => {
+    aiUsageListeners.delete(listener);
+  };
+}
+
 export async function saveAiUsage({
+  userId,
   email,
   emailAccountId,
   provider,
@@ -29,6 +57,7 @@ export async function saveAiUsage({
   stepCount,
   toolCallCount,
 }: {
+  userId?: string;
   email: string;
   emailAccountId: string;
   provider: string;
@@ -44,20 +73,47 @@ export async function saveAiUsage({
 }) {
   const estimatedCost = calculateUsageCost({ provider, model, usage });
   const isUserApiKey = !!hasUserApiKey;
-  const platformCost = isUserApiKey ? 0 : estimatedCost;
+  const platformCost = isUserApiKey
+    ? 0
+    : getPlatformCost({
+        estimatedCost,
+        providerReportedCost,
+        providerUpstreamInferenceCost,
+      });
+  const inputTokens = usage.inputTokens ?? 0;
+  const outputTokens = usage.outputTokens ?? 0;
+  const cachedInputTokens = usage.cachedInputTokens ?? 0;
+  const reasoningTokens = usage.reasoningTokens ?? 0;
+  const totalTokens = usage.totalTokens ?? 0;
+
+  notifyAiUsageListeners({
+    cachedInputTokens,
+    estimatedCost,
+    inputTokens,
+    label,
+    model,
+    outputTokens,
+    platformCost,
+    provider,
+    providerCostSource,
+    providerReportedCost,
+    providerUpstreamInferenceCost,
+    reasoningTokens,
+    totalTokens,
+  });
 
   try {
     return Promise.all([
       publishAiCall({
-        userId: email,
+        userId: userId ?? email,
         emailAccountId,
         provider,
         model,
-        totalTokens: usage.totalTokens ?? 0,
-        completionTokens: usage.outputTokens ?? 0,
-        promptTokens: usage.inputTokens ?? 0,
-        cachedInputTokens: usage.cachedInputTokens ?? 0,
-        reasoningTokens: usage.reasoningTokens ?? 0,
+        totalTokens,
+        completionTokens: outputTokens,
+        promptTokens: inputTokens,
+        cachedInputTokens,
+        reasoningTokens,
         cost: platformCost,
         estimatedCost,
         providerReportedCost,
@@ -69,7 +125,7 @@ export async function saveAiUsage({
         stepCount,
         toolCallCount,
       }),
-      saveUsage({ email, cost: platformCost, usage }),
+      saveUsage({ userId, emailAccountId, cost: platformCost, usage }),
     ]);
   } catch (error) {
     logger.error("Failed to save usage", { error });
@@ -129,7 +185,41 @@ function getModelPricing(options: {
     }
   }
 
-  return undefined;
+  return;
+}
+
+function getPlatformCost({
+  estimatedCost,
+  providerReportedCost,
+  providerUpstreamInferenceCost,
+}: {
+  estimatedCost: number;
+  providerReportedCost?: number;
+  providerUpstreamInferenceCost?: number;
+}) {
+  if (isPositiveFiniteNumber(providerReportedCost)) {
+    return providerReportedCost;
+  }
+  if (isPositiveFiniteNumber(providerUpstreamInferenceCost)) {
+    return providerUpstreamInferenceCost;
+  }
+  if (estimatedCost > 0) return estimatedCost;
+
+  if (isNonNegativeFiniteNumber(providerReportedCost))
+    return providerReportedCost;
+  if (isNonNegativeFiniteNumber(providerUpstreamInferenceCost)) {
+    return providerUpstreamInferenceCost;
+  }
+
+  return estimatedCost;
+}
+
+function isPositiveFiniteNumber(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function isNonNegativeFiniteNumber(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 function buildModelLookupCandidates({
@@ -156,6 +246,16 @@ function buildModelLookupCandidates({
   }
 
   return [...new Set(candidates)];
+}
+
+function notifyAiUsageListeners(event: AiUsageEvent): void {
+  for (const listener of aiUsageListeners) {
+    try {
+      listener(event);
+    } catch (error) {
+      logger.error("AI usage listener failed", { error });
+    }
+  }
 }
 
 function toTinybirdBoolean(value: boolean): 0 | 1 {

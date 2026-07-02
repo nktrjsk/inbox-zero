@@ -27,11 +27,6 @@ import {
 } from "@/generated/prisma/enums";
 import { getEmailAccount, createTestLogger } from "@/__tests__/helpers";
 
-vi.mock("server-only", () => ({}));
-vi.mock("next/server", () => ({
-  after: vi.fn((fn: () => void) => fn()),
-}));
-
 const mockExecutedRuleFindFirst = vi.fn().mockResolvedValue(null);
 const mockExecutedRuleUpdate = vi.fn().mockResolvedValue({});
 
@@ -109,9 +104,11 @@ vi.mock("@/utils/ai/choose-rule/run-rules", () => ({
       client: provider,
       executedRule,
       message,
-      userEmail: "webhook-flow@example.com",
-      userId: "test-user-id",
-      emailAccountId: "test-account-id",
+      emailAccount: {
+        email: "webhook-flow@example.com",
+        id: "test-account-id",
+        userId: "test-user-id",
+      },
       logger,
     });
 

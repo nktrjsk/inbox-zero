@@ -4,7 +4,7 @@ import { env } from "@/env";
 import { hasPostCronSecret } from "@/utils/cron";
 import { captureException } from "@/utils/error";
 import { withError } from "@/utils/middleware";
-import { processFollowUpRemindersForEmailAccountId } from "../process";
+import { processFollowUpRemindersForEmailAccountId } from "@/utils/follow-up/process";
 
 export const maxDuration = 800;
 
@@ -30,10 +30,10 @@ export const POST = withError(
     const parseResult = bodySchema.safeParse(await request.json());
     if (!parseResult.success) {
       request.logger.error("Invalid follow-up reminder account payload", {
-        errors: parseResult.error.errors,
+        errors: parseResult.error.issues,
       });
       return NextResponse.json(
-        { error: "Invalid payload", details: parseResult.error.errors },
+        { error: "Invalid payload", details: parseResult.error.issues },
         { status: 400 },
       );
     }

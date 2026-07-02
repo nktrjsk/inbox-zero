@@ -40,6 +40,7 @@ import { Label } from "@/components/ui/label";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Checkbox } from "@/components/ui/checkbox";
 import { canActionBeDelayed } from "@/utils/delayed-actions";
+import { DelayInputControls } from "@/components/DelayInputControls";
 import { FolderSelector } from "@/components/FolderSelector";
 import { cn } from "@/utils";
 import { WebhookDocumentationLink } from "@/components/WebhookDocumentation";
@@ -50,7 +51,10 @@ import { MutedText } from "@/components/Typography";
 import { BRAND_NAME } from "@/utils/branding";
 import { ActionAttachmentsField } from "@/app/(app)/[emailAccountId]/assistant/ActionAttachmentsField";
 import type { AttachmentSourceInput } from "@/utils/attachments/source-schema";
-import { getMessagingProviderName } from "@/utils/messaging/platforms";
+import {
+  getConnectAppLabel,
+  getMessagingProviderName,
+} from "@/utils/messaging/platforms";
 import { getConnectedRuleNotificationChannels } from "@/utils/messaging/routes";
 import type { GetMessagingChannelsResponse } from "@/app/api/user/messaging-channels/route";
 import { prefixPath } from "@/utils/path";
@@ -230,13 +234,15 @@ function ActionCard({
 
   const delayValue = watch(`actions.${index}.delayInMinutes`);
   const delayEnabled = !!delayValue;
+  const connectedMessagingChannels =
+    getConnectedRuleNotificationChannels(messagingChannels);
   const selectedMessagingChannelIds = getDraftReplyMessagingChannelIds({
     primaryAction,
     draftMessagingActions,
   });
   const selectedMessagingChannels = selectedMessagingChannelIds
     .map((channelId) =>
-      messagingChannels.find(
+      connectedMessagingChannels.find(
         (messagingChannel) => messagingChannel.id === channelId,
       ),
     )
@@ -246,7 +252,7 @@ function ActionCard({
   const selectedMessagingChannel = selectedMessagingChannels[0];
   const draftReplyGroupIndexes = [index, ...draftMessagingIndexes];
   const draftReplyDelivery: DraftReplyDelivery =
-    selectedMessagingChannelIds.length === 0
+    selectedMessagingChannels.length === 0
       ? "EMAIL"
       : primaryAction?.type === ActionType.DRAFT_MESSAGING_CHANNEL
         ? "MESSAGING"
@@ -436,9 +442,13 @@ function ActionCard({
                     <>
                       <span className="text-muted-foreground">after</span>
                       <DelayInputControls
-                        index={index}
-                        delayInMinutes={delayValue}
-                        setValue={setValue}
+                        name={`delay-${index}`}
+                        value={delayValue}
+                        onChange={(minutes) =>
+                          setValue(`actions.${index}.delayInMinutes`, minutes, {
+                            shouldValidate: true,
+                          })
+                        }
                       />
                     </>
                   )}
@@ -601,9 +611,13 @@ function ActionCard({
         <div className="flex items-center space-x-2">
           <span className="text-muted-foreground">after</span>
           <DelayInputControls
-            index={index}
-            delayInMinutes={delayValue}
-            setValue={setValue}
+            name={`delay-${index}`}
+            value={delayValue}
+            onChange={(minutes) =>
+              setValue(`actions.${index}.delayInMinutes`, minutes, {
+                shouldValidate: true,
+              })
+            }
           />
         </div>
 
@@ -655,8 +669,6 @@ function ActionCard({
     />
   ) : null;
 
-  const connectedMessagingChannels =
-    getConnectedRuleNotificationChannels(messagingChannels);
   const canConnectMessagingApp = availableMessagingProviders.length > 0;
 
   const deliveryField = isMessagingNotification ? (
@@ -665,7 +677,6 @@ function ActionCard({
       index={index}
       label="Send to"
       messagingChannels={connectedMessagingChannels}
-      selectedChannel={selectedMessagingChannel}
     />
   ) : null;
 
@@ -740,6 +751,7 @@ function ActionCard({
         delivery={draftReplyDelivery}
         selectedChannels={selectedMessagingChannels}
         connectedChannels={connectedMessagingChannels}
+        connectAppLabel={getConnectAppLabel(availableMessagingProviders)}
         errorMessage={deliveryErrorMessage}
         onChange={handleDraftReplyDeliveryChange}
       />
@@ -901,7 +913,7 @@ function ActionCard({
                 <div className="flex flex-wrap gap-2">
                   <Button asChild size="sm" variant="outline">
                     <Link href={prefixPath(emailAccountId, "/channels")}>
-                      Connect app
+                      {getConnectAppLabel(availableMessagingProviders)}
                     </Link>
                   </Button>
                 </div>
@@ -931,6 +943,7 @@ function DraftReplyReviewChannelsSection({
   delivery,
   selectedChannels,
   connectedChannels,
+  connectAppLabel,
   errorMessage,
   onChange,
 }: {
@@ -938,21 +951,13 @@ function DraftReplyReviewChannelsSection({
   delivery: DraftReplyDelivery;
   selectedChannels: MessagingChannelOption[];
   connectedChannels: MessagingChannelOption[];
+  connectAppLabel: string;
   errorMessage?: string;
   onChange: (value: {
     includeEmail: boolean;
     selectedMessagingChannelIds: string[];
   }) => void;
 }) {
-  const availableChannels = [...connectedChannels];
-  for (const selectedChannel of selectedChannels) {
-    if (
-      !availableChannels.some((channel) => channel.id === selectedChannel.id)
-    ) {
-      availableChannels.push(selectedChannel);
-    }
-  }
-
   const includeEmail = delivery !== "MESSAGING";
   const selectedMessagingChannelIds = selectedChannels.map(
     (channel) => channel.id,
@@ -993,7 +998,7 @@ function DraftReplyReviewChannelsSection({
           </div>
         </div>
 
-        {availableChannels.map((channel) => {
+        {connectedChannels.map((channel) => {
           const channelLabel = formatDraftReplyReviewChannelLabel(channel);
           const isSelectedChannel = selectedMessagingChannelIds.includes(
             channel.id,
@@ -1042,7 +1047,7 @@ function DraftReplyReviewChannelsSection({
       {!hasConnectedMessagingDestination ? (
         <Button asChild size="sm" variant="outline" className="w-fit">
           <Link href={prefixPath(emailAccountId, "/channels")}>
-            Connect app
+            {connectAppLabel}
           </Link>
         </Button>
       ) : null}
@@ -1058,26 +1063,24 @@ function MessagingChannelField({
   label,
   includeEmailOption = false,
   messagingChannels,
-  selectedChannel,
 }: {
   control: Control<CreateRuleBody>;
   index: number;
   label: string;
   includeEmailOption?: boolean;
   messagingChannels: MessagingChannelOption[];
-  selectedChannel?: MessagingChannelOption;
 }) {
   return (
     <FormField
       control={control}
       name={`actions.${index}.messagingChannelId`}
       render={({ field, fieldState }) => {
-        const value = field.value ?? (includeEmailOption ? "email" : undefined);
-        const showDisconnectedOption =
-          !!selectedChannel &&
-          !messagingChannels.some(
-            (channel) => channel.id === selectedChannel.id,
-          );
+        const isSelectedChannelConnected =
+          !field.value ||
+          messagingChannels.some((channel) => channel.id === field.value);
+        const value =
+          (isSelectedChannelConnected ? field.value : null) ??
+          (includeEmailOption ? "email" : undefined);
 
         return (
           <div className="space-y-2">
@@ -1108,12 +1111,6 @@ function MessagingChannelField({
                     {formatMessagingDestinationLabel(channel)}
                   </SelectItem>
                 ))}
-                {showDisconnectedOption && selectedChannel ? (
-                  <SelectItem value={selectedChannel.id}>
-                    {formatMessagingDestinationLabel(selectedChannel)}{" "}
-                    (Disconnected)
-                  </SelectItem>
-                ) : null}
               </SelectContent>
             </Select>
             {fieldState.error?.message ? (
@@ -1126,7 +1123,9 @@ function MessagingChannelField({
   );
 }
 
-function formatMessagingDestinationLabel(channel: MessagingChannelOption) {
+export function formatMessagingDestinationLabel(
+  channel: MessagingChannelOption,
+) {
   const provider = getMessagingProviderName(channel.provider);
   const destination = channel.destinations.ruleNotifications;
 
@@ -1270,7 +1269,7 @@ function getMessagingChannelError({
     if (errorMessage) return errorMessage;
   }
 
-  return undefined;
+  return;
 }
 
 function formatDraftReplyDeliverySummary({
@@ -1352,76 +1351,6 @@ function VariableProTip() {
   );
 }
 
-function DelayInputControls({
-  index,
-  delayInMinutes,
-  setValue,
-}: {
-  index: number;
-  delayInMinutes: number | null | undefined;
-  setValue: ReturnType<typeof useForm<CreateRuleBody>>["setValue"];
-}) {
-  const { value: displayValue, unit } = getDisplayValueAndUnit(delayInMinutes);
-
-  const handleValueChange = (newValue: string, currentUnit: string) => {
-    const minutes = convertToMinutes(newValue, currentUnit);
-    setValue(`actions.${index}.delayInMinutes`, minutes, {
-      shouldValidate: true,
-    });
-  };
-
-  const handleUnitChange = (newUnit: string) => {
-    if (displayValue) {
-      const minutes = convertToMinutes(displayValue, newUnit);
-      setValue(`actions.${index}.delayInMinutes`, minutes);
-    }
-  };
-
-  const delayConfig = {
-    displayValue,
-    unit,
-    handleValueChange,
-    handleUnitChange,
-  };
-
-  return (
-    <div className="flex items-center space-x-2">
-      <Input
-        name={`delay-${index}`}
-        type="text"
-        placeholder="0"
-        className="w-20"
-        registerProps={{
-          value: delayConfig.displayValue,
-          onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
-            const value = e.target.value.replace(/[^0-9]/g, "");
-            delayConfig.handleValueChange(value, delayConfig.unit);
-          },
-        }}
-      />
-      <Select
-        value={delayConfig.unit}
-        onValueChange={delayConfig.handleUnitChange}
-      >
-        <SelectTrigger className="w-24">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="minutes">
-            {delayInMinutes === 1 ? "Minute" : "Minutes"}
-          </SelectItem>
-          <SelectItem value="hours">
-            {delayInMinutes === 60 ? "Hour" : "Hours"}
-          </SelectItem>
-          <SelectItem value="days">
-            {delayInMinutes === 1440 ? "Day" : "Days"}
-          </SelectItem>
-        </SelectContent>
-      </Select>
-    </div>
-  );
-}
-
 function renderFieldRows(
   fields: Array<(typeof actionInputs)[ActionType]["fields"][number]>,
   renderField: (
@@ -1461,36 +1390,4 @@ function renderFieldRows(
   }
 
   return rows;
-}
-
-// minutes to user-friendly UI format
-function getDisplayValueAndUnit(minutes: number | null | undefined) {
-  if (minutes === null || minutes === undefined)
-    return { value: "", unit: "hours" };
-  if (minutes === -1 || minutes <= 0) return { value: "", unit: "hours" };
-
-  if (minutes >= 1440 && minutes % 1440 === 0) {
-    return { value: (minutes / 1440).toString(), unit: "days" };
-  } else if (minutes >= 60 && minutes % 60 === 0) {
-    return { value: (minutes / 60).toString(), unit: "hours" };
-  } else {
-    return { value: minutes.toString(), unit: "minutes" };
-  }
-}
-
-// user-friendly UI format to minutes
-function convertToMinutes(value: string, unit: string) {
-  const numValue = Number.parseInt(value, 10);
-  if (Number.isNaN(numValue) || numValue <= 0) return -1;
-
-  switch (unit) {
-    case "minutes":
-      return numValue;
-    case "hours":
-      return numValue * 60;
-    case "days":
-      return numValue * 1440;
-    default:
-      return numValue;
-  }
 }

@@ -37,12 +37,12 @@ export function ResetAnalyticsSection({
             onClick={async () => {
               toast.promise(() => executeResetAnalytics(), {
                 loading: "Resetting analytics...",
-                success: () => {
-                  return "Analytics reset! Visit the Unsubscriber or Analytics page and click the 'Load More' button to reload your data.";
-                },
-                error: (err) => {
-                  return `Error resetting analytics: ${err.message}`;
-                },
+                success: () =>
+                  "Analytics reset! Visit the Unsubscriber or Analytics page and click the 'Load More' button to reload your data.",
+                error: (err: unknown) =>
+                  `Error resetting analytics: ${
+                    err instanceof Error ? err.message : "Unknown error"
+                  }`,
               });
             }}
           >

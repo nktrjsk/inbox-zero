@@ -1,12 +1,27 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { CheckIcon, LogOutIcon, MoreVerticalIcon } from "lucide-react";
+import Link from "next/link";
+import {
+  BellIcon,
+  CalendarClockIcon,
+  CheckIcon,
+  ChevronRightIcon,
+  LogOutIcon,
+  MailIcon,
+  MessageCircleReplyIcon,
+  MoreVerticalIcon,
+  Settings2Icon,
+  SunIcon,
+} from "lucide-react";
 import Image from "next/image";
 import { useAction } from "next-safe-action/hooks";
+import { DigestSettingsDialogContent } from "@/app/(app)/[emailAccountId]/assistant/settings/DigestSetting";
+import { FollowUpSettingsDialogContent } from "@/app/(app)/[emailAccountId]/assistant/settings/FollowUpRemindersSetting";
 import { SlackNotificationTargetSelect } from "@/components/SlackNotificationTargetSelect";
 import { PageHeader } from "@/components/PageHeader";
 import { LoadingContent } from "@/components/LoadingContent";
+import { Tooltip } from "@/components/Tooltip";
 import { Toggle } from "@/components/Toggle";
 import { MutedText } from "@/components/Typography";
 import { Badge } from "@/components/Badge";
@@ -35,6 +50,7 @@ import {
   ItemTitle,
 } from "@/components/ui/item";
 import { useAccount } from "@/providers/EmailAccountProvider";
+import { useTeamsEnabled } from "@/hooks/useFeatureFlags";
 import { useMessagingChannels } from "@/hooks/useMessagingChannels";
 import { useRules } from "@/hooks/useRules";
 import { useSlackConnect } from "@/hooks/useSlackConnect";
@@ -62,6 +78,11 @@ import {
 import type { GetMessagingChannelsResponse } from "@/app/api/user/messaging-channels/route";
 import type { RulesResponse } from "@/app/api/user/rules/route";
 import type { MessagingActionType } from "@/utils/actions/messaging-channels.validation";
+import { prefixPath } from "@/utils/path";
+import { useProductAnalytics } from "@/hooks/useProductAnalytics";
+import { usePremium } from "@/hooks/usePremium";
+import { hasTierAccess } from "@/utils/premium";
+import { UpgradeToPlusButton } from "@/components/UpgradeToPlusButton";
 
 type LinkableProvider = "TEAMS" | "TELEGRAM";
 
@@ -87,6 +108,16 @@ const CHANNEL_FEATURES: Array<{
     description: "Get a summary before your meetings.",
   },
   {
+    purpose: MessagingRoutePurpose.FOLLOW_UPS,
+    name: "Follow-up reminders",
+    description: "Get nudged about emails that need a follow-up.",
+  },
+  {
+    purpose: MessagingRoutePurpose.DIGESTS,
+    name: "Digests",
+    description: "Receive your scheduled digest in chat.",
+  },
+  {
     purpose: MessagingRoutePurpose.DOCUMENT_FILINGS,
     name: "Document filing alerts",
     description: "Notifications when documents are auto-filed.",
@@ -99,6 +130,11 @@ type Rule = RulesResponse[number];
 
 export function Channels() {
   const { emailAccountId } = useAccount();
+  const { tier, isLoading: isLoadingPremium } = usePremium();
+  const hasDigestAccess = hasTierAccess({
+    tier,
+    minimumTier: "PLUS_MONTHLY",
+  });
   const {
     data: channelsData,
     isLoading: isLoadingChannels,
@@ -125,13 +161,19 @@ export function Channels() {
     [channelsData],
   );
 
-  const availableProviders = channelsData?.availableProviders ?? [];
+  const teamsEnabled = useTeamsEnabled();
+  const availableProviders = (channelsData?.availableProviders ?? []).filter(
+    (provider) => provider !== "TEAMS" || teamsEnabled,
+  );
   const visibleRules = useMemo(
     () =>
       sortRulesForAutomation((rulesData ?? []).filter((rule) => rule.enabled)),
     [rulesData],
   );
-  const connectedProviders = new Set(connectedChannels.map((c) => c.provider));
+  const connectedProviders = useMemo(
+    () => new Set(connectedChannels.map((c) => c.provider)),
+    [connectedChannels],
+  );
   const unconnectedProviders = sortProviders(
     availableProviders.filter((p) => !connectedProviders.has(p)),
   );
@@ -153,10 +195,14 @@ export function Channels() {
       />
 
       <LoadingContent
-        loading={isLoadingChannels || isLoadingRules}
+        loading={isLoadingChannels || isLoadingRules || isLoadingPremium}
         error={channelsError || rulesError}
       >
         <div className="space-y-10">
+          {connectedChannels.length === 0 && (
+            <ChannelsIntro availableProviders={availableProviders} />
+          )}
+
           {orderedProviders.map((provider) => {
             const providerChannels = connectedChannels.filter(
               (channel) => channel.provider === provider,
@@ -169,6 +215,7 @@ export function Channels() {
                   channel={channel}
                   rules={visibleRules}
                   emailAccountId={emailAccountId}
+                  hasDigestAccess={hasDigestAccess}
                   onUpdate={onUpdate}
                 />
               ));
@@ -194,16 +241,59 @@ export function Channels() {
                 <MutedText>No channels available.</MutedText>
               </ItemCard>
             )}
-
-          {connectedChannels.length > 0 && (
-            <SectionGroup title="Scheduled check-ins">
-              <ProactiveUpdatesSetting />
-            </SectionGroup>
-          )}
         </div>
       </LoadingContent>
     </div>
   );
+}
+
+const INTRO_FEATURES: Array<{
+  icon: React.ElementType;
+  label: string;
+}> = [
+  { icon: MailIcon, label: "Important emails" },
+  { icon: MessageCircleReplyIcon, label: "Drafted replies" },
+  { icon: CalendarClockIcon, label: "Meeting briefs" },
+  { icon: SunIcon, label: "Daily summary" },
+];
+
+function ChannelsIntro({
+  availableProviders,
+}: {
+  availableProviders: MessagingProvider[];
+}) {
+  const providerList = formatProviderList(availableProviders);
+
+  return (
+    <section className="rounded-xl border border-blue-100 bg-blue-50/40 p-6 dark:border-blue-950 dark:bg-blue-950/20">
+      <h2 className="flex items-start gap-2 text-lg font-semibold tracking-tight">
+        <BellIcon className="mt-1 size-5 shrink-0 text-blue-600 dark:text-blue-400" />
+        <span>Inbox Zero where you work.</span>
+      </h2>
+      <MutedText className="mt-2 text-sm">
+        Important emails, pre-drafted replies, meeting briefs, and a daily inbox
+        summary
+        {providerList ? `, delivered to ${providerList}` : ""}.
+      </MutedText>
+      <div className="mt-5 flex flex-wrap gap-2">
+        {INTRO_FEATURES.map(({ icon: Icon, label }) => (
+          <div
+            key={label}
+            className="flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs font-medium"
+          >
+            <Icon className="size-3.5 text-muted-foreground" />
+            {label}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function formatProviderList(providers: MessagingProvider[]) {
+  if (providers.length === 0) return null;
+  const names = sortProviders(providers).map((p) => PROVIDER_CONFIG[p].name);
+  return new Intl.ListFormat("en", { type: "disjunction" }).format(names);
 }
 
 function SectionGroup({
@@ -233,13 +323,16 @@ function ConnectedChannelSection({
   channel,
   rules,
   emailAccountId,
+  hasDigestAccess,
   onUpdate,
 }: {
   channel: ChannelFromResponse;
   rules: Rule[];
   emailAccountId: string;
+  hasDigestAccess: boolean;
   onUpdate: () => void;
 }) {
+  const analytics = useProductAnalytics("channels");
   const config = PROVIDER_CONFIG[channel.provider];
   const isSlack = channel.provider === "SLACK";
 
@@ -247,6 +340,9 @@ function ConnectedChannelSection({
     disconnectChannelAction.bind(null, emailAccountId),
     {
       onSuccess: () => {
+        analytics.captureAction("channel_disconnected", {
+          provider: channel.provider,
+        });
         toastSuccess({ description: `${config.name} disconnected` });
         onUpdate();
       },
@@ -313,15 +409,15 @@ function ConnectedChannelSection({
         </div>
       }
     >
-      {isSlack && (
-        <ItemCard>
-          <Item size="sm">
-            <ItemContent>
-              <ItemTitle>Rule notifications</ItemTitle>
-              <ItemDescription>
-                Choose where rule notifications and chat replies go.
-              </ItemDescription>
-            </ItemContent>
+      <ItemCard>
+        <Item size="sm">
+          <ItemContent>
+            <ItemTitle>Rule notifications</ItemTitle>
+            <ItemDescription>
+              Choose which rules send notifications and where they go.
+            </ItemDescription>
+          </ItemContent>
+          {isSlack && (
             <ItemActions>
               <SlackNotificationTargetSelect
                 emailAccountId={emailAccountId}
@@ -334,21 +430,10 @@ function ConnectedChannelSection({
                 onUpdate={onUpdate}
               />
             </ItemActions>
-          </Item>
-        </ItemCard>
-      )}
-
-      <ItemCard>
-        <Item size="sm">
-          <ItemContent>
-            <ItemTitle>Rules</ItemTitle>
-            <ItemDescription>
-              Choose which rules send notifications to this channel.
-            </ItemDescription>
-          </ItemContent>
+          )}
         </Item>
         <ItemSeparator />
-        <div className="max-h-80 overflow-y-auto">
+        <div className="max-h-[8.5rem] overflow-y-auto">
           {rules.length > 0 ? (
             rules.map((rule) => (
               <RuleToggle
@@ -376,10 +461,27 @@ function ConnectedChannelSection({
             channel.destinations,
             feature.purpose,
           );
+          const digestLocked =
+            feature.purpose === MessagingRoutePurpose.DIGESTS &&
+            !hasDigestAccess;
+          const disabled = !canEnableMessagingFeatureRoute(
+            channel.destinations,
+            feature.purpose,
+          );
 
           return (
             <div key={feature.purpose}>
               {index > 0 && <ItemSeparator />}
+              {feature.purpose === MessagingRoutePurpose.FOLLOW_UPS && (
+                <>
+                  <ProactiveUpdatesSetting
+                    channel={channel}
+                    emailAccountId={emailAccountId}
+                    onUpdate={onUpdate}
+                  />
+                  <ItemSeparator />
+                </>
+              )}
               <FeatureRouteToggle
                 name={feature.name}
                 description={feature.description}
@@ -390,11 +492,11 @@ function ConnectedChannelSection({
                 canSendAsDm={channel.canSendAsDm}
                 emailAccountId={emailAccountId}
                 onUpdate={onUpdate}
-                disabled={
-                  !canEnableMessagingFeatureRoute(
-                    channel.destinations,
-                    feature.purpose,
-                  )
+                disabled={disabled}
+                upgradeTooltip={
+                  digestLocked
+                    ? "Upgrade to the Plus plan to deliver digests to chat."
+                    : undefined
                 }
               />
             </div>
@@ -415,6 +517,7 @@ function UnconnectedProviderSection({
   onConnected: () => void;
 }) {
   const config = PROVIDER_CONFIG[provider];
+  const analytics = useProductAnalytics("channels");
   const { connect: connectSlack, connecting: connectingSlack } =
     useSlackConnect({ emailAccountId, onConnected });
 
@@ -429,6 +532,9 @@ function UnconnectedProviderSection({
     {
       onSuccess: ({ data }) => {
         if (!data?.code || !data.provider) return;
+        analytics.captureAction("channel_link_code_created", {
+          provider: data.provider,
+        });
         setLinkCodeDialog({
           provider: data.provider,
           code: data.code,
@@ -445,6 +551,7 @@ function UnconnectedProviderSection({
   );
 
   const handleConnect = () => {
+    analytics.captureAction("channel_connect_started", { provider });
     if (provider === "SLACK") {
       connectSlack();
     } else {
@@ -513,6 +620,8 @@ function LinkCodeDialog({
 
   const providerName = dialog.provider === "TEAMS" ? "Teams" : "Telegram";
   const command = `/connect ${dialog.code}`;
+  const openBotLabel =
+    dialog.provider === "TEAMS" ? "Open Teams app" : "Open Telegram bot";
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -528,11 +637,11 @@ function LinkCodeDialog({
           <div className="text-xs text-muted-foreground">Command</div>
           <CopyInput value={command} />
         </div>
-        {dialog.provider === "TELEGRAM" && dialog.botUrl && (
+        {dialog.botUrl && (
           <div className="pt-1">
             <Button asChild size="sm">
               <a href={dialog.botUrl} target="_blank" rel="noopener noreferrer">
-                Open Telegram bot
+                {openBotLabel}
               </a>
             </Button>
           </div>
@@ -555,6 +664,7 @@ function RuleToggle({
   emailAccountId: string;
   onUpdate: () => void;
 }) {
+  const analytics = useProductAnalytics("channels");
   const enabled = currentActionType !== null;
   const isDraft = currentActionType === "DRAFT_MESSAGING_CHANNEL";
 
@@ -585,6 +695,10 @@ function RuleToggle({
 
   const switchMode = (newType: MessagingActionType) => {
     if (newType === currentActionType) return;
+    analytics.captureAction("rule_channel_mode_changed", {
+      action_type: newType,
+      was_enabled: enabled,
+    });
     execute({
       ruleId: rule.id,
       messagingChannelId: channelId,
@@ -639,14 +753,18 @@ function RuleToggle({
             name={`rule-${rule.id}-${channelId}`}
             enabled={enabled}
             disabled={isExecuting}
-            onChange={(value) =>
+            onChange={(value) => {
+              analytics.captureAction("rule_channel_toggled", {
+                enabled: value,
+                action_type: value ? defaultActionType : currentActionType,
+              });
               execute({
                 ruleId: rule.id,
                 messagingChannelId: channelId,
                 enabled: value,
                 actionType: value ? defaultActionType : undefined,
-              })
-            }
+              });
+            }}
           />
         </div>
       </ItemActions>
@@ -665,6 +783,7 @@ function FeatureRouteToggle({
   emailAccountId,
   onUpdate,
   disabled,
+  upgradeTooltip,
 }: {
   name: string;
   description: string;
@@ -676,7 +795,9 @@ function FeatureRouteToggle({
   emailAccountId: string;
   onUpdate: () => void;
   disabled?: boolean;
+  upgradeTooltip?: string;
 }) {
+  const analytics = useProductAnalytics("channels");
   const { execute, status } = useAction(
     updateMessagingFeatureRouteAction.bind(null, emailAccountId),
     {
@@ -700,30 +821,102 @@ function FeatureRouteToggle({
       </ItemContent>
       <ItemActions>
         <div className="flex items-center gap-2">
-          {showTargetSelect && (
-            <SlackNotificationTargetSelect
-              emailAccountId={emailAccountId}
-              messagingChannelId={messagingChannelId}
-              purpose={purpose}
-              targetId={destination.targetId}
-              targetLabel={destination.targetLabel}
-              isDm={destination.isDm}
-              canSendAsDm={canSendAsDm}
-              onUpdate={onUpdate}
-            />
+          {upgradeTooltip ? (
+            <UpgradeToPlusButton tooltip={upgradeTooltip} />
+          ) : (
+            <>
+              <FeatureRouteAction
+                purpose={purpose}
+                emailAccountId={emailAccountId}
+              />
+              {showTargetSelect && (
+                <SlackNotificationTargetSelect
+                  emailAccountId={emailAccountId}
+                  messagingChannelId={messagingChannelId}
+                  purpose={purpose}
+                  targetId={destination.targetId}
+                  targetLabel={destination.targetLabel}
+                  isDm={destination.isDm}
+                  canSendAsDm={canSendAsDm}
+                  onUpdate={onUpdate}
+                />
+              )}
+              <Toggle
+                name={`feature-${purpose}-${messagingChannelId}`}
+                enabled={destination.enabled}
+                disabled={disabled || status === "executing"}
+                onChange={(enabled) => {
+                  if (disabled) return;
+                  analytics.captureAction("feature_route_toggled", {
+                    purpose,
+                    enabled,
+                  });
+                  execute({ channelId: messagingChannelId, purpose, enabled });
+                }}
+              />
+            </>
           )}
-          <Toggle
-            name={`feature-${purpose}-${messagingChannelId}`}
-            enabled={destination.enabled}
-            disabled={disabled || status === "executing"}
-            onChange={(enabled) => {
-              if (disabled) return;
-              execute({ channelId: messagingChannelId, purpose, enabled });
-            }}
-          />
         </div>
       </ItemActions>
     </Item>
+  );
+}
+
+function FeatureRouteAction({
+  purpose,
+  emailAccountId,
+}: {
+  purpose: MessagingFeatureRoutePurpose;
+  emailAccountId: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  if (
+    purpose === MessagingRoutePurpose.MEETING_BRIEFS ||
+    purpose === MessagingRoutePurpose.DOCUMENT_FILINGS
+  ) {
+    const href =
+      purpose === MessagingRoutePurpose.MEETING_BRIEFS
+        ? prefixPath(emailAccountId, "/briefs")
+        : prefixPath(emailAccountId, "/drive");
+
+    return (
+      <Tooltip content="Open settings">
+        <Button asChild variant="ghost" size="icon" className="h-8 w-8">
+          <Link href={href}>
+            <ChevronRightIcon className="h-4 w-4" />
+          </Link>
+        </Button>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <>
+      <Tooltip content="Configure">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8"
+          onClick={() => setOpen(true)}
+        >
+          <Settings2Icon className="h-4 w-4" />
+        </Button>
+      </Tooltip>
+      <Dialog open={open} onOpenChange={setOpen}>
+        {purpose === MessagingRoutePurpose.DIGESTS ? (
+          <DigestSettingsDialogContent
+            onSuccess={() => setOpen(false)}
+            showChannelsHint={false}
+          />
+        ) : (
+          <FollowUpSettingsDialogContent
+            onSuccess={() => setOpen(false)}
+            showChannelsHint={false}
+          />
+        )}
+      </Dialog>
+    </>
   );
 }
 

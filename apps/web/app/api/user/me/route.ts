@@ -3,6 +3,7 @@ import prisma from "@/utils/prisma";
 import { withError } from "@/utils/middleware";
 import { SafeError } from "@/utils/error";
 import { auth } from "@/utils/auth";
+import { premiumEntitlementSelect } from "@/utils/premium";
 
 export type UserResponse = Awaited<ReturnType<typeof getUser>> | null;
 
@@ -22,20 +23,17 @@ async function getUser({
       aiModel: true,
       aiApiKey: true,
       webhookSecret: true,
-      referralCode: true,
       announcementDismissedAt: true,
       dismissedHints: true,
       premium: {
         select: {
+          ...premiumEntitlementSelect,
           lemonSqueezyCustomerId: true,
           lemonSqueezySubscriptionId: true,
-          lemonSqueezyRenewsAt: true,
           stripeCustomerId: true,
           stripePriceId: true,
           stripeSubscriptionId: true,
-          stripeSubscriptionStatus: true,
           unsubscribeCredits: true,
-          tier: true,
           emailAccountsAccess: true,
           lemonLicenseKey: true,
           pendingInvites: true,
@@ -72,10 +70,19 @@ async function getUser({
     })),
   );
 
-  const { aiApiKey, webhookSecret, ...publicUser } = user;
+  const { aiApiKey, webhookSecret, emailAccounts } = user;
 
   return {
-    ...publicUser,
+    id: user.id,
+    createdAt: user.createdAt,
+    aiProvider: user.aiProvider,
+    aiModel: user.aiModel,
+    announcementDismissedAt: user.announcementDismissedAt,
+    dismissedHints: user.dismissedHints,
+    premium: user.premium,
+    emailAccounts: emailAccounts.map(({ members: _members, ...account }) => ({
+      ...account,
+    })),
     hasAiApiKey: !!aiApiKey,
     hasWebhookSecret: !!webhookSecret,
     members,
@@ -85,7 +92,7 @@ async function getUser({
 // Not using withAuth — unauthenticated requests return 401 with isKnownError
 // so the client can distinguish "not logged in" from real errors without Sentry noise
 export const GET = withError("user/me", async (request) => {
-  const session = await auth();
+  const session = await auth(request.headers);
   const userId = session?.user.id;
   if (!userId)
     return NextResponse.json(

@@ -4,6 +4,7 @@ import type { EmailAccountWithAI } from "@/utils/llms/types";
 import { Provider } from "@/utils/llms/config";
 
 export interface EvalModel {
+  includeInAll?: boolean;
   label: string;
   model: string;
   provider: string;
@@ -25,15 +26,33 @@ const EVAL_MODEL_CATALOG: Record<string, EvalModel> = {
     model: "google/gemini-3.1-flash-lite-preview",
     label: "Gemini 3.1 Flash Lite",
   },
-  "grok-4.1-fast": {
+  "gpt-5.4-nano": {
     provider: "openrouter",
-    model: "x-ai/grok-4.1-fast",
-    label: "Grok 4.1 Fast",
+    model: "openai/gpt-5.4-nano",
+    label: "GPT-5.4 Nano",
   },
-  "gpt-5-nano": {
+  "gpt-5.4-mini": {
     provider: "openrouter",
-    model: "openai/gpt-5-nano",
-    label: "GPT-5 Nano",
+    model: "openai/gpt-5.4-mini",
+    label: "GPT-5.4 Mini",
+  },
+  "deepseek-v4-pro-azure": {
+    provider: "azure-foundry",
+    model: "DeepSeek-V4-Pro",
+    label: "DeepSeek V4 Pro Azure",
+    includeInAll: false,
+  },
+  "deepseek-v4-flash-azure": {
+    provider: "azure-foundry",
+    model: "DeepSeek-V4-Flash",
+    label: "DeepSeek V4 Flash Azure",
+    includeInAll: false,
+  },
+  "ollama-gemma4-e2b": {
+    provider: "ollama",
+    model: "gemma4:e2b",
+    label: "Ollama Gemma 4 E2B",
+    includeInAll: false,
   },
 };
 
@@ -43,13 +62,17 @@ const EVAL_MODEL_CATALOG: Record<string, EvalModel> = {
  * - Not set:                         single run with default env-configured model
  * - EVAL_MODELS=all                  every model in the catalog
  * - EVAL_MODELS=gemini-2.5-flash     single model by shorthand
- * - EVAL_MODELS=gemini-2.5-flash,grok-4.1-fast   comma-separated shorthand picks
+ * - EVAL_MODELS=gemini-2.5-flash,gpt-5.4-mini   comma-separated shorthand picks
  * - EVAL_MODELS=[{...}]             custom JSON array
  */
 export function getEvalModels(): EvalModel[] {
   const envModels = process.env.EVAL_MODELS;
   if (!envModels) return [];
-  if (envModels === "all") return Object.values(EVAL_MODEL_CATALOG);
+  if (envModels === "all") {
+    return Object.entries(EVAL_MODEL_CATALOG)
+      .filter(([, model]) => model.includeInAll !== false)
+      .map(([, model]) => model);
+  }
 
   if (envModels.startsWith("[")) {
     try {
@@ -97,7 +120,7 @@ export function shouldRunEvalTests(): boolean {
     return models.every((model) => hasConfiguredProvider(model.provider));
   }
 
-  const defaultProvider = process.env.DEFAULT_LLM_PROVIDER;
+  const defaultProvider = getDefaultEvalProvider();
   return defaultProvider
     ? hasConfiguredProvider(defaultProvider)
     : hasAnyConfiguredProvider();
@@ -128,7 +151,7 @@ export function describeEvalMatrix(
   const models = getEvalModels();
 
   if (models.length === 0) {
-    const fallback = EVAL_MODEL_CATALOG["gemini-3.1-flash-lite"];
+    const fallback = EVAL_MODEL_CATALOG["gemini-3-flash"];
     describe(name, () => {
       fn(fallback, getEmailAccountForModel(fallback, overrides));
     });
@@ -142,6 +165,10 @@ export function describeEvalMatrix(
   }
 }
 
+function getDefaultEvalProvider(): string | undefined {
+  return process.env.DEFAULT_LLMS?.split(",").find(Boolean)?.split(":", 1)[0];
+}
+
 function getApiKeyForProvider(provider: string): string | null {
   const keys: Record<string, string | undefined> = {
     openrouter: process.env.OPENROUTER_API_KEY,
@@ -149,11 +176,16 @@ function getApiKeyForProvider(provider: string): string | null {
     anthropic: process.env.ANTHROPIC_API_KEY,
     google: process.env.GOOGLE_API_KEY,
     groq: process.env.GROQ_API_KEY,
+    [Provider.AZURE_FOUNDRY]: process.env.AZURE_FOUNDRY_API_KEY,
+    "openai-compatible": process.env.LLM_API_KEY || "not-required",
+    ollama: "ollama-local",
   };
   return keys[provider] ?? null;
 }
 
 function hasConfiguredProvider(provider: string): boolean {
+  if (provider === Provider.AZURE_FOUNDRY) return hasAzureFoundryCredentials();
+
   if (process.env.LLM_API_KEY) return true;
 
   switch (provider) {
@@ -165,6 +197,8 @@ function hasConfiguredProvider(provider: string): boolean {
       return Boolean(
         process.env.AZURE_API_KEY && process.env.AZURE_RESOURCE_NAME,
       );
+    case Provider.AZURE_FOUNDRY:
+      return hasAzureFoundryCredentials();
     case Provider.ANTHROPIC:
       return Boolean(process.env.ANTHROPIC_API_KEY);
     case Provider.GOOGLE:
@@ -181,8 +215,8 @@ function hasConfiguredProvider(provider: string): boolean {
       );
     case Provider.AI_GATEWAY:
       return Boolean(process.env.AI_GATEWAY_API_KEY);
-    case Provider.OLLAMA:
     case Provider.OPENAI_COMPATIBLE:
+    case Provider.OLLAMA:
       return true;
     default:
       return hasAnyConfiguredProvider();
@@ -199,11 +233,18 @@ function hasAnyConfiguredProvider(): boolean {
       process.env.GOOGLE_VERTEX_PROJECT ||
       process.env.GROQ_API_KEY ||
       process.env.OPENROUTER_API_KEY ||
+      hasAzureFoundryCredentials() ||
       process.env.AI_GATEWAY_API_KEY ||
       (process.env.BEDROCK_ACCESS_KEY &&
         process.env.BEDROCK_SECRET_KEY &&
         process.env.BEDROCK_REGION) ||
-      process.env.OLLAMA_BASE_URL ||
-      process.env.OPENAI_COMPATIBLE_BASE_URL,
+      process.env.OPENAI_COMPATIBLE_BASE_URL ||
+      process.env.OLLAMA_BASE_URL,
+  );
+}
+
+function hasAzureFoundryCredentials(): boolean {
+  return Boolean(
+    process.env.AZURE_FOUNDRY_API_KEY && process.env.AZURE_FOUNDRY_BASE_URL,
   );
 }

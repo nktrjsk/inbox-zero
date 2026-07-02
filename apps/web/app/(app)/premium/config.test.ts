@@ -10,7 +10,7 @@ vi.mock("@/env", () => ({
     NEXT_PUBLIC_BUSINESS_ANNUALLY_VARIANT_ID: 6,
     NEXT_PUBLIC_COPILOT_MONTHLY_VARIANT_ID: 7,
     NEXT_PUBLIC_STRIPE_BUSINESS_MONTHLY_PRICE_ID:
-      "price_current_starter_monthly",
+      "price_1S5u73KGf8mwZWHn8VYFdALA",
     NEXT_PUBLIC_STRIPE_BUSINESS_ANNUALLY_PRICE_ID:
       "price_current_starter_annual",
     NEXT_PUBLIC_STRIPE_PLUS_MONTHLY_PRICE_ID: "price_current_plus_monthly",
@@ -19,20 +19,25 @@ vi.mock("@/env", () => ({
       "price_current_professional_monthly",
     NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_ANNUALLY_PRICE_ID:
       "price_current_professional_annual",
+    NEXT_PUBLIC_APPLE_IAP_STARTER_MONTHLY_PRODUCT_ID: "starter.monthly",
+    NEXT_PUBLIC_APPLE_IAP_STARTER_ANNUALLY_PRODUCT_ID: "starter.annual",
   },
 }));
 
 import {
+  getAppleSubscriptionTier,
+  getStripePriceId,
   hasLegacyStripePriceId,
+  hasIncludedEmailAccountsStripePriceId,
   shouldShowLegacyStripePricingNotice,
 } from "./config";
 
 describe("hasLegacyStripePriceId", () => {
-  it("returns false when the subscription uses the current Stripe price", () => {
+  it("returns false when the current Stripe price also appears in legacy ids", () => {
     expect(
       hasLegacyStripePriceId({
         tier: "STARTER_MONTHLY",
-        priceId: "price_current_starter_monthly",
+        priceId: "price_1S5u73KGf8mwZWHn8VYFdALA",
       }),
     ).toBe(false);
   });
@@ -59,7 +64,7 @@ describe("hasLegacyStripePriceId", () => {
     expect(
       hasLegacyStripePriceId({
         tier: null,
-        priceId: "price_current_starter_monthly",
+        priceId: "price_1S5u73KGf8mwZWHn8VYFdALA",
       }),
     ).toBe(false);
 
@@ -112,13 +117,64 @@ describe("shouldShowLegacyStripePricingNotice", () => {
     ).toBe(false);
   });
 
-  it("hides the notice when the Stripe price is current", () => {
+  it("hides the notice when the current Stripe price also appears in legacy ids", () => {
     expect(
       shouldShowLegacyStripePricingNotice({
         tier: "STARTER_MONTHLY",
-        stripePriceId: "price_current_starter_monthly",
+        stripePriceId: "price_1S5u73KGf8mwZWHn8VYFdALA",
         stripeSubscriptionStatus: "active",
       }),
     ).toBe(false);
+  });
+});
+
+describe("monthly pricing config", () => {
+  it("uses the active monthly Stripe price ids for checkout", () => {
+    expect(getStripePriceId({ tier: "STARTER_MONTHLY" })).toBe(
+      "price_1S5u73KGf8mwZWHn8VYFdALA",
+    );
+    expect(getStripePriceId({ tier: "PLUS_MONTHLY" })).toBe(
+      "price_current_plus_monthly",
+    );
+    expect(getStripePriceId({ tier: "PROFESSIONAL_MONTHLY" })).toBe(
+      "price_current_professional_monthly",
+    );
+  });
+
+  it("marks only the active monthly prices for special seat billing", () => {
+    expect(
+      hasIncludedEmailAccountsStripePriceId("price_1S5u73KGf8mwZWHn8VYFdALA"),
+    ).toBe(false);
+    expect(
+      hasIncludedEmailAccountsStripePriceId("price_current_plus_monthly"),
+    ).toBe(true);
+    expect(
+      hasIncludedEmailAccountsStripePriceId(
+        "price_current_professional_monthly",
+      ),
+    ).toBe(true);
+    expect(
+      hasIncludedEmailAccountsStripePriceId("price_current_starter_annual"),
+    ).toBe(false);
+    expect(
+      hasIncludedEmailAccountsStripePriceId("price_1S5u6NKGf8mwZWHnZCfy4D5n"),
+    ).toBe(false);
+  });
+});
+
+describe("getAppleSubscriptionTier", () => {
+  it("maps configured starter Apple product ids", () => {
+    expect(getAppleSubscriptionTier({ productId: "starter.monthly" })).toBe(
+      "STARTER_MONTHLY",
+    );
+    expect(getAppleSubscriptionTier({ productId: "starter.annual" })).toBe(
+      "STARTER_ANNUALLY",
+    );
+  });
+
+  it("returns null for unknown Apple products", () => {
+    expect(getAppleSubscriptionTier({ productId: "unknown.apple.plan" })).toBe(
+      null,
+    );
   });
 });

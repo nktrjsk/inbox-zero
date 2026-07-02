@@ -2,6 +2,8 @@ import { vi } from "vitest";
 
 setRequiredTestEnv();
 
+vi.mock("server-only", () => ({}));
+
 // Mock next/server's after() to just run synchronously in tests
 vi.mock("next/server", async () => {
   const actual = await vi.importActual("next/server");
@@ -36,7 +38,7 @@ function setRequiredTestEnv() {
   setEnvDefault("EMAIL_ENCRYPT_SECRET", "test-email-encrypt-secret");
   setEnvDefault("EMAIL_ENCRYPT_SALT", "test-email-encrypt-salt");
   setEnvDefault("INTERNAL_API_KEY", "test-internal-api-key");
-  setEnvDefault("DEFAULT_LLM_PROVIDER", "openai");
+  setEnvDefault("DEFAULT_LLMS", "openrouter:openai/gpt-5.4-mini");
   setEnvDefault("NEXT_PUBLIC_BASE_URL", "http://localhost:3000");
 }
 

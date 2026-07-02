@@ -1,5 +1,6 @@
 "use client";
 
+import { type ChangeEvent, useState } from "react";
 import { useAction } from "next-safe-action/hooks";
 import { useForm } from "react-hook-form";
 import { Button } from "@/components/ui/button";
@@ -15,12 +16,20 @@ import {
   adminWatchEmailsAction,
   adminDisableAllRulesAction,
   adminCleanupDraftsAction,
+  adminLoadResponseTimeDataAction,
+  adminSyncAppleSubscriptionForUserAction,
+  adminSyncStripeForUserAction,
 } from "@/utils/actions/admin";
 import { adminCheckPermissionsAction } from "@/utils/actions/permissions";
 import { toastError, toastSuccess } from "@/components/Toast";
 import { getActionErrorMessage } from "@/utils/error";
 
 export const AdminUserControls = () => {
+  const [responseTimeMaxSentMessages, setResponseTimeMaxSentMessages] =
+    useState(500);
+  const [appleOriginalTransactionId, setAppleOriginalTransactionId] =
+    useState("");
+
   const { execute: processHistory, isExecuting: isProcessing } = useAction(
     adminProcessHistoryAction,
     {
@@ -86,6 +95,40 @@ export const AdminUserControls = () => {
       },
     },
   );
+  const { execute: syncStripe, isExecuting: isSyncingStripe } = useAction(
+    adminSyncStripeForUserAction,
+    {
+      onSuccess: (result) => {
+        toastSuccess({
+          title: "Stripe synced",
+          description: `Status: ${result.data?.stripeSubscriptionStatus ?? "none"}`,
+        });
+      },
+      onError: (error) => {
+        toastError({
+          title: "Error syncing Stripe",
+          description: getActionErrorMessage(error.error),
+        });
+      },
+    },
+  );
+  const { execute: syncApple, isExecuting: isSyncingApple } = useAction(
+    adminSyncAppleSubscriptionForUserAction,
+    {
+      onSuccess: (result) => {
+        toastSuccess({
+          title: "Apple synced",
+          description: `Status: ${result.data?.appleSubscriptionStatus ?? "none"}; tier: ${result.data?.tier ?? "none"}`,
+        });
+      },
+      onError: (error) => {
+        toastError({
+          title: "Error syncing Apple",
+          description: getActionErrorMessage(error.error),
+        });
+      },
+    },
+  );
   const { execute: disableRules, isExecuting: isDisablingRules } = useAction(
     adminDisableAllRulesAction,
     {
@@ -120,6 +163,21 @@ export const AdminUserControls = () => {
       },
     },
   );
+  const { execute: loadResponseTimes, isExecuting: isLoadingResponseTimes } =
+    useAction(adminLoadResponseTimeDataAction, {
+      onSuccess: (result) => {
+        toastSuccess({
+          title: "Response times loaded",
+          description: `Analyzed ${result.data?.emailsAnalyzed ?? 0} email(s) with a cap of ${result.data?.maxEmailsCap ?? responseTimeMaxSentMessages}`,
+        });
+      },
+      onError: (error) => {
+        toastError({
+          title: "Error loading response times",
+          description: getActionErrorMessage(error.error),
+        });
+      },
+    });
   const { execute: deleteAccount, isExecuting: isDeleting } = useAction(
     adminDeleteAccountAction,
     {
@@ -155,7 +213,31 @@ export const AdminUserControls = () => {
         registerProps={register("email", { required: true })}
         error={errors.email}
       />
-      <div className="flex gap-2">
+      <Input
+        type="number"
+        name="responseTimeMaxSentMessages"
+        label="Response time sent messages"
+        min={1}
+        max={2000}
+        step={50}
+        registerProps={{
+          value: responseTimeMaxSentMessages,
+          onChange: (event: ChangeEvent<HTMLInputElement>) =>
+            setResponseTimeMaxSentMessages(Number(event.target.value)),
+        }}
+      />
+      <Input
+        type="text"
+        name="appleOriginalTransactionId"
+        label="Apple original transaction ID"
+        placeholder="200000000000000"
+        registerProps={{
+          value: appleOriginalTransactionId,
+          onChange: (event: ChangeEvent<HTMLInputElement>) =>
+            setAppleOriginalTransactionId(event.target.value),
+        }}
+      />
+      <div className="flex flex-wrap gap-2">
         <Button
           variant="outline"
           loading={isProcessing}
@@ -184,6 +266,29 @@ export const AdminUserControls = () => {
           Watch
         </Button>
         <Button
+          type="button"
+          variant="outline"
+          loading={isSyncingStripe}
+          onClick={() => {
+            syncStripe({ email: getValues("email") });
+          }}
+        >
+          Sync Stripe
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          loading={isSyncingApple}
+          onClick={() => {
+            syncApple({
+              email: getValues("email"),
+              transactionId: appleOriginalTransactionId,
+            });
+          }}
+        >
+          Sync Apple
+        </Button>
+        <Button
           variant="outline"
           loading={isDisablingRules}
           onClick={() => {
@@ -200,6 +305,18 @@ export const AdminUserControls = () => {
           }}
         >
           Cleanup Drafts
+        </Button>
+        <Button
+          variant="outline"
+          loading={isLoadingResponseTimes}
+          onClick={() => {
+            loadResponseTimes({
+              email: getValues("email"),
+              maxSentMessages: responseTimeMaxSentMessages,
+            });
+          }}
+        >
+          Load Response Times
         </Button>
         <Button
           variant="destructive"

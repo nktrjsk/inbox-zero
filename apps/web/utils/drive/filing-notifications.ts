@@ -13,6 +13,10 @@ import { escapeHtml } from "@/utils/string";
 
 interface SourceMessageInfo {
   headerMessageId: string;
+  // Platform-specific message ID (e.g. Microsoft Graph ID) — required so
+  // Outlook's createReply can thread the notification into the source
+  // conversation instead of starting a new thread.
+  messageId?: string;
   references?: string;
   threadId: string;
 }
@@ -78,7 +82,7 @@ export async function sendFiledNotification({
     await prisma.documentFiling.update({
       where: { id: filingId },
       data: {
-        notificationMessageId: result.messageId,
+        notificationMessageId: result.messageId || null,
         notificationSentAt: new Date(),
       },
     });
@@ -135,7 +139,7 @@ export async function sendAskNotification({
     await prisma.documentFiling.update({
       where: { id: filingId },
       data: {
-        notificationMessageId: result.messageId,
+        notificationMessageId: result.messageId || null,
         notificationSentAt: new Date(),
       },
     });

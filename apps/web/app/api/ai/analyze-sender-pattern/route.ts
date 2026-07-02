@@ -1,11 +1,11 @@
 import { NextResponse, after } from "next/server";
 import { headers } from "next/headers";
-import { z } from "zod";
 import { withError } from "@/utils/middleware";
 import prisma from "@/utils/prisma";
 import type { Logger } from "@/utils/logger";
 import type { ParsedMessage } from "@/utils/types";
 import { aiDetectRecurringPattern } from "@/utils/ai/choose-rule/ai-detect-recurring-pattern";
+import { analyzeSenderPatternBodySchema } from "@/utils/ai/choose-rule/analyze-sender-pattern";
 import { isValidInternalApiKey } from "@/utils/internal-api";
 import { extractEmailAddress } from "@/utils/email";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
@@ -20,12 +20,6 @@ export const maxDuration = 60;
 const THRESHOLD_THREADS = 3;
 const MAX_RESULTS = 10;
 
-const schema = z.object({
-  emailAccountId: z.string(),
-  from: z.string(),
-});
-export type AnalyzeSenderPatternBody = z.infer<typeof schema>;
-
 export const POST = withError(
   "api/ai/analyze-sender-pattern",
   async (request) => {
@@ -35,10 +29,10 @@ export const POST = withError(
 
     if (!isValidInternalApiKey(await headers(), logger)) {
       logger.error("Invalid API key for sender pattern analysis", json);
-      return NextResponse.json({ error: "Invalid API key" });
+      return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
     }
 
-    const data = schema.parse(json);
+    const data = analyzeSenderPatternBodySchema.parse(json);
     const { emailAccountId } = data;
     const from = extractEmailAddress(data.from);
 
@@ -336,6 +330,7 @@ async function getEmailAccountWithRules({
       email: true,
       about: true,
       multiRuleSelectionEnabled: true,
+      sensitiveDataPolicy: true,
       timezone: true,
       calendarBookingLink: true,
       user: {

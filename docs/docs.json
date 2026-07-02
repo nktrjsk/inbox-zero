@@ -87,6 +87,7 @@
               "hosting/google-oauth",
               "hosting/google-pubsub",
               "hosting/microsoft-oauth",
+              "hosting/sso",
               "hosting/llm-setup"
             ]
           },
@@ -94,8 +95,9 @@
             "group": "Self-Hosting",
             "pages": [
               "hosting/self-hosting",
-              "hosting/vercel",
               "hosting/environment-variables",
+              "hosting/vercel",
+              "hosting/kubernetes",
               "hosting/troubleshooting",
               "hosting/image-proxy"
             ]
@@ -107,6 +109,12 @@
               "hosting/ec2-deployment",
               "hosting/terraform",
               "hosting/aws-copilot"
+            ]
+          },
+          {
+            "group": "GCP Deployment",
+            "pages": [
+              "hosting/gcp-cloudflare-tunnel"
             ]
           },
           {
@@ -130,7 +138,6 @@
               "api-reference/cli",
               "api-reference/endpoint/get-statsby-period",
               "api-reference/endpoint/get-statsresponse-time",
-              "api-reference/endpoint/get-group-emails",
               "api-reference/endpoint/get-rules",
               "api-reference/endpoint/post-rules",
               "api-reference/endpoint/get-rules-id",
@@ -172,7 +179,7 @@
     "links": [
       {
         "label": "Support",
-        "href": "mailto:elie@getinboxzero.com"
+        "href": "mailto:support@getinboxzero.com"
       }
     ],
     "primary": {

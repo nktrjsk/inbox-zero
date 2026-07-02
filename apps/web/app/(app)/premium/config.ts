@@ -21,7 +21,7 @@ const pricing: Record<PremiumTier, number> = {
   BASIC_ANNUALLY: 8,
   PRO_MONTHLY: 16,
   PRO_ANNUALLY: 10,
-  STARTER_MONTHLY: 25,
+  STARTER_MONTHLY: 20,
   STARTER_ANNUALLY: 18,
   PLUS_MONTHLY: 35,
   PLUS_ANNUALLY: 28,
@@ -45,6 +45,11 @@ export const BRIEF_MY_MEETING_PRICE_ID_MONTHLY =
   "price_1SjoaXKGf8mwZWHnOdyaf2IN";
 export const BRIEF_MY_MEETING_PRICE_ID_ANNUALLY =
   "price_1SjoawKGf8mwZWHnfAeShYhb";
+
+const INCLUDED_EMAIL_ACCOUNT_PRICE_IDS = [
+  env.NEXT_PUBLIC_STRIPE_PLUS_MONTHLY_PRICE_ID,
+  env.NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_MONTHLY_PRICE_ID,
+];
 
 const STRIPE_PRICE_ID_CONFIG: Record<
   PremiumTier,
@@ -71,7 +76,6 @@ const STRIPE_PRICE_ID_CONFIG: Record<
       "price_1Rg0QfKGf8mwZWHnDsiocBVD",
       "price_1Rg0LEKGf8mwZWHndYXYg7ie",
       "price_1Rg03pKGf8mwZWHnWMNeQzLc",
-      // brief my meeting
       BRIEF_MY_MEETING_PRICE_ID_MONTHLY,
     ],
   },
@@ -110,6 +114,11 @@ const STRIPE_PRICE_ID_CONFIG: Record<
   LIFETIME: {},
 };
 
+const APPLE_PRODUCT_ID_CONFIG: Partial<Record<PremiumTier, string>> = {
+  STARTER_MONTHLY: env.NEXT_PUBLIC_APPLE_IAP_STARTER_MONTHLY_PRODUCT_ID,
+  STARTER_ANNUALLY: env.NEXT_PUBLIC_APPLE_IAP_STARTER_ANNUALLY_PRODUCT_ID,
+};
+
 export function getStripeSubscriptionTier({
   priceId,
 }: {
@@ -133,6 +142,30 @@ export function getStripePriceId({
   return STRIPE_PRICE_ID_CONFIG[tier]?.priceId ?? null;
 }
 
+export function hasIncludedEmailAccountsStripePriceId(
+  priceId: string | null | undefined,
+): boolean {
+  if (!priceId) return false;
+
+  return INCLUDED_EMAIL_ACCOUNT_PRICE_IDS?.includes(priceId) ?? false;
+}
+
+export function getAppleSubscriptionTier({
+  productId,
+}: {
+  productId: string;
+}): PremiumTier | null {
+  for (const [tier, configuredProductId] of Object.entries(
+    APPLE_PRODUCT_ID_CONFIG,
+  )) {
+    if (configuredProductId === productId) {
+      return tier as PremiumTier;
+    }
+  }
+
+  return null;
+}
+
 export function hasLegacyStripePriceId({
   tier,
   priceId,
@@ -145,10 +178,12 @@ export function hasLegacyStripePriceId({
   const resolvedTier = tier || getStripeSubscriptionTier({ priceId });
   if (!resolvedTier) return false;
 
-  return (
-    STRIPE_PRICE_ID_CONFIG[resolvedTier]?.oldPriceIds?.includes(priceId) ??
-    false
-  );
+  const tierConfig = STRIPE_PRICE_ID_CONFIG[resolvedTier];
+  if (!tierConfig) return false;
+  // We sometimes reuse a historical price as the active price again.
+  if (tierConfig.priceId === priceId) return false;
+
+  return tierConfig.oldPriceIds?.includes(priceId) ?? false;
 }
 
 export function shouldShowLegacyStripePricingNotice(
@@ -264,9 +299,19 @@ const plusTier: Tier = {
       text: "Everything in Starter, plus:",
     },
     {
+      text: "2 email accounts included per user",
+      tooltip:
+        "Each user gets 2 email accounts included. Additional email accounts are billed at the standard per-seat rate.",
+    },
+    {
       text: "Slack integration",
       tooltip:
         "Forward important emails and notifications to your Slack channels automatically.",
+    },
+    {
+      text: "Email digests",
+      tooltip:
+        "Group emails from selected rules into a scheduled summary instead of reading each message individually.",
     },
     {
       text: "Auto-file attachments",
@@ -333,6 +378,9 @@ const enterpriseTier: Tier = {
     },
     {
       text: "SSO login",
+    },
+    {
+      text: "SCIM user provisioning",
     },
     {
       text: "On-premise deployment (optional)",

@@ -14,6 +14,7 @@ import {
   parsePortConflict,
   updateEnvValue,
   redactValue,
+  getEnvFileName,
   type EnvConfig,
 } from "./utils";
 import { LLM_PROVIDER_OPTIONS, promptLlmCredentials } from "./llm";
@@ -118,7 +119,7 @@ function fixComposeEnvPaths(composeContent: string): string {
 }
 
 function findEnvFile(name?: string): string | null {
-  const envFileName = name ? `.env.${name}` : ".env";
+  const envFileName = getEnvFileName(name);
 
   if (REPO_ROOT) {
     const repoEnv = resolve(REPO_ROOT, "apps/web", envFileName);
@@ -507,7 +508,7 @@ async function runSetupQuick(options: { name?: string }) {
   const selectedLlmProvider = String(llmProvider);
 
   // Gather LLM credentials before generating config
-  const llmEnv: EnvConfig = { DEFAULT_LLM_PROVIDER: selectedLlmProvider };
+  const llmEnv: EnvConfig = {};
   await promptLlmCredentials(selectedLlmProvider, llmEnv);
 
   // Generate token early so we can show it in the instructions
@@ -533,11 +534,11 @@ async function runSetupQuick(options: { name?: string }) {
       message: "Google Pub/Sub Topic Name",
       placeholder: "projects/your-project-id/topics/inbox-zero-emails",
       validate: (v) => {
-        if (!v) return undefined;
+        if (!v) return;
         if (!v.startsWith("projects/") || !v.includes("/topics/")) {
           return "Topic name must be in format: projects/PROJECT_ID/topics/TOPIC_NAME";
         }
-        return undefined;
+        return;
       },
     });
 
@@ -552,7 +553,7 @@ async function runSetupQuick(options: { name?: string }) {
 
   // Determine file paths first so we can read existing config
   const configDir = REPO_ROOT ?? STANDALONE_CONFIG_DIR;
-  const envFileName = configName ? `.env.${configName}` : ".env";
+  const envFileName = getEnvFileName(configName);
   const envFile = REPO_ROOT
     ? resolve(REPO_ROOT, "apps/web", envFileName)
     : resolve(STANDALONE_CONFIG_DIR, envFileName);
@@ -595,6 +596,7 @@ async function runSetupQuick(options: { name?: string }) {
     DATABASE_URL: `postgresql://postgres:${dbPassword}@db:5432/inboxzero`,
     UPSTASH_REDIS_TOKEN: redisToken,
     UPSTASH_REDIS_URL: "http://serverless-redis-http:80",
+    QUEUE_BACKEND: "internal",
     INTERNAL_API_URL: "http://web:3000",
     // Secrets
     AUTH_SECRET: generateSecret(32),
@@ -874,7 +876,7 @@ async function runSetupAdvanced(options: { name?: string }) {
 
   // Determine paths - if in repo, write to apps/web/.env, otherwise use standalone
   const configDir = REPO_ROOT ?? STANDALONE_CONFIG_DIR;
-  const envFileName = configName ? `.env.${configName}` : ".env";
+  const envFileName = getEnvFileName(configName);
   const envFile = REPO_ROOT
     ? resolve(REPO_ROOT, "apps/web", envFileName)
     : resolve(STANDALONE_CONFIG_DIR, envFileName);
@@ -992,11 +994,11 @@ Full guide: https://docs.getinboxzero.com/self-hosting/google-pubsub`,
       message: "Google Pub/Sub Topic Name",
       placeholder: "projects/your-project-id/topics/inbox-zero-emails",
       validate: (v) => {
-        if (!v) return undefined; // Allow empty to skip
+        if (!v) return; // Allow empty to skip
         if (!v.startsWith("projects/") || !v.includes("/topics/")) {
           return "Topic name must be in format: projects/PROJECT_ID/topics/TOPIC_NAME";
         }
-        return undefined;
+        return;
       },
     });
 
@@ -1080,7 +1082,6 @@ Full guide: https://docs.getinboxzero.com/self-hosting/microsoft-oauth`,
   if (p.isCancel(llmProvider)) cancelSetup();
   const selectedLlmProvider = String(llmProvider);
 
-  env.DEFAULT_LLM_PROVIDER = selectedLlmProvider;
   await promptLlmCredentials(selectedLlmProvider, env);
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1108,6 +1109,7 @@ Full guide: https://docs.getinboxzero.com/self-hosting/microsoft-oauth`,
     env.REDIS_HTTP_PORT = redisHttpPort;
     env.WEB_PORT = webPort;
     env.UPSTASH_REDIS_TOKEN = redisToken;
+    env.QUEUE_BACKEND = "internal";
 
     if (runWebInDocker) {
       // Web app runs in Docker: use container hostnames
@@ -1570,8 +1572,11 @@ const CONFIG_CATEGORIES: Record<
   "AI Provider": {
     description: "LLM provider and API keys",
     keys: [
-      "DEFAULT_LLM_PROVIDER",
-      "DEFAULT_LLM_MODEL",
+      "DEFAULT_LLMS",
+      "ECONOMY_LLMS",
+      "CHAT_LLMS",
+      "NANO_LLMS",
+      "DRAFT_LLMS",
       "LLM_API_KEY",
       "BEDROCK_ACCESS_KEY",
       "BEDROCK_SECRET_KEY",
@@ -1593,7 +1598,11 @@ const CONFIG_CATEGORIES: Record<
   },
   "App Settings": {
     description: "Application URL and feature flags",
-    keys: ["NEXT_PUBLIC_BASE_URL", "NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS"],
+    keys: [
+      "NEXT_PUBLIC_BASE_URL",
+      "NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS",
+      "NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED",
+    ],
   },
 };
 
@@ -1801,7 +1810,7 @@ function logPortConflictGuidance() {
 }
 
 function readExistingDbPassword(envFile: string): string | undefined {
-  if (!existsSync(envFile)) return undefined;
+  if (!existsSync(envFile)) return;
   const existing = parseEnvFile(readFileSync(envFile, "utf-8"));
   return existing.POSTGRES_PASSWORD || undefined;
 }

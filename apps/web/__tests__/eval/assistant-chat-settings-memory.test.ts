@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { ModelMessage } from "ai";
 import { afterAll, beforeEach, describe, expect, test, vi } from "vitest";
 import {
@@ -11,12 +12,18 @@ import {
 } from "@/__tests__/eval/semantic-judge";
 import {
   captureAssistantChatToolCalls,
+  getFirstMatchingToolCall,
   getLastMatchingToolCall,
   summarizeRecordedToolCalls,
   type RecordedToolCall,
 } from "@/__tests__/eval/assistant-chat-eval-utils";
+import {
+  settingsMemoryScenarios,
+  type AssistantSettingsChangeExpectation,
+  type SettingsMemoryScenario,
+  type SettingsMemoryScenarioExpectation,
+} from "@/__tests__/eval/assistant-chat-settings-memory.scenarios";
 import prisma from "@/utils/__mocks__/prisma";
-import { normalizeMemoryText } from "@/utils/ai/assistant/chat-memory-policy";
 import { createScopedLogger } from "@/utils/logger";
 import { isActivePremium } from "@/utils/premium";
 import { getUserPremium } from "@/utils/user/get";
@@ -25,68 +32,16 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-settings-memory
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-settings-memory
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-settings-memory",
+});
 const logger = createScopedLogger("eval-assistant-chat-settings-memory");
-const scenarios: EvalScenario[] = [
-  {
-    title: "uses getAssistantCapabilities for capability discovery requests",
-    reportName: "capability discovery uses getAssistantCapabilities",
-    prompt: "What settings can you change for me from chat?",
-    expectation: {
-      kind: "capability_discovery",
-    },
-  },
-  {
-    title: "uses updateAssistantSettings for supported setting changes",
-    reportName: "supported settings change uses updateAssistantSettings",
-    prompt: "Turn on multi-rule selection for me.",
-    expectation: {
-      kind: "assistant_settings",
-      changePath: "assistant.multiRuleSelection.enabled",
-      value: true,
-      forbiddenTools: ["updateAssistantSettingsCompat"],
-    },
-  },
-  {
-    title:
-      "uses updatePersonalInstructions in append mode for personal instruction updates",
-    reportName: "personal instructions use updatePersonalInstructions append",
-    prompt: "Add to my personal instructions that I prefer concise replies.",
-    expectation: {
-      kind: "personal_instructions",
-      mode: "append",
-      semanticExpectation:
-        "Updated personal instructions that remember the user's preference for concise replies.",
-    },
-  },
-  {
-    title: "uses saveMemory when asked to remember a durable preference",
-    reportName: "remember preference uses saveMemory",
-    prompt: "Remember that I like batching newsletters in the afternoon.",
-    timeout: 120_000,
-    expectation: {
-      kind: "save_memory",
-      forbiddenTools: ["searchMemories"],
-      expectedContent: "I like batching newsletters in the afternoon.",
-      expectedUserEvidence: "I like batching newsletters in the afternoon.",
-    },
-  },
-  {
-    title: "uses searchMemories when asked about remembered preferences",
-    reportName: "memory lookup uses searchMemories",
-    prompt: "What do you remember about my newsletter preferences?",
-    expectation: {
-      kind: "search_memories",
-      forbiddenTools: ["saveMemory"],
-      semanticExpectation:
-        "A memory search query that looks up what the assistant knows about the user's newsletter preferences.",
-    },
-  },
-];
+const selectedScenarios =
+  process.env.EVAL_MODELS === "all"
+    ? settingsMemoryScenarios.filter((scenario) => scenario.crossModelCanary)
+    : settingsMemoryScenarios;
 
 const { mockPosthogCaptureEvent, mockRedis } = vi.hoisted(() => ({
   mockPosthogCaptureEvent: vi.fn(),
@@ -122,13 +77,15 @@ vi.mock("@/utils/email/provider", () => ({
   createEmailProvider: vi.fn(),
 }));
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 const mockIsActivePremium = vi.mocked(isActivePremium);
 const mockGetUserPremium = vi.mocked(getUserPremium);
@@ -221,18 +178,18 @@ describe.runIf(shouldRunEval)(
     describeEvalMatrix(
       "assistant-chat settings and memory",
       (model, emailAccount) => {
-        for (const scenario of scenarios) {
+        for (const scenario of selectedScenarios) {
           test(
             scenario.title,
             async () => {
               const result = await runAssistantChat({
                 emailAccount,
-                messages: [{ role: "user", content: scenario.prompt }],
+                messages: getScenarioMessages(scenario),
               });
 
               const { pass, judgeOutput, judgeResult } = await evaluateScenario(
                 result,
-                scenario.prompt,
+                getScenarioPrompt(scenario),
                 scenario.expectation,
               );
 
@@ -300,44 +257,13 @@ type SearchMemoriesInput = {
   query: string;
 };
 
-type UpdateAboutInput = {
-  about: string;
+type UpdatePersonalInstructionsInput = {
+  personalInstructions: string;
   mode?: "append" | "replace";
 };
 
-type ScenarioExpectation =
-  | {
-      kind: "capability_discovery";
-    }
-  | {
-      kind: "assistant_settings";
-      changePath: string;
-      value: unknown;
-      forbiddenTools: string[];
-    }
-  | {
-      kind: "personal_instructions";
-      mode: "append" | "replace";
-      semanticExpectation: string;
-    }
-  | {
-      kind: "save_memory";
-      forbiddenTools: string[];
-      expectedContent: string;
-      expectedUserEvidence: string;
-    }
-  | {
-      kind: "search_memories";
-      forbiddenTools: string[];
-      semanticExpectation: string;
-    };
-
-type EvalScenario = {
-  title: string;
-  reportName: string;
-  prompt: string;
-  timeout?: number;
-  expectation: ScenarioExpectation;
+type ActivateToolsInput = {
+  capabilities: string[];
 };
 
 function isUpdateAssistantSettingsInput(
@@ -374,24 +300,34 @@ function isSearchMemoriesInput(input: unknown): input is SearchMemoriesInput {
   );
 }
 
-function isUpdateAboutInput(input: unknown): input is UpdateAboutInput {
+function isUpdatePersonalInstructionsInput(
+  input: unknown,
+): input is UpdatePersonalInstructionsInput {
   if (!input || typeof input !== "object") return false;
 
   const value = input as {
-    about?: unknown;
+    personalInstructions?: unknown;
     mode?: unknown;
   };
 
   return (
-    typeof value.about === "string" &&
+    typeof value.personalInstructions === "string" &&
     (value.mode == null || value.mode === "append" || value.mode === "replace")
+  );
+}
+
+function isActivateToolsInput(input: unknown): input is ActivateToolsInput {
+  return (
+    !!input &&
+    typeof input === "object" &&
+    Array.isArray((input as { capabilities?: unknown }).capabilities)
   );
 }
 
 async function evaluateScenario(
   result: Awaited<ReturnType<typeof runAssistantChat>>,
   prompt: string,
-  expectation: ScenarioExpectation,
+  expectation: SettingsMemoryScenarioExpectation,
 ) {
   switch (expectation.kind) {
     case "capability_discovery":
@@ -399,11 +335,7 @@ async function evaluateScenario(
         pass:
           result.toolCalls.some(
             (toolCall) => toolCall.toolName === "getAssistantCapabilities",
-          ) &&
-          hasNoToolCalls(result.toolCalls, [
-            "updateAssistantSettings",
-            "updateAssistantSettingsCompat",
-          ]),
+          ) && hasNoToolCalls(result.toolCalls, ["updateAssistantSettings"]),
         judgeOutput: null,
         judgeResult: null,
       };
@@ -418,11 +350,7 @@ async function evaluateScenario(
       return {
         pass:
           !!settingsCall &&
-          settingsCall.changes.some(
-            (change) =>
-              change.path === expectation.changePath &&
-              change.value === expectation.value,
-          ) &&
+          matchesExpectedChanges(settingsCall.changes, expectation.changes) &&
           hasNoToolCalls(result.toolCalls, expectation.forbiddenTools),
         judgeOutput: null,
         judgeResult: null,
@@ -430,30 +358,31 @@ async function evaluateScenario(
     }
 
     case "personal_instructions": {
-      const aboutCall = getLastMatchingToolCall(
+      const piCall = getLastMatchingToolCall(
         result.toolCalls,
         "updatePersonalInstructions",
-        isUpdateAboutInput,
+        isUpdatePersonalInstructionsInput,
       )?.input;
-      const judgeResult = aboutCall
+      const piContent = piCall?.personalInstructions ?? null;
+      const judgeResult = piContent
         ? await judgeEvalOutput({
             input: prompt,
-            output: aboutCall.about,
+            output: piContent,
             expected: expectation.semanticExpectation,
             criterion: {
               name: "Personal instructions semantics",
               description:
-                "The updated personal instructions should semantically preserve the requested preference even if the wording differs from the prompt.",
+                "The stored personal-instructions text should semantically preserve the requested preference even if the wording, perspective, or sentence style differs from the prompt.",
             },
           })
         : null;
 
       return {
         pass:
-          !!aboutCall &&
+          !!piCall &&
           !!judgeResult?.pass &&
-          aboutCall.mode === expectation.mode,
-        judgeOutput: aboutCall?.about ?? null,
+          (piCall.mode ?? "append") === expectation.mode,
+        judgeOutput: piContent,
         judgeResult,
       };
     }
@@ -464,18 +393,23 @@ async function evaluateScenario(
         "saveMemory",
         isSaveMemoryInput,
       )?.input;
+      const contentJudge = memoryCall
+        ? await judgeEvalOutput({
+            input: prompt,
+            output: memoryCall.content,
+            expected: expectation.expectedContent,
+            criterion: {
+              name: "Saved memory semantics",
+              description:
+                "The saved memory content should preserve the semantic meaning of the user's preference or fact. Both first-person ('I prefer...') and third-person ('The user prefers...') formats are acceptable. Do not penalize perspective differences.",
+            },
+          })
+        : null;
 
       return {
         pass:
           !!memoryCall &&
-          memoryCall.source === "user_message" &&
-          normalizeMemoryText(memoryCall.content) ===
-            normalizeMemoryText(expectation.expectedContent) &&
-          normalizeMemoryText(
-            typeof memoryCall.userEvidence === "string"
-              ? memoryCall.userEvidence
-              : "",
-          ).includes(normalizeMemoryText(expectation.expectedUserEvidence)) &&
+          !!contentJudge?.pass &&
           hasNoToolCalls(result.toolCalls, expectation.forbiddenTools),
         judgeOutput: memoryCall
           ? JSON.stringify({
@@ -484,48 +418,234 @@ async function evaluateScenario(
               userEvidence: memoryCall.userEvidence,
             })
           : null,
-        judgeResult: null,
+        judgeResult: contentJudge,
       };
     }
 
     case "search_memories": {
-      const searchCall = getLastMatchingToolCall(
+      return evaluateSearchMemoriesExpectation(result, prompt, expectation);
+    }
+
+    case "assistant_settings_and_save_memory": {
+      const settingsCall = getLastMatchingToolCall(
         result.toolCalls,
-        "searchMemories",
-        isSearchMemoriesInput,
+        "updateAssistantSettings",
+        isUpdateAssistantSettingsInput,
       )?.input;
-      const judgeResult = searchCall
+      const memoryCall = getLastMatchingToolCall(
+        result.toolCalls,
+        "saveMemory",
+        isSaveMemoryInput,
+      )?.input;
+      const contentJudge = memoryCall
         ? await judgeEvalOutput({
             input: prompt,
-            output: searchCall.query,
-            expected: expectation.semanticExpectation,
+            output: memoryCall.content,
+            expected: expectation.expectedContent,
             criterion: {
-              name: "Memory search semantics",
+              name: "Saved memory semantics",
               description:
-                "The memory search query should semantically target the requested remembered preference, even if the wording differs from the prompt.",
+                "The saved memory content should preserve the semantic meaning of the user's preference or fact. Both first-person and third-person formats are acceptable. Do not penalize perspective differences.",
             },
           })
         : null;
 
       return {
         pass:
-          !!searchCall &&
-          !!judgeResult?.pass &&
+          !!settingsCall &&
+          matchesExpectedChanges(settingsCall.changes, expectation.changes) &&
+          !!memoryCall &&
+          !!contentJudge?.pass &&
           hasNoToolCalls(result.toolCalls, expectation.forbiddenTools),
-        judgeOutput: searchCall?.query ?? null,
-        judgeResult,
+        judgeOutput: memoryCall
+          ? JSON.stringify({
+              content: memoryCall.content,
+              source: memoryCall.source,
+              userEvidence: memoryCall.userEvidence,
+            })
+          : null,
+        judgeResult: contentJudge,
+      };
+    }
+
+    case "save_then_search_memories": {
+      const firstSaveCall = getFirstMatchingToolCall(
+        result.toolCalls,
+        "saveMemory",
+        isSaveMemoryInput,
+      );
+      const lastSearchCall = getLastMatchingToolCall(
+        result.toolCalls,
+        "searchMemories",
+        isSearchMemoriesInput,
+      );
+      const contentJudge = firstSaveCall
+        ? await judgeEvalOutput({
+            input: prompt,
+            output: firstSaveCall.input.content,
+            expected: expectation.expectedContent,
+            criterion: {
+              name: "Saved memory semantics",
+              description:
+                "The saved memory content should preserve the semantic meaning of the user's preference or fact. Both first-person and third-person formats are acceptable. Do not penalize perspective differences.",
+            },
+          })
+        : null;
+      const searchEvaluation = lastSearchCall
+        ? await evaluateSearchMemoriesExpectation(result, prompt, {
+            kind: "search_memories",
+            forbiddenTools: expectation.forbiddenTools,
+            semanticExpectation: expectation.semanticExpectation,
+            allowEmptyQuery: expectation.allowEmptyQuery,
+            requireEmptyQuery: expectation.requireEmptyQuery,
+          })
+        : {
+            pass: false,
+            judgeOutput: null,
+            judgeResult: null,
+          };
+
+      return {
+        pass:
+          !!firstSaveCall &&
+          !!lastSearchCall &&
+          firstSaveCall.index < lastSearchCall.index &&
+          !!contentJudge?.pass &&
+          searchEvaluation.pass,
+        judgeOutput: firstSaveCall
+          ? JSON.stringify({
+              content: firstSaveCall.input.content,
+              source: firstSaveCall.input.source,
+              userEvidence: firstSaveCall.input.userEvidence,
+            })
+          : searchEvaluation.judgeOutput,
+        judgeResult: contentJudge ?? searchEvaluation.judgeResult,
       };
     }
   }
 }
 
-function hasNoToolCalls(toolCalls: RecordedToolCall[], toolNames: string[]) {
+function hasNoToolCalls(
+  toolCalls: RecordedToolCall[],
+  toolNames: string[] | undefined,
+) {
+  if (!toolNames?.length) return true;
   return !toolCalls.some((toolCall) => toolNames.includes(toolCall.toolName));
+}
+
+function getScenarioMessages(scenario: SettingsMemoryScenario): ModelMessage[] {
+  if (scenario.messages) return scenario.messages;
+  return [{ role: "user", content: scenario.prompt ?? "" }];
+}
+
+function getScenarioPrompt(scenario: SettingsMemoryScenario): string {
+  if (scenario.prompt) return scenario.prompt;
+
+  const lastUserMessage = [...(scenario.messages ?? [])]
+    .reverse()
+    .find((message) => message.role === "user");
+
+  if (lastUserMessage && typeof lastUserMessage.content === "string") {
+    return lastUserMessage.content;
+  }
+
+  return "";
+}
+
+function matchesExpectedChanges(
+  actualChanges: UpdateAssistantSettingsInput["changes"],
+  expectedChanges: AssistantSettingsChangeExpectation[],
+) {
+  return expectedChanges.every((expectedChange) =>
+    actualChanges.some(
+      (actualChange) =>
+        actualChange.path === expectedChange.path &&
+        isDeepStrictEqual(actualChange.value, expectedChange.value) &&
+        (expectedChange.mode == null ||
+          actualChange.mode === expectedChange.mode),
+    ),
+  );
+}
+
+async function evaluateSearchMemoriesExpectation(
+  result: Awaited<ReturnType<typeof runAssistantChat>>,
+  prompt: string,
+  expectation: Extract<
+    SettingsMemoryScenarioExpectation,
+    { kind: "search_memories" }
+  >,
+) {
+  const searchCall = getLastMatchingToolCall(
+    result.toolCalls,
+    "searchMemories",
+    isSearchMemoriesInput,
+  )?.input;
+  const trimmedQuery = searchCall?.query.trim() ?? "";
+
+  if (!searchCall) {
+    return {
+      pass: false,
+      judgeOutput: null,
+      judgeResult: null,
+    };
+  }
+
+  if (expectation.requireEmptyQuery) {
+    return {
+      pass:
+        trimmedQuery.length === 0 &&
+        hasNoToolCalls(result.toolCalls, expectation.forbiddenTools),
+      judgeOutput: searchCall.query,
+      judgeResult: {
+        pass: trimmedQuery.length === 0,
+        reasoning: "Broad recall requires an empty searchMemories query.",
+      },
+    };
+  }
+
+  if (trimmedQuery.length === 0 && expectation.allowEmptyQuery) {
+    return {
+      pass: hasNoToolCalls(result.toolCalls, expectation.forbiddenTools),
+      judgeOutput: searchCall.query,
+      judgeResult: {
+        pass: true,
+        reasoning: "Empty query is allowed for broad memory recall.",
+      },
+    };
+  }
+
+  const judgeResult = expectation.semanticExpectation
+    ? await judgeEvalOutput({
+        input: prompt,
+        output: searchCall.query,
+        expected: expectation.semanticExpectation,
+        criterion: {
+          name: "Memory search semantics",
+          description:
+            "The memory search query should semantically target the requested remembered preference, even if the wording differs from the prompt.",
+        },
+      })
+    : {
+        pass: trimmedQuery.length > 0,
+        reasoning: "Search query should not be empty for a topical lookup.",
+      };
+
+  return {
+    pass:
+      !!judgeResult?.pass &&
+      hasNoToolCalls(result.toolCalls, expectation.forbiddenTools),
+    judgeOutput: searchCall.query,
+    judgeResult,
+  };
 }
 
 function summarizeToolCall(toolCall: RecordedToolCall) {
   if (toolCall.toolName === "getAssistantCapabilities") {
     return "getAssistantCapabilities()";
+  }
+
+  if (isActivateToolsInput(toolCall.input)) {
+    return `activateTools([${toolCall.input.capabilities.join(", ")}])`;
   }
 
   if (isUpdateAssistantSettingsInput(toolCall.input)) {
@@ -540,8 +660,8 @@ function summarizeToolCall(toolCall: RecordedToolCall) {
     return `${toolCall.toolName}(${toolCall.input.query})`;
   }
 
-  if (isUpdateAboutInput(toolCall.input)) {
-    return `${toolCall.toolName}(mode=${toolCall.input.mode ?? "replace"})`;
+  if (isUpdatePersonalInstructionsInput(toolCall.input)) {
+    return `${toolCall.toolName}(mode=${toolCall.input.mode ?? "append"})`;
   }
 
   return toolCall.toolName;

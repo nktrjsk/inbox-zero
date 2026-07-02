@@ -95,7 +95,10 @@ export function HeroVideoPlayer() {
               asChild
               onClick={() => landingPageAnalytics.videoClicked(posthog)}
             >
-              <LiquidGlassButton className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
+              <LiquidGlassButton
+                aria-label="Play product demo video"
+                className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"
+              >
                 <div>
                   <Play className="translate-x-[2px]" />
                 </div>
@@ -105,7 +108,7 @@ export function HeroVideoPlayer() {
               <DialogTitle className="sr-only">Video player</DialogTitle>
               <div className="relative aspect-video w-full">
                 <iframe
-                  src="https://www.youtube.com/embed/hfvKvTHBjG0?autoplay=1&rel=0"
+                  src="https://www.youtube.com/embed/UusnveLKwWM?autoplay=1&rel=0"
                   className="size-full rounded-lg"
                   title="Video content"
                   allowFullScreen

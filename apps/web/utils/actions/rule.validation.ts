@@ -80,6 +80,7 @@ const zodActionType = z.enum([
   ActionType.SEND_EMAIL,
   ActionType.CALL_WEBHOOK,
   ActionType.MARK_READ,
+  ActionType.STAR,
   ActionType.DIGEST,
   ActionType.MOVE_FOLDER,
   ActionType.NOTIFY_SENDER,
@@ -199,7 +200,9 @@ const zodAction = z
 
     if (
       data.type === ActionType.DRAFT_MESSAGING_CHANNEL &&
-      !data.messagingChannelId
+      // Persisted legacy rows can be channel-less; keep them editable.
+      !data.messagingChannelId &&
+      !data.id
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -237,6 +240,7 @@ export const createRuleBody = z.object({
   groupId: z.string().nullish(),
   runOnThreads: z.boolean().nullish(),
   digest: z.boolean().nullish(),
+  notifyMessagingChannelId: z.string().nullish(),
   actions: z.array(zodAction).min(1, "You must have at least one action"),
   conditions: z
     .array(zodCondition)
@@ -258,14 +262,13 @@ export const createRuleBody = z.object({
         );
 
         // Filter out empty static conditions (where the active field has no value)
-        const nonEmptyStaticConditions = staticConditions.filter((c) => {
-          return (
+        const nonEmptyStaticConditions = staticConditions.filter(
+          (c) =>
             c.from?.trim() ||
             c.to?.trim() ||
             c.subject?.trim() ||
-            c.body?.trim()
-          );
-        });
+            c.body?.trim(),
+        );
 
         if (nonEmptyStaticConditions.length <= 1) {
           return true; // No duplicates possible
@@ -300,9 +303,6 @@ export const updateRuleBody = createRuleBody.extend({ id: z.string() });
 export type UpdateRuleBody = z.infer<typeof updateRuleBody>;
 
 export const deleteRuleBody = z.object({ id: z.string() });
-
-export const createRulesBody = z.object({ prompt: z.string().trim() });
-export type CreateRulesBody = z.infer<typeof createRulesBody>;
 
 export const updateRuleSettingsBody = z.object({
   id: z.string(),

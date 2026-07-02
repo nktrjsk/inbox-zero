@@ -1,7 +1,7 @@
 import type { ModelMessage } from "ai";
 import { beforeEach, vi } from "vitest";
 import {
-  captureAssistantChatToolCalls,
+  captureAssistantChatTrace,
   getFirstMatchingToolCall,
   getLastMatchingToolCall as getSharedLastMatchingToolCall,
   summarizeRecordedToolCalls,
@@ -11,10 +11,9 @@ import { shouldRunEvalTests } from "@/__tests__/eval/models";
 import { judgeEvalOutput } from "@/__tests__/eval/semantic-judge";
 import { getMockMessage } from "@/__tests__/helpers";
 import type { getEmailAccount } from "@/__tests__/helpers";
+import { FOLDER_SEPARATOR } from "@/utils/outlook/folders";
 import prisma from "@/utils/__mocks__/prisma";
 import { createScopedLogger } from "@/utils/logger";
-
-vi.mock("server-only", () => ({}));
 
 export const shouldRunEval = shouldRunEvalTests();
 export const TIMEOUT = 120_000;
@@ -48,11 +47,11 @@ const writeToolNames = new Set([
   "updateLearnedPatterns",
   "updatePersonalInstructions",
   "updateAssistantSettings",
-  "updateAssistantSettingsCompat",
-  "updateInboxFeatures",
   "sendEmail",
   "replyEmail",
   "forwardEmail",
+  "createOrGetFolder",
+  "moveThreadsToFolder",
   "saveMemory",
   "addToKnowledgeBase",
 ]);
@@ -80,6 +79,9 @@ const hoisted = vi.hoisted(() => ({
   mockArchiveThreadWithLabel: vi.fn(),
   mockMarkReadThread: vi.fn(),
   mockBulkArchiveFromSenders: vi.fn(),
+  mockGetFolders: vi.fn(),
+  mockGetOrCreateFolderIdByName: vi.fn(),
+  mockMoveThreadToFolder: vi.fn(),
 }));
 
 const {
@@ -95,6 +97,10 @@ const {
 } = hoisted;
 
 export const mockSearchMessages = hoisted.mockSearchMessages;
+export const mockGetFolders = hoisted.mockGetFolders;
+export const mockGetOrCreateFolderIdByName =
+  hoisted.mockGetOrCreateFolderIdByName;
+export const mockMoveThreadToFolder = hoisted.mockMoveThreadToFolder;
 
 vi.mock("@/utils/rule/rule", () => ({
   createRule: hoisted.mockCreateRule,
@@ -125,13 +131,15 @@ vi.mock("@/utils/senders/unsubscribe", () => ({
 
 vi.mock("@/utils/prisma");
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 export function setupInboxWorkflowEval() {
   beforeEach(() => {
@@ -179,6 +187,19 @@ export function setupInboxWorkflowEval() {
       messages: getDefaultSearchMessages(),
       nextPageToken: undefined,
     });
+    mockGetFolders.mockResolvedValue(getDefaultFolders());
+    mockGetOrCreateFolderIdByName.mockImplementation(async (folderName) => {
+      const folder = flattenFolders(getDefaultFolders()).find(
+        (candidate) =>
+          candidate.displayName.toLowerCase() ===
+            String(folderName).trim().toLowerCase() ||
+          candidate.path.toLowerCase() ===
+            String(folderName).trim().toLowerCase(),
+      );
+
+      return folder?.id ?? "folder-created";
+    });
+    mockMoveThreadToFolder.mockResolvedValue(undefined);
 
     mockGetMessage.mockImplementation(async (messageId: string) =>
       getMessageById(messageId),
@@ -191,6 +212,9 @@ export function setupInboxWorkflowEval() {
       archiveThreadWithLabel: mockArchiveThreadWithLabel,
       markReadThread: mockMarkReadThread,
       bulkArchiveFromSenders: mockBulkArchiveFromSenders,
+      getFolders: mockGetFolders,
+      getOrCreateFolderIdByName: mockGetOrCreateFolderIdByName,
+      moveThreadToFolder: mockMoveThreadToFolder,
       getMessagesWithPagination: vi.fn().mockResolvedValue({
         messages: [],
         nextPageToken: undefined,
@@ -208,7 +232,7 @@ export async function runAssistantChat({
   messages: ModelMessage[];
   inboxStats?: { total: number; unread: number } | null;
 }) {
-  const toolCalls = await captureAssistantChatToolCalls({
+  const trace = await captureAssistantChatTrace({
     messages,
     emailAccount,
     inboxStats,
@@ -216,8 +240,9 @@ export async function runAssistantChat({
   });
 
   return {
-    toolCalls,
-    actual: summarizeRecordedToolCalls(toolCalls, summarizeToolCall),
+    toolCalls: trace.toolCalls,
+    finalText: trace.finalText,
+    actual: summarizeRecordedToolCalls(trace.toolCalls, summarizeToolCall),
   };
 }
 
@@ -248,6 +273,7 @@ export function isManageInboxThreadActionInput(
 
   return (
     (value.action === "archive_threads" ||
+      value.action === "trash_threads" ||
       value.action === "mark_read_threads") &&
     Array.isArray(value.threadIds)
   );
@@ -387,7 +413,7 @@ type ReadEmailInput = {
 };
 
 type ManageInboxThreadActionInput = {
-  action: "archive_threads" | "mark_read_threads";
+  action: "archive_threads" | "trash_threads" | "mark_read_threads";
   threadIds: string[];
 };
 
@@ -423,6 +449,43 @@ function getDefaultLabels() {
     { id: "Label_To Reply", name: "To Reply" },
     { id: "Label_FYI", name: "FYI" },
   ];
+}
+
+function getDefaultFolders() {
+  return [
+    {
+      id: "folder-operations",
+      displayName: "Operations",
+      childFolderCount: 1,
+      childFolders: [
+        {
+          id: "folder-operations-reports",
+          displayName: "Reports",
+          childFolderCount: 0,
+          childFolders: [],
+        },
+      ],
+    },
+    {
+      id: "folder-vendor-updates",
+      displayName: "Vendor Updates",
+      childFolderCount: 0,
+      childFolders: [],
+    },
+  ];
+}
+
+function flattenFolders(
+  folders: ReturnType<typeof getDefaultFolders>,
+  parentPath?: string,
+): Array<ReturnType<typeof getDefaultFolders>[number] & { path: string }> {
+  return folders.flatMap((folder) => {
+    const path = parentPath
+      ? `${parentPath}${FOLDER_SEPARATOR}${folder.displayName}`
+      : folder.displayName;
+
+    return [{ ...folder, path }, ...flattenFolders(folder.childFolders, path)];
+  });
 }
 
 function getDefaultSearchMessages() {

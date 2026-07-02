@@ -19,115 +19,95 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-progressive-disclosure
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-progressive-disclosure
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-progressive-disclosure",
+});
 const logger = createScopedLogger("eval-assistant-chat-progressive-disclosure");
+
+const { mockCreateEmailProvider, mockPosthogCaptureEvent, mockRedis } =
+  vi.hoisted(() => ({
+    mockCreateEmailProvider: vi.fn(),
+    mockPosthogCaptureEvent: vi.fn(),
+    mockRedis: {
+      set: vi.fn(),
+      rpush: vi.fn(),
+      hincrby: vi.fn(),
+      expire: vi.fn(),
+      keys: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue(null),
+      llen: vi.fn().mockResolvedValue(0),
+      lrange: vi.fn().mockResolvedValue([]),
+    },
+  }));
 
 type EvalScenario = {
   title: string;
   reportName: string;
   prompt: string;
-  expectation:
-    | {
-        kind: "activate_then_use";
-        expectedCapabilities: string[];
-        expectedFollowUpTool: string;
-      }
-    | {
-        kind: "core_tool_no_activation";
-        expectedTool: string;
-      };
+  expectedTool: string;
+  disallowedTools?: string[];
   timeout?: number;
 };
 
 const scenarios: EvalScenario[] = [
   {
-    title: "activates labels capability before listing labels",
-    reportName: "list labels activates labels capability",
+    title: "calls listLabels for label listing requests",
+    reportName: "list labels calls listLabels",
     prompt: "List my labels",
-    expectation: {
-      kind: "activate_then_use",
-      expectedCapabilities: ["labels"],
-      expectedFollowUpTool: "listLabels",
-    },
+    expectedTool: "listLabels",
   },
   {
-    title: "activates knowledge capability before adding to knowledge base",
-    reportName: "save to knowledge base activates knowledge capability",
-    prompt: "Save this to my knowledge base: always reply with bullet points",
-    expectation: {
-      kind: "activate_then_use",
-      expectedCapabilities: ["knowledge"],
-      expectedFollowUpTool: "addToKnowledgeBase",
-    },
+    title: "calls addToKnowledgeBase for knowledge base requests",
+    reportName: "save to knowledge base calls addToKnowledgeBase",
+    prompt:
+      "Save this to my knowledge base: The refund window is 30 days after purchase.",
+    expectedTool: "addToKnowledgeBase",
+    disallowedTools: ["saveMemory", "updatePersonalInstructions"],
   },
   {
-    title: "activates memory capability before saving memory",
-    reportName: "remember preference activates memory capability",
-    prompt: "Remember that I prefer morning summaries",
-    expectation: {
-      kind: "activate_then_use",
-      expectedCapabilities: ["memory"],
-      expectedFollowUpTool: "saveMemory",
-    },
+    title: "calls updatePersonalInstructions for global behavior requests",
+    reportName: "global behavior preference calls updatePersonalInstructions",
+    prompt:
+      "Update my personal instructions: when drafting replies, keep the tone formal.",
+    expectedTool: "updatePersonalInstructions",
+    disallowedTools: ["saveMemory", "addToKnowledgeBase"],
     timeout: 120_000,
   },
   {
-    title: "activates settings capability for feature toggle",
-    reportName: "toggle setting activates settings capability",
+    title: "calls saveMemory for chat recall facts",
+    reportName: "chat recall fact calls saveMemory",
+    prompt: "Remember that the project codename is Atlas.",
+    expectedTool: "saveMemory",
+    disallowedTools: ["updatePersonalInstructions", "addToKnowledgeBase"],
+    timeout: 120_000,
+  },
+  {
+    title: "calls updateAssistantSettings for feature toggle",
+    reportName: "toggle setting calls updateAssistantSettings",
     prompt: "Turn on auto-file attachments",
-    expectation: {
-      kind: "activate_then_use",
-      expectedCapabilities: ["settings"],
-      expectedFollowUpTool: "updateAssistantSettings",
-    },
+    expectedTool: "updateAssistantSettings",
   },
   {
-    title: "activates calendar capability before fetching events",
-    reportName: "calendar query activates calendar capability",
+    title: "calls getCalendarEvents for calendar queries",
+    reportName: "calendar query calls getCalendarEvents",
     prompt: "What's on my calendar tomorrow?",
-    expectation: {
-      kind: "activate_then_use",
-      expectedCapabilities: ["calendar"],
-      expectedFollowUpTool: "getCalendarEvents",
-    },
+    expectedTool: "getCalendarEvents",
   },
   {
-    title: "does not need activateTools for core inbox management",
-    reportName: "archive emails uses core tool without activation",
+    title: "calls manageInbox for archive requests",
+    reportName: "archive emails calls manageInbox",
     prompt: "Archive emails from newsletters@example.com",
-    expectation: {
-      kind: "core_tool_no_activation",
-      expectedTool: "manageInbox",
-    },
+    expectedTool: "manageInbox",
   },
   {
-    title: "does not need activateTools for core search",
-    reportName: "search inbox uses core tool without activation",
+    title: "calls searchInbox for search requests",
+    reportName: "search inbox calls searchInbox",
     prompt: "Search my inbox for emails from John",
-    expectation: {
-      kind: "core_tool_no_activation",
-      expectedTool: "searchInbox",
-    },
+    expectedTool: "searchInbox",
   },
 ];
-
-const { mockPosthogCaptureEvent, mockRedis } = vi.hoisted(() => ({
-  mockPosthogCaptureEvent: vi.fn(),
-  mockRedis: {
-    set: vi.fn(),
-    rpush: vi.fn(),
-    hincrby: vi.fn(),
-    expire: vi.fn(),
-    keys: vi.fn().mockResolvedValue([]),
-    get: vi.fn().mockResolvedValue(null),
-    llen: vi.fn().mockResolvedValue(0),
-    lrange: vi.fn().mockResolvedValue([]),
-  },
-}));
 
 vi.mock("@/utils/posthog", () => ({
   posthogCaptureEvent: mockPosthogCaptureEvent,
@@ -146,16 +126,18 @@ vi.mock("@/utils/user/get", () => ({
   getUserPremium: vi.fn(),
 }));
 vi.mock("@/utils/email/provider", () => ({
-  createEmailProvider: vi.fn(),
+  createEmailProvider: mockCreateEmailProvider,
 }));
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 const mockIsActivePremium = vi.mocked(isActivePremium);
 const mockGetUserPremium = vi.mocked(getUserPremium);
@@ -238,6 +220,47 @@ describe.runIf(shouldRunEval)(
       prisma.chatMemory.findFirst.mockResolvedValue(null);
       prisma.chatMemory.create.mockResolvedValue({});
       prisma.knowledge.upsert.mockResolvedValue({});
+      mockCreateEmailProvider.mockResolvedValue({
+        searchMessages: vi.fn().mockResolvedValue({
+          messages: [
+            {
+              id: "msg-newsletter-1",
+              threadId: "thread-newsletter-1",
+              headers: {
+                from: "newsletters@example.com",
+                to: "user@test.com",
+                subject: "Weekly roundup",
+                date: new Date().toISOString(),
+              },
+              snippet: "This week's updates.",
+              textPlain: "This week's updates.",
+              textHtml: "<p>This week's updates.</p>",
+              attachments: [],
+              inline: [],
+              labelIds: ["INBOX"],
+              subject: "Weekly roundup",
+              date: new Date().toISOString(),
+            },
+          ],
+          nextPageToken: undefined,
+        }),
+        getMessagesWithPagination: vi.fn().mockResolvedValue({
+          messages: [],
+          nextPageToken: undefined,
+        }),
+        getLabels: vi.fn().mockResolvedValue([
+          { id: "INBOX", name: "INBOX" },
+          { id: "UNREAD", name: "UNREAD" },
+        ]),
+        getThreadMessages: vi
+          .fn()
+          .mockImplementation(async (threadId: string) => [
+            { id: `${threadId}-message-1`, threadId },
+          ]),
+        archiveThreadWithLabel: vi.fn().mockResolvedValue(undefined),
+        markReadThread: vi.fn().mockResolvedValue(undefined),
+        bulkArchiveFromSenders: vi.fn().mockResolvedValue(undefined),
+      });
     });
 
     describeEvalMatrix(
@@ -252,10 +275,7 @@ describe.runIf(shouldRunEval)(
                 messages: [{ role: "user", content: scenario.prompt }],
               });
 
-              const pass = evaluateScenario(
-                result.toolCalls,
-                scenario.expectation,
-              );
+              const pass = evaluateScenario(result.toolCalls, scenario);
 
               evalReporter.record({
                 testName: scenario.reportName,
@@ -299,62 +319,18 @@ async function runAssistantChat({
 
 function evaluateScenario(
   toolCalls: RecordedToolCall[],
-  expectation: EvalScenario["expectation"],
+  scenario: EvalScenario,
 ): boolean {
-  switch (expectation.kind) {
-    case "activate_then_use": {
-      const activateIndex = toolCalls.findIndex(
-        (tc) =>
-          tc.toolName === "activateTools" &&
-          isActivateToolsInput(tc.input) &&
-          expectation.expectedCapabilities.every((cap) =>
-            (tc.input as ActivateToolsInput).capabilities.includes(cap),
-          ),
-      );
-
-      if (activateIndex < 0) return false;
-
-      const followUpIndex = toolCalls.findIndex(
-        (tc, i) =>
-          i > activateIndex && tc.toolName === expectation.expectedFollowUpTool,
-      );
-
-      return followUpIndex > activateIndex;
-    }
-
-    case "core_tool_no_activation": {
-      const hasActivateCall = toolCalls.some(
-        (tc) => tc.toolName === "activateTools",
-      );
-      const hasCoreToolCall = toolCalls.some(
-        (tc) => tc.toolName === expectation.expectedTool,
-      );
-
-      return !hasActivateCall && hasCoreToolCall;
-    }
-  }
-}
-
-type ActivateToolsInput = {
-  capabilities: string[];
-};
-
-function isActivateToolsInput(input: unknown): input is ActivateToolsInput {
-  if (!input || typeof input !== "object") return false;
-  const value = input as { capabilities?: unknown };
-  return (
-    Array.isArray(value.capabilities) &&
-    value.capabilities.every((c: unknown) => typeof c === "string")
+  const calledExpectedTool = toolCalls.some(
+    (tc) => tc.toolName === scenario.expectedTool,
   );
+  const calledDisallowedTool = scenario.disallowedTools?.some((toolName) =>
+    toolCalls.some((tc) => tc.toolName === toolName),
+  );
+
+  return calledExpectedTool && !calledDisallowedTool;
 }
 
 function summarizeToolCall(toolCall: RecordedToolCall) {
-  if (
-    toolCall.toolName === "activateTools" &&
-    isActivateToolsInput(toolCall.input)
-  ) {
-    return `activateTools([${toolCall.input.capabilities.join(", ")}])`;
-  }
-
   return toolCall.toolName;
 }

@@ -12,6 +12,7 @@ import {
 import {
   captureAssistantChatToolCalls,
   getLastMatchingToolCall,
+  getStableMessageCacheKey,
   summarizeRecordedToolCalls,
   type RecordedToolCall,
 } from "@/__tests__/eval/assistant-chat-eval-utils";
@@ -23,11 +24,11 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-trash-delete
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-trash-delete
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-trash-delete",
+});
 const logger = createScopedLogger("eval-assistant-chat-trash-delete");
 
 const spamMessages = [
@@ -191,13 +192,15 @@ vi.mock("@/utils/senders/unsubscribe", () => ({
 
 vi.mock("@/utils/prisma");
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 describe.runIf(shouldRunEval)("Eval: assistant chat trash/delete", () => {
   beforeEach(() => {
@@ -257,13 +260,6 @@ describe.runIf(shouldRunEval)("Eval: assistant chat trash/delete", () => {
         test(
           scenario.title,
           async () => {
-            if (scenario.searchMessages) {
-              mockSearchMessages.mockResolvedValueOnce({
-                messages: scenario.searchMessages,
-                nextPageToken: undefined,
-              });
-            }
-
             const messages: ModelMessage[] = [];
 
             if (scenario.prefillSearch) {
@@ -278,25 +274,41 @@ describe.runIf(shouldRunEval)("Eval: assistant chat trash/delete", () => {
 
             messages.push({ role: "user", content: scenario.prompt });
 
-            const result = await runAssistantChat({
-              emailAccount,
-              messages,
-            });
+            const record = await evalReporter.recordCached(
+              {
+                testName: scenario.reportName,
+                model: model.label,
+                cacheKeyParts: [
+                  { model, scenario: getScenarioCacheKey(scenario), messages },
+                ],
+              },
+              async () => {
+                if (scenario.searchMessages) {
+                  mockSearchMessages.mockResolvedValueOnce({
+                    messages: scenario.searchMessages,
+                    nextPageToken: undefined,
+                  });
+                }
 
-            const evaluation = await evaluateScenario(
-              result,
-              scenario.prompt,
-              scenario.expectation,
+                const result = await runAssistantChat({
+                  emailAccount,
+                  messages,
+                });
+
+                const evaluation = await evaluateScenario(
+                  result,
+                  scenario.prompt,
+                  scenario.expectation,
+                );
+
+                return {
+                  pass: evaluation.pass,
+                  actual: evaluation.actual,
+                };
+              },
             );
 
-            evalReporter.record({
-              testName: scenario.reportName,
-              model: model.label,
-              pass: evaluation.pass,
-              actual: evaluation.actual,
-            });
-
-            expect(evaluation.pass).toBe(true);
+            expect(record.pass, record.actual).toBe(true);
           },
           TIMEOUT,
         );
@@ -358,6 +370,14 @@ type EvalScenario = {
   searchMessages?: ReturnType<typeof getMockMessage>[];
   expectation: ScenarioExpectation;
 };
+
+function getScenarioCacheKey(scenario: EvalScenario) {
+  return {
+    ...scenario,
+    prefillSearch: getStableMessageCacheKey(scenario.prefillSearch),
+    searchMessages: getStableMessageCacheKey(scenario.searchMessages),
+  };
+}
 
 function isManageInboxInput(input: unknown): input is ManageInboxInput {
   return (

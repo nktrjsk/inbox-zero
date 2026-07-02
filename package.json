@@ -5,7 +5,9 @@
     "build": "turbo build --filter=./apps/web",
     "dev": "turbo dev --filter=./apps/web",
     "worker": "pnpm --filter @inboxzero/worker start",
-    "test": "turbo run test --filter=./apps/web",
+    "test": "turbo run test --filter=./apps/web -- --run",
+    "test-integration": "pnpm --filter inbox-zero-ai test-integration",
+    "test:packages": "pnpm -r --filter @inbox-zero/api --filter @inbox-zero/cli --filter @inboxzero/image-proxy --filter @inboxzero/image-proxy-aws test",
     "lint": "turbo lint",
     "postinstall": "sh clone-marketing.sh",
     "prepare": "husky install",
@@ -22,18 +24,18 @@
     "docker:local:run": "./docker/scripts/run-local.sh"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.10",
-    "@clack/prompts": "1.2.0",
-    "@turbo/gen": "2.9.4",
-    "commander": "14.0.3",
+    "@biomejs/biome": "2.5.1",
+    "@clack/prompts": "1.6.0",
+    "@turbo/gen": "2.10.0",
+    "commander": "15.0.0",
     "husky": "9.1.7",
-    "lint-staged": "16.4.0",
+    "lint-staged": "17.0.8",
     "tsconfig-paths": "4.2.0",
-    "tsx": "4.21.0",
-    "turbo": "2.9.4",
-    "ultracite": "7.4.3"
+    "tsx": "4.22.4",
+    "turbo": "2.10.0",
+    "ultracite": "7.8.3"
   },
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "pnpm@11.9.0",
   "lint-staged": {
     "*.{js,jsx,ts,tsx,json,jsonc,css,scss,md,mdx}": [
       "ultracite fix"
@@ -41,15 +43,5 @@
   },
   "engines": {
     "node": "24.x"
-  },
-  "pnpm": {
-    "overrides": {
-      "@types/react": "19.2.14",
-      "@types/react-dom": "19.2.3",
-      "@xmldom/xmldom": "0.8.12",
-      "fast-xml-parser": "5.5.9",
-      "jws": "4.0.1",
-      "lodash": "4.18.1"
-    }
   }
 }

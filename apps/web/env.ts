@@ -1,11 +1,13 @@
 /* eslint-disable no-process-env */
 import { createEnv } from "@t3-oss/env-nextjs";
 import { z } from "zod";
+import { buildLegacyLlmsEnv, optionalEnvValue } from "@/env-legacy-llms";
 import { booleanString } from "@/utils/zod";
 
 const llmProviderEnum = z.enum([
   "anthropic",
   "azure",
+  "azure-foundry",
   "vertex",
   "google",
   "openai",
@@ -15,6 +17,8 @@ const llmProviderEnum = z.enum([
   "aigateway",
   "ollama",
   "openai-compatible",
+  "codex-cli",
+  "claude-code",
 ]);
 
 /** For Vercel preview deployments, auto-detect from VERCEL_URL. */
@@ -30,6 +34,19 @@ const getBaseUrl = (): string | undefined => {
 
   return process.env.NEXT_PUBLIC_BASE_URL;
 };
+
+const legacyLlmsEnv = buildLegacyLlmsEnv(process.env);
+
+const llmsEnv = (legacyValue: string | undefined) =>
+  z.preprocess(
+    (value) => optionalEnvValue(value) ?? legacyValue,
+    z.string().optional(),
+  );
+
+const defaultLlmsEnv = z.preprocess(
+  (value) => optionalEnvValue(value) ?? legacyLlmsEnv.DEFAULT_LLMS,
+  z.string().min(1),
+);
 
 const parsedEnv = createEnv({
   server: {
@@ -71,37 +88,74 @@ const parsedEnv = createEnv({
     MICROSOFT_CLIENT_ID: z.string().optional(),
     MICROSOFT_CLIENT_SECRET: z.string().optional(),
     MICROSOFT_TENANT_ID: z.string().optional().default("common"),
+    APPLE_CLIENT_ID: z.string().optional(),
+    APPLE_TEAM_ID: z.string().optional(),
+    APPLE_KEY_ID: z.string().optional(),
+    APPLE_PRIVATE_KEY: z.string().optional(),
+    APPLE_APP_BUNDLE_IDENTIFIER: z.string().optional(),
+    // Comma-separated SHA-256 fingerprints served from /.well-known/assetlinks.json
+    ANDROID_APP_CERT_SHA256_FINGERPRINTS: z
+      .string()
+      .optional()
+      .transform((value) =>
+        value
+          ?.split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean),
+      ),
     EMAIL_ENCRYPT_SECRET: z.string(),
     EMAIL_ENCRYPT_SALT: z.string(),
 
-    DEFAULT_LLM_PROVIDER: z
-      // custom is deprecated
-      .enum([...llmProviderEnum.options, "custom"]),
-    DEFAULT_LLM_MODEL: z.string().optional(),
-    DEFAULT_LLM_FALLBACKS: z.string().optional(), // Comma-separated provider:model chain; explicit model required (e.g., "openrouter:anthropic/claude-sonnet-4.6,openai:gpt-5.1")
-    DEFAULT_OPENROUTER_PROVIDERS: z.string().optional(), // Comma-separated list of OpenRouter providers for default model (e.g., "Google Vertex,Anthropic")
-    // Set this to a cheaper model like Gemini Flash
-    ECONOMY_LLM_PROVIDER: llmProviderEnum.optional(),
-    ECONOMY_LLM_MODEL: z.string().optional(),
-    ECONOMY_LLM_FALLBACKS: z.string().optional(), // Comma-separated provider:model chain for economy model; explicit model required
-    ECONOMY_OPENROUTER_PROVIDERS: z.string().optional(), // Comma-separated list of OpenRouter providers for economy model (e.g., "Google Vertex,Anthropic")
-    // Set this to a fast but strong model like Groq Kimi K2. Leaving blank will fallback to default which is also fine.
-    CHAT_LLM_PROVIDER: llmProviderEnum.optional(),
-    CHAT_LLM_MODEL: z.string().optional(),
-    CHAT_LLM_FALLBACKS: z.string().optional(), // Comma-separated provider:model chain for chat model; explicit model required
+    DEFAULT_LLMS: defaultLlmsEnv, // Ordered provider:model chain; first valid entry is primary, later entries are fallbacks
+    ECONOMY_LLMS: llmsEnv(legacyLlmsEnv.ECONOMY_LLMS), // Ordered provider:model chain for economy model plus fallbacks
+    CHAT_LLMS: llmsEnv(legacyLlmsEnv.CHAT_LLMS), // Ordered provider:model chain for chat model plus fallbacks
+    NANO_LLMS: llmsEnv(legacyLlmsEnv.NANO_LLMS), // Ordered provider:model chain for nano model plus fallbacks
+    DRAFT_LLMS: llmsEnv(legacyLlmsEnv.DRAFT_LLMS), // Ordered provider:model chain for draft model plus fallbacks
     CHAT_OPENROUTER_PROVIDERS: z.string().optional(), // Comma-separated list of OpenRouter providers for chat (e.g., "Google Vertex,Anthropic")
+    DEFAULT_OPENROUTER_PROVIDERS: z.string().optional(), // Comma-separated list of OpenRouter providers for default model (e.g., "Google Vertex,Anthropic")
+    ECONOMY_OPENROUTER_PROVIDERS: z.string().optional(), // Comma-separated list of OpenRouter providers for economy model (e.g., "Google Vertex,Anthropic")
+    // Deprecated: use DEFAULT_LLMS instead. Kept so older deployments are converted at startup.
+    DEFAULT_LLM_PROVIDER: z
+      .enum([...llmProviderEnum.options, "custom"])
+      .optional(),
+    // Deprecated: use DEFAULT_LLMS instead. Kept so older deployments are converted at startup.
+    DEFAULT_LLM_MODEL: z.string().optional(),
+    // Deprecated: use DEFAULT_LLMS instead. Kept so older deployments are converted at startup.
+    DEFAULT_LLM_FALLBACKS: z.string().optional(),
+    // Deprecated: use ECONOMY_LLMS instead. Kept so older deployments are converted at startup.
+    ECONOMY_LLM_PROVIDER: llmProviderEnum.optional(),
+    // Deprecated: use ECONOMY_LLMS instead. Kept so older deployments are converted at startup.
+    ECONOMY_LLM_MODEL: z.string().optional(),
+    // Deprecated: use ECONOMY_LLMS instead. Kept so older deployments are converted at startup.
+    ECONOMY_LLM_FALLBACKS: z.string().optional(),
+    // Deprecated: use CHAT_LLMS instead. Kept so older deployments are converted at startup.
+    CHAT_LLM_PROVIDER: llmProviderEnum.optional(),
+    // Deprecated: use CHAT_LLMS instead. Kept so older deployments are converted at startup.
+    CHAT_LLM_MODEL: z.string().optional(),
+    // Deprecated: use CHAT_LLMS instead. Kept so older deployments are converted at startup.
+    CHAT_LLM_FALLBACKS: z.string().optional(),
+    // Deprecated: use NANO_LLMS instead. Kept so older deployments are converted at startup.
     NANO_LLM_PROVIDER: llmProviderEnum.optional(),
+    // Deprecated: use NANO_LLMS instead. Kept so older deployments are converted at startup.
     NANO_LLM_MODEL: z.string().optional(),
-    // Set this to override the model used for drafting replies
+    // Deprecated: use DRAFT_LLMS instead. Kept so older deployments are converted at startup.
     DRAFT_LLM_PROVIDER: llmProviderEnum.optional(),
+    // Deprecated: use DRAFT_LLMS instead. Kept so older deployments are converted at startup.
     DRAFT_LLM_MODEL: z.string().optional(),
     AI_NANO_WEEKLY_SPEND_LIMIT_USD: z.coerce.number().positive().optional(),
+    AI_TRIAL_WEEKLY_SPEND_LIMIT_USD: z.coerce.number().positive().optional(),
+    // Unset defaults to ALLOW. Used when an account has not chosen a policy.
+    SENSITIVE_DATA_POLICY_DEFAULT: z
+      .enum(["ALLOW", "REDACT", "BLOCK"])
+      .optional(),
 
     LLM_API_KEY: z.string().optional(),
     OPENAI_API_KEY: z.string().optional(),
     AZURE_API_KEY: z.string().optional(),
     AZURE_RESOURCE_NAME: z.string().optional(),
     AZURE_API_VERSION: z.string().optional(),
+    AZURE_FOUNDRY_API_KEY: z.string().optional(),
+    AZURE_FOUNDRY_BASE_URL: z.string().optional(),
     ANTHROPIC_API_KEY: z.string().optional(),
     BEDROCK_ACCESS_KEY: z.string().optional(),
     BEDROCK_SECRET_KEY: z.string().optional(),
@@ -124,6 +178,12 @@ const parsedEnv = createEnv({
     OLLAMA_MODEL: z.string().optional(),
     OPENAI_COMPATIBLE_BASE_URL: z.string().optional(),
     OPENAI_COMPATIBLE_MODEL: z.string().optional(),
+    OPENAI_COMPATIBLE_AUTH_HEADER: z
+      .enum(["authorization", "api-key"])
+      .optional(),
+    CLI_LLM_ENABLED: booleanString.optional().default(false),
+    CODEX_CLI_ALLOW_NPX: booleanString.optional().default(false),
+    CODEX_CLI_PATH: z.string().optional(),
 
     OPENAI_ZERO_DATA_RETENTION: booleanString.optional().default(false),
 
@@ -143,7 +203,10 @@ const parsedEnv = createEnv({
     QSTASH_TOKEN: z.string().optional(),
     QSTASH_CURRENT_SIGNING_KEY: z.string().optional(),
     QSTASH_NEXT_SIGNING_KEY: z.string().optional(),
-    QUEUE_BACKEND: z.enum(["bullmq", "internal", "qstash"]).optional(),
+    QUEUE_BACKEND: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.enum(["bullmq", "internal", "qstash"]).optional(),
+    ),
 
     GOOGLE_PUBSUB_TOPIC_NAME: z.string().optional().default(""),
     GOOGLE_PUBSUB_VERIFICATION_TOKEN: z.string().optional(),
@@ -155,6 +218,8 @@ const parsedEnv = createEnv({
     SENTRY_PROJECT: z.string().optional(),
     AXIOM_DATASET: z.string().optional(),
     AXIOM_TOKEN: z.string().optional(),
+    AXIOM_AUDIT_DATASET: z.string().optional(),
+    AXIOM_AUDIT_TOKEN: z.string().optional(),
 
     DISABLE_LOG_ZOD_ERRORS: booleanString.optional(),
     ENABLE_DEBUG_LOGS: booleanString.default(false),
@@ -163,6 +228,14 @@ const parsedEnv = createEnv({
       .int()
       .nonnegative()
       .default(50),
+    REASONING_RETENTION_DAYS: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().int().nonnegative().optional(),
+    ),
+    DRAFT_SENT_TEXT_RETENTION_DAYS: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().int().nonnegative().default(14),
+    ),
 
     // Lemon Squeezy
     LEMON_SQUEEZY_SIGNING_SECRET: z.string().optional(),
@@ -173,10 +246,16 @@ const parsedEnv = createEnv({
     STRIPE_WEBHOOK_SECRET: z.string().optional(),
     STRIPE_AI_GENERATION_OVERAGE_CONFIG: z.string().optional(),
 
+    // Apple App Store
+    APPLE_IAP_ISSUER_ID: z.string().uuid().optional(),
+    APPLE_IAP_KEY_ID: z.string().min(1).optional(),
+    APPLE_IAP_PRIVATE_KEY: z.string().min(1).optional(),
+    APPLE_IAP_BUNDLE_ID: z.string().min(1).optional(),
+    APPLE_IAP_APPLE_ID: z.coerce.number().int().positive().optional(),
+    SUPERWALL_APP_STORE_CONNECT_FORWARD_URL: z.string().url().optional(),
+
     TINYBIRD_TOKEN: z.string().optional(),
     TINYBIRD_BASE_URL: z.string().default("https://api.us-east.tinybird.co/"),
-    TINYBIRD_ENCRYPT_SECRET: z.string().optional(),
-    TINYBIRD_ENCRYPT_SALT: z.string().optional(),
 
     API_KEY_SALT: z.string().optional(),
 
@@ -194,6 +273,7 @@ const parsedEnv = createEnv({
     LOOPS_API_SECRET: z.string().optional(),
     FB_CONVERSION_API_ACCESS_TOKEN: z.string().optional(),
     FB_PIXEL_ID: z.string().optional(),
+    CONVERSION_ANALYTICS_SERVER_URL: z.string().optional(),
     ADMINS: z
       .string()
       .optional()
@@ -240,12 +320,11 @@ const parsedEnv = createEnv({
     TEAMS_BOT_APP_ID: z.string().optional(),
     TEAMS_BOT_APP_PASSWORD: z.string().optional(),
     TEAMS_BOT_APP_TENANT_ID: z.string().optional(),
-    TEAMS_BOT_APP_TYPE: z.enum(["MultiTenant", "SingleTenant"]).optional(),
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_BOT_SECRET_TOKEN: z.string().optional(),
     APP_REVIEW_DEMO_ENABLED: booleanString.optional().default(false),
-    APP_REVIEW_DEMO_CODE: z.string().optional(),
-    APP_REVIEW_DEMO_EMAIL: z.string().email().optional(),
+    APP_REVIEW_DEMO_ACCOUNTS: z.string().optional(),
+    SSO_LOGIN_ENABLED: booleanString.optional().default(false),
     // Enables email/password auth + the generic IMAP/SMTP provider. Off by
     // default so OAuth-only deployments don't silently open public signup.
     IMAP_PROVIDER_ENABLED: booleanString.optional().default(false),
@@ -258,6 +337,10 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_STRIPE_PLUS_ANNUALLY_PRICE_ID: z.string().optional(),
     NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_MONTHLY_PRICE_ID: z.string().optional(),
     NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_ANNUALLY_PRICE_ID: z.string().optional(),
+
+    // apple app store
+    NEXT_PUBLIC_APPLE_IAP_STARTER_MONTHLY_PRODUCT_ID: z.string().optional(),
+    NEXT_PUBLIC_APPLE_IAP_STARTER_ANNUALLY_PRODUCT_ID: z.string().optional(),
 
     // lemon squeezy
     NEXT_PUBLIC_LEMON_STORE_ID: z.string().nullish().default("inboxzero"),
@@ -286,6 +369,7 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_BRAND_LOGO_URL: z.string().optional(),
     NEXT_PUBLIC_BRAND_ICON_URL: z.string().optional().default("/icon.png"),
     NEXT_PUBLIC_SLACK_BOT_NAME: z.string().trim().min(1).default("Inbox Zero"),
+    NEXT_PUBLIC_SELF_HOSTED_LOGIN_FOOTER_TEXT: z.string().optional(),
     NEXT_PUBLIC_CONTACTS_ENABLED: booleanString.optional().default(false),
     NEXT_PUBLIC_EMAIL_SEND_ENABLED: booleanString.default(true),
     NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED: booleanString.optional().default(true),
@@ -293,8 +377,9 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_SUPPORT_EMAIL: z
       .string()
       .optional()
-      .default("elie@getinboxzero.com"),
+      .default("support@getinboxzero.com"),
     NEXT_PUBLIC_GTM_ID: z.string().optional(),
+    NEXT_PUBLIC_CONVERSION_ANALYTICS_SCRIPT_URL: z.string().optional(),
     NEXT_PUBLIC_CRISP_WEBSITE_ID: z.string().optional(),
     NEXT_PUBLIC_WELCOME_UPGRADE_ENABLED: booleanString
       .optional()
@@ -320,8 +405,16 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_INTEGRATIONS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_SMART_FILING_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_CLEANER_ENABLED: booleanString.optional(),
+    NEXT_PUBLIC_BOOKING_LINKS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_EXTERNAL_API_ENABLED: booleanString.optional().default(false),
     NEXT_PUBLIC_AUTO_DRAFT_DISABLED: booleanString.optional(),
+    NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED: booleanString
+      .optional()
+      .default(false),
+    // When true, the deployment default is enforced and account-level edits are disabled.
+    NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED: booleanString
+      .optional()
+      .default(false),
     NEXT_PUBLIC_IS_RESEND_CONFIGURED: booleanString.optional(),
     NEXT_PUBLIC_TABS_EXTENSION_ID: z
       .string()
@@ -343,6 +436,12 @@ const parsedEnv = createEnv({
       process.env.NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_MONTHLY_PRICE_ID,
     NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_ANNUALLY_PRICE_ID:
       process.env.NEXT_PUBLIC_STRIPE_BUSINESS_PLUS_ANNUALLY_PRICE_ID,
+
+    // apple app store
+    NEXT_PUBLIC_APPLE_IAP_STARTER_MONTHLY_PRODUCT_ID:
+      process.env.NEXT_PUBLIC_APPLE_IAP_STARTER_MONTHLY_PRODUCT_ID,
+    NEXT_PUBLIC_APPLE_IAP_STARTER_ANNUALLY_PRODUCT_ID:
+      process.env.NEXT_PUBLIC_APPLE_IAP_STARTER_ANNUALLY_PRODUCT_ID,
 
     // lemon squeezy
     NEXT_PUBLIC_LEMON_STORE_ID: process.env.NEXT_PUBLIC_LEMON_STORE_ID,
@@ -376,6 +475,8 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_BRAND_LOGO_URL: process.env.NEXT_PUBLIC_BRAND_LOGO_URL,
     NEXT_PUBLIC_BRAND_ICON_URL: process.env.NEXT_PUBLIC_BRAND_ICON_URL,
     NEXT_PUBLIC_SLACK_BOT_NAME: process.env.NEXT_PUBLIC_SLACK_BOT_NAME,
+    NEXT_PUBLIC_SELF_HOSTED_LOGIN_FOOTER_TEXT:
+      process.env.NEXT_PUBLIC_SELF_HOSTED_LOGIN_FOOTER_TEXT,
     NEXT_PUBLIC_CONTACTS_ENABLED: process.env.NEXT_PUBLIC_CONTACTS_ENABLED,
     NEXT_PUBLIC_EMAIL_SEND_ENABLED: process.env.NEXT_PUBLIC_EMAIL_SEND_ENABLED,
     NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED:
@@ -385,6 +486,8 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_SENTRY_DSN: process.env.NEXT_PUBLIC_SENTRY_DSN,
     NEXT_PUBLIC_SUPPORT_EMAIL: process.env.NEXT_PUBLIC_SUPPORT_EMAIL,
     NEXT_PUBLIC_GTM_ID: process.env.NEXT_PUBLIC_GTM_ID,
+    NEXT_PUBLIC_CONVERSION_ANALYTICS_SCRIPT_URL:
+      process.env.NEXT_PUBLIC_CONVERSION_ANALYTICS_SCRIPT_URL,
     NEXT_PUBLIC_CRISP_WEBSITE_ID: process.env.NEXT_PUBLIC_CRISP_WEBSITE_ID,
     NEXT_PUBLIC_WELCOME_UPGRADE_ENABLED:
       process.env.NEXT_PUBLIC_WELCOME_UPGRADE_ENABLED,
@@ -407,10 +510,16 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_SMART_FILING_ENABLED:
       process.env.NEXT_PUBLIC_SMART_FILING_ENABLED,
     NEXT_PUBLIC_CLEANER_ENABLED: process.env.NEXT_PUBLIC_CLEANER_ENABLED,
+    NEXT_PUBLIC_BOOKING_LINKS_ENABLED:
+      process.env.NEXT_PUBLIC_BOOKING_LINKS_ENABLED,
     NEXT_PUBLIC_EXTERNAL_API_ENABLED:
       process.env.NEXT_PUBLIC_EXTERNAL_API_ENABLED,
     NEXT_PUBLIC_AUTO_DRAFT_DISABLED:
       process.env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED,
+    NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED:
+      process.env.NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED,
+    NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED:
+      process.env.NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED,
     NEXT_PUBLIC_IS_RESEND_CONFIGURED:
       process.env.NEXT_PUBLIC_IS_RESEND_CONFIGURED,
     NEXT_PUBLIC_TABS_EXTENSION_ID: process.env.NEXT_PUBLIC_TABS_EXTENSION_ID,

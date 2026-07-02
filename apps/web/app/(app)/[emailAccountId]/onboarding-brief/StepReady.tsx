@@ -20,12 +20,9 @@ import {
   frequencies,
   DiscountBadge,
 } from "@/app/(app)/premium/PricingFrequencyToggle";
-import {
-  BRIEF_MY_MEETING_PRICE_ID_MONTHLY,
-  BRIEF_MY_MEETING_PRICE_ID_ANNUALLY,
-} from "@/app/(app)/premium/config";
 import { generateCheckoutSessionAction } from "@/utils/actions/premium";
 import { toastError } from "@/components/Toast";
+import { redirectToSafeUrl } from "@/utils/redirect";
 
 const PRICING_FEATURES = [
   "Briefs for every external meeting",
@@ -44,19 +41,18 @@ export function StepReady() {
     try {
       const tier =
         frequency.value === "annually" ? "STARTER_ANNUALLY" : "STARTER_MONTHLY";
-      const priceId =
-        frequency.value === "annually"
-          ? BRIEF_MY_MEETING_PRICE_ID_ANNUALLY
-          : BRIEF_MY_MEETING_PRICE_ID_MONTHLY;
 
-      const result = await generateCheckoutSessionAction({ tier, priceId });
+      const result = await generateCheckoutSessionAction({
+        tier,
+        offer: "BRIEF_MY_MEETING",
+      });
 
       if (!result?.data?.url) {
         toastError({ description: "Error creating checkout session" });
         return;
       }
 
-      window.location.href = result.data.url;
+      redirectToSafeUrl(result.data.url, { allowExternal: true });
     } catch {
       toastError({ description: "Error creating checkout session" });
     } finally {

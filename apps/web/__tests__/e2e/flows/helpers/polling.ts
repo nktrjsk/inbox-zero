@@ -13,7 +13,10 @@ import { logStep } from "./logging";
 import { sleep } from "@/utils/sleep";
 import { extractEmailAddress } from "@/utils/email";
 import { getOrCreateFollowUpLabel } from "@/utils/follow-up/labels";
-import type { ThreadTrackerType } from "@/generated/prisma/enums";
+import {
+  DraftEmailStatus,
+  type ThreadTrackerType,
+} from "@/generated/prisma/enums";
 
 interface PollOptions {
   description?: string;
@@ -155,7 +158,7 @@ export async function waitForExecutedRule(options: {
         description: `ExecutedRule for thread ${threadId} to reach terminal status`,
       },
     );
-  } catch (_error) {
+  } catch {
     const elapsed = Date.now() - startTime;
     throw new Error(
       `Timeout waiting for ExecutedRule after ${elapsed}ms. ` +
@@ -543,7 +546,7 @@ export async function waitForDraftSendLog(options: {
           executedAction: {
             select: {
               draftId: true,
-              wasDraftSent: true,
+              draftStatus: true,
             },
           },
         },
@@ -559,7 +562,7 @@ export async function waitForDraftSendLog(options: {
         sentMessageId: log.sentMessageId,
         similarityScore: log.similarityScore,
         draftId: log.executedAction.draftId,
-        wasSentFromDraft: log.executedAction.wasDraftSent,
+        wasSentFromDraft: isSentDraftStatus(log.executedAction.draftStatus),
       };
     },
     {
@@ -644,7 +647,7 @@ export async function waitForThreadTracker(options: {
         description: `ThreadTracker${type ? ` (${type})` : ""} for thread ${threadId}`,
       },
     );
-  } catch (_error) {
+  } catch {
     const elapsed = Date.now() - startTime;
     const webhookUrl =
       process.env.WEBHOOK_URL || process.env.NEXT_PUBLIC_BASE_URL;
@@ -715,4 +718,8 @@ export async function waitForThreadMessageCount(options: {
       description: `Thread ${threadId} to have at least ${minCount} messages`,
     },
   );
+}
+
+function isSentDraftStatus(status?: DraftEmailStatus | null) {
+  return status === DraftEmailStatus.LIKELY_SENT;
 }

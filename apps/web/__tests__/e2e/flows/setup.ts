@@ -21,27 +21,13 @@ import {
 import { ensureWebhookSubscription } from "./helpers/webhook";
 import { logStep } from "./helpers/logging";
 
-// Mock server-only module (Next.js specific)
-vi.mock("server-only", () => ({}));
-
 // Mock message processing lock to always succeed
 vi.mock("@/utils/redis/message-processing", () => ({
+  acquireOutboundMessageLock: vi.fn().mockResolvedValue("lock-token-1"),
+  clearOutboundMessageLock: vi.fn().mockResolvedValue(true),
   markMessageAsProcessing: vi.fn().mockResolvedValue(true),
+  markOutboundMessageProcessed: vi.fn().mockResolvedValue(true),
 }));
-
-// Mock Next.js after() to run immediately in tests
-// This ensures webhook processing completes before assertions
-vi.mock("next/server", async () => {
-  const actual =
-    await vi.importActual<typeof import("next/server")>("next/server");
-  return {
-    ...actual,
-    after: async (fn: () => void | Promise<void>) => {
-      // Run the async function and wait for it
-      await fn();
-    },
-  };
-});
 
 /**
  * Initialize test environment

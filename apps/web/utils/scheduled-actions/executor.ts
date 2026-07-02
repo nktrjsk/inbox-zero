@@ -7,7 +7,11 @@ import prisma from "@/utils/prisma";
 import type { Logger } from "@/utils/logger";
 import { getEmailAccountWithAiAndTokens } from "@/utils/user/get";
 import { runActionFunction } from "@/utils/ai/actions";
-import type { ActionItem, EmailForAction } from "@/utils/ai/types";
+import type {
+  ActionExecutionEmailAccount,
+  ActionItem,
+  EmailForAction,
+} from "@/utils/ai/types";
 import type { EmailProvider } from "@/utils/email/types";
 
 const MODULE = "scheduled-actions-executor";
@@ -45,6 +49,7 @@ export async function executeScheduledAction(
         log,
         "Email no longer exists",
       );
+      await checkAndCompleteExecutedRule(scheduledAction.executedRuleId, log);
       return { success: true, reason: "Email no longer exists" };
     }
 
@@ -59,6 +64,7 @@ export async function executeScheduledAction(
       bcc: scheduledAction.bcc,
       url: scheduledAction.url,
       staticAttachments: scheduledAction.staticAttachments,
+      selectedAttachments: scheduledAction.selectedAttachments,
     };
 
     const executedAction = await executeDelayedAction({
@@ -90,6 +96,7 @@ export async function executeScheduledAction(
     });
 
     await markActionFailed(scheduledAction.id, error, log);
+    await checkAndCompleteExecutedRule(scheduledAction.executedRuleId, log);
     return { success: false, error };
   }
 }
@@ -155,7 +162,7 @@ async function executeDelayedAction({
   client: EmailProvider;
   actionItem: ActionItem;
   emailMessage: EmailForAction;
-  emailAccount: { email: string; userId: string; id: string };
+  emailAccount: ActionExecutionEmailAccount;
   scheduledAction: ScheduledAction;
   log: Logger;
 }) {
@@ -170,13 +177,16 @@ async function executeDelayedAction({
       bcc: actionItem.bcc,
       url: actionItem.url,
       staticAttachments: actionItem.staticAttachments ?? undefined,
+      selectedAttachments: actionItem.selectedAttachments ?? undefined,
       executedRuleId: scheduledAction.executedRuleId,
     },
   });
 
   const executedRule = await prisma.executedRule.findUnique({
     where: { id: scheduledAction.executedRuleId },
-    include: { actionItems: true },
+    include: {
+      actionItems: true,
+    },
   });
 
   if (!executedRule) {
@@ -204,9 +214,7 @@ async function executeDelayedAction({
     client,
     email,
     action: executedAction,
-    userEmail: emailAccount.email,
-    userId: emailAccount.userId,
-    emailAccountId: emailAccount.id,
+    emailAccount,
     executedRule,
     logger: log,
   });
@@ -269,7 +277,7 @@ async function markActionFailed(
  * Check if all scheduled actions for an ExecutedRule are complete
  * and update the ExecutedRule status accordingly
  */
-async function checkAndCompleteExecutedRule(
+export async function checkAndCompleteExecutedRule(
   executedRuleId: string,
   log: Logger,
 ) {
@@ -283,13 +291,35 @@ async function checkAndCompleteExecutedRule(
   });
 
   if (pendingActions === 0) {
-    await prisma.executedRule.update({
-      where: { id: executedRuleId },
-      data: { status: ExecutedRuleStatus.APPLIED },
+    const failedActions = await prisma.scheduledAction.count({
+      where: {
+        executedRuleId,
+        status: ScheduledActionStatus.FAILED,
+      },
     });
 
-    log.info("Completed ExecutedRule - all scheduled actions finished", {
-      executedRuleId,
-    });
+    if (failedActions > 0) {
+      await prisma.executedRule.update({
+        where: { id: executedRuleId },
+        data: {
+          status: ExecutedRuleStatus.ERROR,
+          reason: "One or more scheduled actions failed",
+        },
+      });
+
+      log.info("ExecutedRule errored - some scheduled actions failed", {
+        executedRuleId,
+        failedActions,
+      });
+    } else {
+      await prisma.executedRule.update({
+        where: { id: executedRuleId },
+        data: { status: ExecutedRuleStatus.APPLIED },
+      });
+
+      log.info("Completed ExecutedRule - all scheduled actions finished", {
+        executedRuleId,
+      });
+    }
   }
 }

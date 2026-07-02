@@ -1,9 +1,47 @@
-function getGmailBaseUrl(emailAddress?: string | null) {
-  return `https://mail.google.com/mail/u/${emailAddress || 0}`;
+import { extractDomainFromEmail } from "@/utils/email";
+
+export function createSearchParams(params: Record<string, unknown>) {
+  const searchParams = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value === null || value === undefined) continue;
+    searchParams.set(key, String(value));
+  }
+
+  return searchParams;
 }
 
-function getOutlookBaseUrl() {
-  return "https://outlook.live.com/mail/0";
+function getGmailUrlForFragment(
+  fragment: string,
+  emailAddress?: string | null,
+) {
+  if (!emailAddress) return `https://mail.google.com/mail/u/0/#${fragment}`;
+
+  return `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(emailAddress)}#${fragment}`;
+}
+
+// Personal Microsoft accounts (outlook / hotmail / live / msn) sign in at
+// outlook.live.com; everything else is an Entra ID / Microsoft 365 mailbox
+// served from outlook.office.com. The two hosts route to separate services, so
+// pointing a business user at outlook.live.com lands them on the homepage.
+// Prefix match covers country variants like outlook.fr, live.co.uk, hotmail.de.
+const PERSONAL_MICROSOFT_DOMAIN_PREFIXES = ["outlook.", "hotmail.", "live."];
+const PERSONAL_MICROSOFT_DOMAINS = new Set(["msn.com", "passport.com"]);
+
+function isPersonalMicrosoftEmail(emailAddress?: string | null) {
+  if (!emailAddress) return false;
+  const domain = extractDomainFromEmail(emailAddress).toLowerCase();
+  if (!domain) return false;
+  if (PERSONAL_MICROSOFT_DOMAINS.has(domain)) return true;
+  return PERSONAL_MICROSOFT_DOMAIN_PREFIXES.some((prefix) =>
+    domain.startsWith(prefix),
+  );
+}
+
+function getOutlookBaseUrl(emailAddress?: string | null) {
+  return isPersonalMicrosoftEmail(emailAddress)
+    ? "https://outlook.live.com/mail/0"
+    : "https://outlook.office.com/mail";
 }
 
 const PROVIDER_CONFIG: Record<
@@ -20,37 +58,37 @@ const PROVIDER_CONFIG: Record<
 > = {
   microsoft: {
     requiresMessageId: true,
-    buildUrl: (messageOrThreadId: string, _emailAddress?: string | null) => {
-      // Outlook URL format: https://outlook.live.com/mail/0/inbox/id/ENCODED_MESSAGE_ID
-      // The message ID needs to be URL-encoded for Outlook
+    buildUrl: (messageOrThreadId: string, emailAddress?: string | null) => {
       const encodedMessageId = encodeURIComponent(messageOrThreadId);
-      return `${getOutlookBaseUrl()}/inbox/id/${encodedMessageId}`;
+      return `${getOutlookBaseUrl(emailAddress)}/inbox/id/${encodedMessageId}`;
     },
     selectId: (messageId: string, _threadId: string) => messageId,
-    buildSearchUrl: (from: string, _emailAddress?: string | null) => {
+    buildSearchUrl: (from: string, emailAddress?: string | null) => {
       const query = encodeURIComponent(`from:${from}`);
-      return `${getOutlookBaseUrl()}/search/q/${query}`;
+      return `${getOutlookBaseUrl(emailAddress)}/search/q/${query}`;
     },
   },
   google: {
     requiresMessageId: false,
     buildUrl: (messageOrThreadId: string, emailAddress?: string | null) =>
-      `${getGmailBaseUrl(emailAddress)}/#all/${messageOrThreadId}`,
+      getGmailUrlForFragment(`all/${messageOrThreadId}`, emailAddress),
     selectId: (messageId: string, _threadId: string) => messageId,
     buildSearchUrl: (from: string, emailAddress?: string | null) =>
-      `${getGmailBaseUrl(
+      getGmailUrlForFragment(
+        `advanced-search/from=${encodeURIComponent(from)}`,
         emailAddress,
-      )}/#advanced-search/from=${encodeURIComponent(from)}`,
+      ),
   },
   default: {
     requiresMessageId: false,
     buildUrl: (messageOrThreadId: string, emailAddress?: string | null) =>
-      `${getGmailBaseUrl(emailAddress)}/#all/${messageOrThreadId}`,
+      getGmailUrlForFragment(`all/${messageOrThreadId}`, emailAddress),
     selectId: (_messageId: string, threadId: string) => threadId,
     buildSearchUrl: (from: string, emailAddress?: string | null) =>
-      `${getGmailBaseUrl(
+      getGmailUrlForFragment(
+        `advanced-search/from=${encodeURIComponent(from)}`,
         emailAddress,
-      )}/#advanced-search/from=${encodeURIComponent(from)}`,
+      ),
   },
 } as const;
 
@@ -138,9 +176,10 @@ export function getEmailSearchUrl(
 }
 
 export function getGmailBasicSearchUrl(emailAddress: string, query: string) {
-  return `${getGmailBaseUrl(emailAddress)}/#search/${encodeURIComponent(
-    query,
-  )}`;
+  return getGmailUrlForFragment(
+    `search/${encodeURIComponent(query)}`,
+    emailAddress,
+  );
 }
 
 // export function getGmailCreateFilterUrl(
@@ -154,5 +193,5 @@ export function getGmailBasicSearchUrl(emailAddress: string, query: string) {
 // }
 
 export function getGmailFilterSettingsUrl(emailAddress?: string | null) {
-  return `${getGmailBaseUrl(emailAddress)}/#settings/filters`;
+  return getGmailUrlForFragment("settings/filters", emailAddress);
 }

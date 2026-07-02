@@ -2,7 +2,9 @@ import type { ModelMessage } from "ai";
 import { afterAll, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   captureAssistantChatToolCalls,
-  getLastMatchingToolCall,
+  getLastRuleActionsUpdate,
+  hasActionType,
+  hasLabelAction,
   summarizeRecordedToolCalls,
   type RecordedToolCall,
 } from "@/__tests__/eval/assistant-chat-eval-utils";
@@ -24,11 +26,11 @@ import { createScopedLogger } from "@/utils/logger";
 // pnpm test-ai eval/assistant-chat-rule-editing
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-rule-editing
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 240_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-rule-editing-action-updates",
+});
 const logger = createScopedLogger(
   "eval-assistant-chat-rule-editing-action-updates",
 );
@@ -108,13 +110,15 @@ vi.mock("@/utils/senders/unsubscribe", () => ({
 
 vi.mock("@/utils/prisma");
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 describe.runIf(shouldRunEval)(
   "Eval: assistant chat rule editing action updates",
@@ -160,20 +164,12 @@ describe.runIf(shouldRunEval)(
               ],
             });
 
-            const updateCall = getLastMatchingToolCall(
-              toolCalls,
-              "updateRuleActions",
-              isUpdateRuleActionsInput,
-            )?.input;
-            const updateCallIndex = getLastToolCallIndex(
-              toolCalls,
-              "updateRuleActions",
-            );
+            const updateCall = getLastRuleActionsUpdate(toolCalls);
 
             const pass =
               !!updateCall &&
               updateCall.ruleName === "Notification" &&
-              hasRuleReadBeforeUpdate(toolCalls, updateCallIndex) &&
+              hasRuleReadBeforeUpdate(toolCalls, updateCall.index) &&
               !toolCalls.some(
                 (toolCall) => toolCall.toolName === "createRule",
               ) &&
@@ -205,11 +201,7 @@ describe.runIf(shouldRunEval)(
               ],
             });
 
-            const updateCall = getLastMatchingToolCall(
-              toolCalls,
-              "updateRuleActions",
-              isUpdateRuleActionsInput,
-            )?.input;
+            const updateCall = getLastRuleActionsUpdate(toolCalls);
 
             const pass =
               !!updateCall &&
@@ -257,53 +249,6 @@ async function runAssistantChat({
       (toolCall) => toolCall.toolName,
     ),
   };
-}
-
-type UpdateRuleActionsInput = {
-  ruleName: string;
-  actions: Array<{
-    type: ActionType;
-    fields?: {
-      label?: string | null;
-    } | null;
-    delayInMinutes?: number | null;
-  }>;
-};
-
-function isUpdateRuleActionsInput(
-  input: unknown,
-): input is UpdateRuleActionsInput {
-  if (!input || typeof input !== "object") return false;
-
-  const value = input as {
-    ruleName?: unknown;
-    actions?: unknown;
-  };
-
-  return typeof value.ruleName === "string" && Array.isArray(value.actions);
-}
-
-function hasActionType(
-  actions: Array<{ type: ActionType }>,
-  expectedActionType: ActionType,
-) {
-  return actions.some((action) => action.type === expectedActionType);
-}
-
-function hasLabelAction(
-  actions: Array<{
-    type: ActionType;
-    fields?: {
-      label?: string | null;
-    } | null;
-  }>,
-  expectedLabel: string,
-) {
-  return actions.some(
-    (action) =>
-      action.type === ActionType.LABEL &&
-      action.fields?.label === expectedLabel,
-  );
 }
 
 function getLastToolCallIndex(toolCalls: RecordedToolCall[], toolName: string) {

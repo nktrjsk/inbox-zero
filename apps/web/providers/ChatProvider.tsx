@@ -8,6 +8,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -18,7 +19,7 @@ import type { ChatMessage } from "@/components/assistant-chat/types";
 import { useChatMessages } from "@/hooks/useChatMessages";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { EMAIL_ACCOUNT_HEADER } from "@/utils/config";
-import type { MessageContext } from "@/app/api/chat/validation";
+import type { MessageContext } from "@/utils/ai/assistant/chat-context-validation";
 import { InlineEmailActionProvider } from "@/components/assistant-chat/inline-email-action-context";
 import {
   mergeInlineEmailActions,
@@ -39,9 +40,11 @@ type ChatContextType = {
   chat: Chat;
   input: string;
   chatId: string | null;
+  persistedMessageIds: Set<string>;
   setInput: (input: string) => void;
   setChatId: (chatId: string | null) => void;
   setNewChat: () => void;
+  submitTextMessage: (text: string) => Promise<void>;
   handleSubmit: () => void;
   context: MessageContext | null;
   setContext: (context: MessageContext | null) => void;
@@ -63,8 +66,13 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   const inlineActionsRef = useRef(inlineActions);
   const pendingInlineActionsRef = useRef<InlineEmailAction[] | null>(null);
   const previousChatIdRef = useRef(chatId);
+  const previousEmailAccountIdRef = useRef<string | null>(null);
 
   const { data } = useChatMessages(chatId);
+  const persistedMessageIds = useMemo(
+    () => new Set(data?.messages.map((message) => message.id) ?? []),
+    [data?.messages],
+  );
 
   const setNewChat = useCallback(() => {
     setChatId(generateUUID());
@@ -101,9 +109,12 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     // messages: initialMessages, // NOTE: couldn't get this to work
     experimental_throttle: 100,
     generateId: generateUUID,
-    onFinish: () => {
+    onFinish: async () => {
       pendingInlineActionsRef.current = null;
-      mutate("/api/user/rules");
+      await Promise.all([
+        mutate("/api/user/rules"),
+        chatId ? mutate(`/api/chats/${chatId}`) : Promise.resolve(),
+      ]);
     },
     onError: (error) => {
       const pendingInlineActions = pendingInlineActionsRef.current;
@@ -138,15 +149,68 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     setInlineActions([]);
   }, [chatId]);
 
+  useEffect(() => {
+    if (!emailAccountId) return;
+
+    if (previousEmailAccountIdRef.current === null) {
+      previousEmailAccountIdRef.current = emailAccountId;
+      return;
+    }
+
+    if (previousEmailAccountIdRef.current === emailAccountId) return;
+
+    previousEmailAccountIdRef.current = emailAccountId;
+    pendingInlineActionsRef.current = null;
+    setChatId(null);
+    chat.setMessages([]);
+    setInput("");
+    setContext(null);
+    setAttachments([]);
+    setInlineActions([]);
+  }, [chat.setMessages, emailAccountId, setChatId]);
+
+  const sendMessageParts = useCallback(
+    async (
+      parts: Array<
+        | { type: "file"; url: string; filename: string; mediaType: string }
+        | { type: "text"; text: string }
+      >,
+    ) => {
+      if (!chatId) setChatId(chat.id);
+
+      pendingInlineActionsRef.current = inlineActionsRef.current.length
+        ? inlineActionsRef.current
+        : null;
+
+      if (pendingInlineActionsRef.current) {
+        setInlineActions([]);
+      }
+
+      await chat.sendMessage({ role: "user", parts });
+    },
+    [chat.id, chat.sendMessage, chatId, setChatId],
+  );
+
+  const submitTextMessage = useCallback(
+    async (text: string) => {
+      const trimmedText = text.trim();
+      if (!trimmedText) return;
+
+      await sendMessageParts([{ type: "text", text: trimmedText }]);
+      setInput("");
+    },
+    [sendMessageParts],
+  );
+
   const handleSubmit = useCallback(() => {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
 
-    const fileParts = attachments.map((a) => ({
+    const fileParts = attachments.map((attachment) => ({
       type: "file" as const,
-      url: a.url,
-      filename: a.name,
-      mediaType: a.contentType,
+      url: attachment.url,
+      filename: attachment.name,
+      mediaType: attachment.contentType,
     }));
 
     const parts: Array<
@@ -158,19 +222,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       parts.push({ type: "text", text });
     }
 
-    pendingInlineActionsRef.current = inlineActionsRef.current.length
-      ? inlineActionsRef.current
-      : null;
-
-    if (pendingInlineActionsRef.current) {
-      setInlineActions([]);
-    }
-
-    chat.sendMessage({ role: "user", parts });
-
+    sendMessageParts(parts).catch(captureException);
     setAttachments([]);
     setInput("");
-  }, [chat.sendMessage, input, attachments]);
+  }, [attachments, input, sendMessageParts]);
 
   return (
     <ChatContext.Provider
@@ -178,9 +233,11 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         chat,
         chatId,
         input,
+        persistedMessageIds,
         setInput,
         setChatId,
         setNewChat,
+        submitTextMessage,
         handleSubmit,
         context,
         setContext,

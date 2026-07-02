@@ -20,6 +20,7 @@ interface MessagesProps {
   footer?: ReactNode;
   isArtifactVisible: boolean;
   messages: Array<ChatMessage>;
+  persistedMessageIds: Set<string>;
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
   setInput: (input: string) => void;
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
@@ -29,6 +30,7 @@ interface MessagesProps {
 export function Messages({
   status,
   messages,
+  persistedMessageIds,
   setInput,
   footer,
 }: MessagesProps) {
@@ -49,34 +51,30 @@ export function Messages({
           <div className="flex flex-1 flex-col gap-4">
             {messages.length === 0 && <Overview setInput={setInput} />}
 
-            {messages.map((message, index) => {
-              const hideInlineEmailCards = hasEmailToolPart(message.parts);
-
-              return (
-                <Fragment key={message.id}>
-                  <Message from={message.role}>
-                    <MessageContent variant="flat">
-                      {message.parts?.map((part, partIndex) => (
-                        <MessagePart
-                          key={`${message.id}-${partIndex}`}
-                          part={part}
-                          isStreaming={
-                            status === "streaming" &&
-                            partIndex === message.parts.length - 1
-                          }
-                          disableConfirm={disableConfirm}
-                          hideInlineEmailCards={hideInlineEmailCards}
-                          messageId={message.id}
-                          partIndex={partIndex}
-                          threadLookup={emailLookup}
-                        />
-                      ))}
-                    </MessageContent>
-                  </Message>
-                  {index === firstAssistantIndex && <MessagingChannelHint />}
-                </Fragment>
-              );
-            })}
+            {messages.map((message, index) => (
+              <Fragment key={message.id}>
+                <Message from={message.role}>
+                  <MessageContent variant="flat">
+                    {message.parts?.map((part, partIndex) => (
+                      <MessagePart
+                        key={`${message.id}-${partIndex}`}
+                        part={part}
+                        isStreaming={
+                          status === "streaming" &&
+                          partIndex === message.parts.length - 1
+                        }
+                        disableConfirm={disableConfirm}
+                        isPersistedMessage={persistedMessageIds.has(message.id)}
+                        messageId={message.id}
+                        partIndex={partIndex}
+                        threadLookup={emailLookup}
+                      />
+                    ))}
+                  </MessageContent>
+                </Message>
+                {index === firstAssistantIndex && <MessagingChannelHint />}
+              </Fragment>
+            ))}
 
             {status === "submitted" &&
               messages.length > 0 &&
@@ -106,15 +104,6 @@ export function Messages({
   );
 }
 
-function hasEmailToolPart(parts: ChatMessage["parts"]): boolean {
-  return parts?.some(
-    (part) =>
-      part.type === "tool-sendEmail" ||
-      part.type === "tool-replyEmail" ||
-      part.type === "tool-forwardEmail",
-  );
-}
-
 function buildEmailLookup(messages: Array<ChatMessage>): EmailLookup {
   const lookup: EmailLookup = new Map();
   for (const message of messages) {
@@ -133,6 +122,7 @@ function buildEmailLookup(messages: Array<ChatMessage>): EmailLookup {
               snippet: string;
               date: string;
               isUnread: boolean;
+              externalUrl?: string;
             }>
           | undefined;
         if (!items) continue;
@@ -145,6 +135,7 @@ function buildEmailLookup(messages: Array<ChatMessage>): EmailLookup {
               snippet: item.snippet,
               date: item.date,
               isUnread: item.isUnread,
+              externalUrl: item.externalUrl,
             });
           }
         }

@@ -24,7 +24,8 @@ import { serializeMatchReasons } from "@/utils/ai/choose-rule/types";
 import { sanitizeActionFields } from "@/utils/action-item";
 import { extractEmailAddress } from "@/utils/email";
 import { filterNullProperties } from "@/utils";
-import { analyzeSenderPattern } from "@/app/api/ai/analyze-sender-pattern/call-analyze-pattern-api";
+import { analyzeSenderPattern } from "@/utils/ai/choose-rule/analyze-sender-pattern";
+import { FIRST_TIME_EVENTS, trackFirstTimeEvent } from "@/utils/posthog";
 import {
   scheduleDelayedActions,
   cancelScheduledActions,
@@ -49,7 +50,11 @@ import {
   getBlockedLowTrustStaticFromActionTypes,
   LOW_TRUST_STATIC_FROM_OUTBOUND_MESSAGE,
 } from "@/utils/rule/static-from-risk";
-import { isDraftReplyActionType } from "@/utils/actions/draft-reply";
+import {
+  isDraftReplyActionType,
+  isMessagingChannelActionType,
+  isMessagingDraftActionType,
+} from "@/utils/actions/draft-reply";
 
 const MODULE = "ai/choose-rule";
 
@@ -126,13 +131,20 @@ export async function runRules({
     logger,
   });
 
+  const calendarAwareMatches = ensureConversationRuleForAiCalendarMatch({
+    conversationRules,
+    regularRules,
+    matches: results.matches,
+    logger,
+  });
+
   // Auto-reapply conversation tracking for thread continuity
   const conversationAwareMatches = await ensureConversationRuleContinuity({
     emailAccountId: emailAccount.id,
     threadId: message.threadId,
     conversationRules,
     regularRules,
-    matches: results.matches,
+    matches: calendarAwareMatches,
     logger,
   });
 
@@ -296,6 +308,60 @@ function prepareRulesWithMetaRule(rules: RuleWithActions[]): {
   return { regularRules, conversationRules };
 }
 
+export function ensureConversationRuleForAiCalendarMatch<
+  T extends { rule: RuleWithActions; matchReasons?: MatchReason[] },
+>({
+  conversationRules,
+  regularRules,
+  matches,
+  logger,
+}: {
+  conversationRules: RuleWithActions[];
+  regularRules: RuleWithActions[];
+  matches: T[];
+  logger: Logger;
+}): T[] {
+  if (!conversationRules.some((rule) => rule.enabled)) {
+    return matches;
+  }
+
+  const hasAiCalendarMatch = matches.some(
+    (match) =>
+      match.rule.systemType === SystemType.CALENDAR &&
+      !match.matchReasons?.some(
+        (reason) =>
+          reason.type === ConditionType.PRESET &&
+          reason.systemType === SystemType.CALENDAR,
+      ) &&
+      match.matchReasons?.some((reason) => reason.type === ConditionType.AI),
+  );
+
+  if (!hasAiCalendarMatch) {
+    return matches;
+  }
+
+  if (matches.some((match) => isConversationRule(match.rule.id))) {
+    return matches;
+  }
+
+  const metaRule = regularRules.find((rule) => isConversationRule(rule.id));
+  if (!metaRule) {
+    return matches;
+  }
+
+  logger.info("Adding conversation meta rule for AI-selected calendar match", {
+    module: MODULE,
+  });
+
+  return [
+    ...matches,
+    {
+      rule: metaRule,
+      matchReasons: [{ type: ConditionType.STATIC }],
+    } as T,
+  ];
+}
+
 async function executeMatchedRule(
   rule: RuleWithActions,
   message: ParsedMessage,
@@ -338,6 +404,11 @@ async function executeMatchedRule(
       (item) => item.type !== ActionType.ARCHIVE,
     );
   }
+
+  actionItems = removeUnconfiguredMessagingChannelActions({
+    actionItems,
+    logger,
+  });
 
   if (actionItems.length === 0 && blockedActionTypes.length) {
     const reasonToUse = reason
@@ -410,6 +481,10 @@ async function executeMatchedRule(
                       item.staticAttachments != null
                         ? (item.staticAttachments as Prisma.InputJsonValue)
                         : undefined,
+                    selectedAttachments:
+                      item.selectedAttachments != null
+                        ? (item.selectedAttachments as Prisma.InputJsonValue)
+                        : undefined,
                     draftModelProvider: item.draftModelProvider ?? null,
                     draftModelName: item.draftModelName ?? null,
                     draftPipelineVersion: isDraftReplyActionType(item.type)
@@ -437,6 +512,13 @@ async function executeMatchedRule(
         include: { actionItems: true },
       }),
     { logger },
+  );
+
+  after(() =>
+    trackFirstTimeEvent({
+      emailAccountId: emailAccount.id,
+      event: FIRST_TIME_EVENTS.FIRST_AUTOMATED_RULE_RUN,
+    }),
   );
 
   if (rule.systemType === SystemType.COLD_EMAIL) {
@@ -473,6 +555,8 @@ async function executeMatchedRule(
     ]);
   }
 
+  let finalStatus: ExecutedRuleStatus | undefined;
+
   if (executedRule) {
     if (delayedActions?.length > 0) {
       // Cancels existing scheduled actions to avoid duplicates
@@ -494,12 +578,14 @@ async function executeMatchedRule(
 
     // Execute immediate actions if any
     if (immediateActions?.length > 0) {
-      await executeAct({
+      finalStatus = await executeAct({
         client,
-        userEmail: emailAccount.email,
+        emailAccount: {
+          email: emailAccount.email,
+          id: emailAccount.id,
+          userId: emailAccount.userId,
+        },
         logger,
-        userId: emailAccount.userId,
-        emailAccountId: emailAccount.id,
         executedRule,
         message,
       });
@@ -513,6 +599,7 @@ async function executeMatchedRule(
           }),
         { logger },
       );
+      finalStatus = ExecutedRuleStatus.APPLIED;
     }
   }
 
@@ -524,8 +611,29 @@ async function executeMatchedRule(
     executedRule,
     reason,
     matchReasons,
+    status: finalStatus,
     createdAt: batchTimestamp,
   };
+}
+
+function removeUnconfiguredMessagingChannelActions<
+  TAction extends {
+    id: string;
+    type: ActionType;
+    messagingChannelId?: string | null;
+  },
+>({ actionItems, logger }: { actionItems: TAction[]; logger: Logger }) {
+  return actionItems.filter((action) => {
+    if (!isMessagingChannelActionType(action.type)) return true;
+    if (action.messagingChannelId?.trim()) return true;
+
+    logger.warn("Skipping messaging channel action without channel", {
+      actionId: action.id,
+      actionType: action.type,
+    });
+
+    return false;
+  });
 }
 
 async function analyzeSenderPatternIfAiMatch({
@@ -621,19 +729,16 @@ async function isSenderPatternAlreadyAnalyzed({
   emailAccountId: string;
   from: string;
 }) {
-  const existingCheck = await prisma.newsletter.findFirst({
-    where: {
-      emailAccountId,
-      patternAnalyzed: true,
-      email: {
-        equals: from,
-        mode: "insensitive",
-      },
-    },
-    select: {
-      id: true,
-    },
-  });
+  // Prisma's case-insensitive equality emits ILIKE, but this query needs to
+  // match the partial functional index on lower(email).
+  const [existingCheck] = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT "id"
+    FROM "Newsletter"
+    WHERE "emailAccountId" = ${emailAccountId}
+      AND "patternAnalyzed" = true
+      AND lower("email") = lower(${from})
+    LIMIT 1
+  `;
 
   return !!existingCheck;
 }
@@ -743,11 +848,10 @@ function isConversationRule(ruleId: string): boolean {
 /**
  * Limits drafting to a single rule selection.
  * If there are multiple rules with draft reply actions, we prefer the first static
- * drafting rule (fixed content) over a fully dynamic drafting rule. Once a rule is
- * selected, all of its draft reply actions are preserved so the generated draft can
- * fan out to multiple destinations.
- * If there are no draft reply actions, we return the matches as is.
- * If only one rule contains draft reply actions, we return the matches as is.
+ * drafting rule (fixed content) over a fully dynamic drafting rule. Configured
+ * messaging destinations from the other matched draft rules are moved onto the
+ * selected draft rule so the single generated draft can still fan out to every
+ * matched channel.
  */
 export function limitDraftEmailActions<
   T extends { rule: RuleWithActions; matchReasons?: MatchReason[] },
@@ -756,7 +860,7 @@ export function limitDraftEmailActions<
     match.rule.actions
       .filter((action) => isDraftReplyActionType(action.type))
       .map((action) => ({
-        ruleId: match.rule.id,
+        match,
         action,
         hasFixedContent: Boolean(action.content?.trim()),
       })),
@@ -772,16 +876,34 @@ export function limitDraftEmailActions<
     draftCandidates.find((candidate) => candidate.hasFixedContent) ||
     draftCandidates[0];
 
-  const selectedDraftRuleId = preferredCandidate.ruleId;
+  const selectedMatch = preferredCandidate.match;
+  const selectedDraftRuleId = selectedMatch.rule.id;
+  const selectedDraftAction = preferredCandidate.action;
 
   logger.info("Limiting draft actions to a single rule selection", {
     module: MODULE,
     selectedDraftRuleId,
   });
 
+  const copiedMessagingActions = collectMessagingChannelsFromOtherRules({
+    matches,
+    selectedMatch,
+    selectedDraftAction,
+  });
+
   return matches.map((match) => {
     if (match.rule.id === selectedDraftRuleId) {
-      return match;
+      if (!copiedMessagingActions.length) {
+        return match;
+      }
+
+      return {
+        ...match,
+        rule: {
+          ...match.rule,
+          actions: [...match.rule.actions, ...copiedMessagingActions],
+        },
+      };
     }
 
     const hasExtraDrafts = match.rule.actions.some((action) =>
@@ -802,4 +924,52 @@ export function limitDraftEmailActions<
       },
     };
   });
+}
+
+function collectMessagingChannelsFromOtherRules<
+  T extends { rule: RuleWithActions },
+>({
+  matches,
+  selectedMatch,
+  selectedDraftAction,
+}: {
+  matches: T[];
+  selectedMatch: T;
+  selectedDraftAction: RuleWithActions["actions"][number];
+}) {
+  const seenChannelIds = new Set(
+    selectedMatch.rule.actions
+      .filter((action) => isMessagingDraftActionType(action.type))
+      .map((action) => action.messagingChannelId?.trim())
+      .filter((channelId): channelId is string => Boolean(channelId)),
+  );
+
+  const actions: RuleWithActions["actions"] = [];
+
+  for (const match of matches) {
+    if (match === selectedMatch) continue;
+
+    for (const action of match.rule.actions) {
+      if (!isMessagingDraftActionType(action.type)) continue;
+
+      const messagingChannelId = action.messagingChannelId?.trim();
+      if (!messagingChannelId || seenChannelIds.has(messagingChannelId)) {
+        continue;
+      }
+
+      seenChannelIds.add(messagingChannelId);
+      actions.push({
+        ...action,
+        subject: selectedDraftAction.subject,
+        content: selectedDraftAction.content,
+        to: selectedDraftAction.to,
+        cc: selectedDraftAction.cc,
+        bcc: selectedDraftAction.bcc,
+        delayInMinutes: selectedDraftAction.delayInMinutes,
+        staticAttachments: selectedDraftAction.staticAttachments,
+      });
+    }
+  }
+
+  return actions;
 }

@@ -74,7 +74,7 @@ export function createMockEmailProvider(
     // Message retrieval
     getSentMessages: vi.fn().mockResolvedValue([]),
     getInboxMessages: vi.fn().mockResolvedValue([defaultMessage]),
-    getSentMessageIds: vi.fn().mockResolvedValue([]),
+    getSentMessageIds: vi.fn().mockResolvedValue({ messages: [] }),
     getSentThreadsExcluding: vi.fn().mockResolvedValue([]),
     getDrafts: vi.fn().mockResolvedValue([]),
     getMessagesWithPagination: vi
@@ -109,6 +109,7 @@ export function createMockEmailProvider(
     archiveMessage: vi.fn().mockResolvedValue(undefined),
     trashThread: vi.fn().mockResolvedValue(undefined),
     markSpam: vi.fn().mockResolvedValue(undefined),
+    starMessage: vi.fn().mockResolvedValue(undefined),
     markRead: vi.fn().mockResolvedValue(undefined),
     markReadThread: vi.fn().mockResolvedValue(undefined),
     moveThreadToFolder: vi.fn().mockResolvedValue(undefined),

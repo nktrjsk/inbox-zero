@@ -1,8 +1,14 @@
 /** @vitest-environment jsdom */
 
 import React from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockUseSearchParams = vi.fn();
 const mockSignInWithOauth2 = vi.fn();
@@ -54,29 +60,84 @@ describe("LoginForm", () => {
     });
   });
 
-  it("shows an inline error when emulator sign-in fails", async () => {
-    mockSignInWithOauth2.mockRejectedValue(
-      new Error("Failed to connect to Google sign-in."),
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("places Apple after Google and Microsoft when all OAuth options are shown", () => {
+    render(
+      <LoginForm
+        enabledProviders={["google", "microsoft", "apple", "sso"]}
+        useGoogleOauthEmulator
+      />,
     );
 
-    render(<LoginForm useGoogleOauthEmulator />);
+    expect(
+      screen.getAllByRole("button").map((button) => button.textContent),
+    ).toEqual([
+      "Sign in with Google",
+      "Sign in with Microsoft",
+      "Sign in with Apple",
+    ]);
+  });
+
+  it("starts Apple sign-in when the Apple option is shown", async () => {
+    mockSignInSocial.mockResolvedValue(undefined);
+
+    render(<LoginForm enabledProviders={["apple"]} useGoogleOauthEmulator />);
 
     fireEvent.click(
-      screen.getByRole("button", { name: /sign in with google/i }),
+      screen.getByRole("button", { name: /sign in with apple/i }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "I agree" }));
 
-    expect(
-      await screen.findByText("Failed to start Google sign-in"),
-    ).toBeTruthy();
-    expect(
-      screen.getByText("Failed to connect to Google sign-in."),
-    ).toBeTruthy();
+    await waitFor(() => {
+      expect(mockSignInSocial).toHaveBeenCalledWith({
+        provider: "apple",
+        callbackURL: "/connect-mailbox?next=%2Fwelcome-redirect",
+        errorCallbackURL: "/login/error",
+      });
+    });
+  });
+
+  it("preserves next path for Apple sign-in", async () => {
+    mockUseSearchParams.mockReturnValue({
+      get: (key: string) =>
+        key === "next" ? "/organizations/invitations/invite_123/accept" : null,
+    });
+    mockSignInSocial.mockResolvedValue(undefined);
+
+    render(<LoginForm enabledProviders={["apple"]} useGoogleOauthEmulator />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /sign in with apple/i }),
+    );
+
+    await waitFor(() => {
+      expect(mockSignInSocial).toHaveBeenCalledWith({
+        provider: "apple",
+        callbackURL:
+          "/connect-mailbox?next=%2Forganizations%2Finvitations%2Finvite_123%2Faccept",
+        errorCallbackURL: "/login/error?reason=org_invite",
+      });
+    });
+  });
+
+  it("shows a stable message for Safari network failures during Microsoft sign-in", async () => {
+    mockSignInSocial.mockRejectedValue(new Error("Load failed"));
+
+    render(
+      <LoginForm enabledProviders={["microsoft"]} useGoogleOauthEmulator />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /sign in with microsoft/i }),
+    );
 
     await waitFor(() => {
       expect(mockToastError).toHaveBeenCalledWith({
-        title: "Error signing in with Google",
-        description: "Failed to connect to Google sign-in.",
+        title: "Error signing in with Microsoft",
+        description:
+          "Could not start sign-in. Please check that this app is opened from its configured public URL, then try again.",
       });
     });
   });

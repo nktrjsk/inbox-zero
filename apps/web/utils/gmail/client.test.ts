@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { people } from "@googleapis/people";
 import { auth } from "@googleapis/gmail";
+import { saveTokens } from "@/utils/auth/save-tokens";
+import { cleanupInvalidTokens } from "@/utils/auth/cleanup-invalid-tokens";
+import { createTestLogger } from "@/__tests__/helpers";
 import {
   getContactsClient,
   getGmailClientWithRefresh,
@@ -15,6 +18,10 @@ import { gmail } from "@googleapis/gmail";
 
 vi.mock("@/utils/auth/save-tokens", () => ({
   saveTokens: vi.fn(),
+}));
+
+vi.mock("@/utils/auth/cleanup-invalid-tokens", () => ({
+  cleanupInvalidTokens: vi.fn(),
 }));
 
 vi.mock("@/utils/google/oauth", () => ({
@@ -32,6 +39,7 @@ vi.mock("@/utils/google/oauth", () => ({
 
 const setCredentials = vi.fn();
 const refreshAccessToken = vi.fn();
+const logger = createTestLogger();
 
 vi.mock("@googleapis/gmail", () => ({
   auth: {
@@ -112,13 +120,7 @@ describe("gmail oauth client configuration", () => {
       refreshToken: "refresh-token",
       expiresAt: null,
       emailAccountId: "email-account-id",
-      logger: {
-        error: vi.fn(),
-        info: vi.fn(),
-        trace: vi.fn(),
-        warn: vi.fn(),
-        with: vi.fn(),
-      } as any,
+      logger,
     });
 
     expect(getGoogleGmailApiRootUrl).toHaveBeenCalledWith();
@@ -127,5 +129,123 @@ describe("gmail oauth client configuration", () => {
       auth: expect.any(Object),
       rootUrl: "http://localhost:4444",
     });
+  });
+
+  it("saves refreshed Gmail tokens with optimistic concurrency", async () => {
+    const staleExpiresAt = Date.now() - 1000;
+    refreshAccessToken.mockResolvedValue({
+      credentials: {
+        access_token: "new-access-token",
+        expiry_date: Date.now() + 3_600_000,
+      },
+    });
+
+    await getGmailClientWithRefresh({
+      accessToken: "stale-access-token",
+      refreshToken: "refresh-token",
+      expiresAt: staleExpiresAt,
+      emailAccountId: "email-account-id",
+      logger,
+    });
+
+    expect(saveTokens).toHaveBeenCalledWith(
+      expect.objectContaining({
+        emailAccountId: "email-account-id",
+        accountRefreshToken: "refresh-token",
+        provider: "google",
+        expectedExpiresAt: staleExpiresAt,
+        tokens: expect.objectContaining({
+          access_token: "new-access-token",
+        }),
+      }),
+    );
+  });
+
+  it("reuses Gmail tokens that expire beyond the refresh buffer", async () => {
+    await getGmailClientWithRefresh({
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      expiresAt: Date.now() + 11 * 60 * 1000,
+      emailAccountId: "email-account-id",
+      logger,
+    });
+
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    expect(saveTokens).not.toHaveBeenCalled();
+  });
+
+  it("refreshes Gmail tokens before they expire", async () => {
+    const nearExpiryExpiresAt = Date.now() + 60 * 1000;
+    refreshAccessToken.mockResolvedValue({
+      credentials: {
+        access_token: "new-access-token",
+        expiry_date: Date.now() + 3_600_000,
+      },
+    });
+
+    await getGmailClientWithRefresh({
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      expiresAt: nearExpiryExpiresAt,
+      emailAccountId: "email-account-id",
+      logger,
+    });
+
+    expect(refreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(saveTokens).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedExpiresAt: nearExpiryExpiresAt,
+        tokens: expect.objectContaining({
+          access_token: "new-access-token",
+        }),
+      }),
+    );
+  });
+
+  it("cleans up invalid Gmail tokens when refresh reports invalid_grant", async () => {
+    refreshAccessToken.mockRejectedValue(
+      new Error("invalid_grant: token has been expired or revoked"),
+    );
+
+    await expect(
+      getGmailClientWithRefresh({
+        accessToken: "stale-access-token",
+        refreshToken: "refresh-token",
+        expiresAt: Date.now() - 1000,
+        emailAccountId: "email-account-id",
+        logger,
+      }),
+    ).rejects.toThrow("invalid_grant");
+
+    expect(cleanupInvalidTokens).toHaveBeenCalledTimes(1);
+    expect(cleanupInvalidTokens).toHaveBeenCalledWith({
+      emailAccountId: "email-account-id",
+      reason: "invalid_grant",
+      logger,
+    });
+    expect(saveTokens).not.toHaveBeenCalled();
+  });
+
+  it("preserves the original refresh error when invalid token cleanup fails", async () => {
+    const refreshError = new Error(
+      "invalid_grant: token has been expired or revoked",
+    );
+    refreshAccessToken.mockRejectedValue(refreshError);
+    vi.mocked(cleanupInvalidTokens).mockRejectedValue(
+      new Error("cleanup failed"),
+    );
+
+    await expect(
+      getGmailClientWithRefresh({
+        accessToken: "stale-access-token",
+        refreshToken: "refresh-token",
+        expiresAt: Date.now() - 1000,
+        emailAccountId: "email-account-id",
+        logger,
+      }),
+    ).rejects.toBe(refreshError);
+
+    expect(cleanupInvalidTokens).toHaveBeenCalledTimes(1);
+    expect(saveTokens).not.toHaveBeenCalled();
   });
 });

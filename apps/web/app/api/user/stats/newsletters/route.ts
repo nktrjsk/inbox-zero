@@ -1,15 +1,19 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withEmailProvider } from "@/utils/middleware";
-import { extractEmailAddress } from "@/utils/email";
+import {
+  extractEmailAddress,
+  getNewsletterSenderDisplayName,
+} from "@/utils/email";
 import type { Logger } from "@/utils/logger";
 import prisma from "@/utils/prisma";
 import { Prisma } from "@/generated/prisma/client";
 import type { EmailProvider } from "@/utils/email/types";
 import {
-  getAutoArchiveFilters,
+  getEmailFilters,
   findNewsletterStatus,
   findAutoArchiveFilter,
+  findSenderLabelFilters,
   filterNewsletters,
 } from "@/app/api/user/stats/newsletters/helpers";
 
@@ -77,13 +81,13 @@ async function getEmailMessages(
   const { emailAccountId, emailProvider, logger } = options;
   const types = getTypeFilters(options.types);
 
-  const [counts, autoArchiveFilters, userNewsletters] = await Promise.all([
+  const [counts, emailFilters, userNewsletters] = await Promise.all([
     getNewsletterCounts({
       ...options,
       ...types,
       logger,
     }),
-    getAutoArchiveFilters(emailProvider, logger),
+    getEmailFilters(emailProvider, logger),
     findNewsletterStatus({ emailAccountId }),
   ]);
 
@@ -91,16 +95,18 @@ async function getEmailMessages(
     const from = extractEmailAddress(email.from);
     return {
       name: from,
-      fromName: email.fromName || "",
+      fromName: getNewsletterSenderDisplayName({
+        email: from,
+        fromName: email.fromName,
+        minFromName: email.minFromName,
+        maxFromName: email.fromName,
+      }),
       value: email.count,
       inboxEmails: email.inboxEmails,
       readEmails: email.readEmails,
       unsubscribeLink: email.unsubscribeLink,
-      autoArchived: findAutoArchiveFilter(
-        autoArchiveFilters,
-        from,
-        emailProvider,
-      ),
+      autoArchived: findAutoArchiveFilter(emailFilters, from, emailProvider),
+      labelFilters: findSenderLabelFilters(emailFilters, from),
       status: userNewsletters?.find((n) => n.email === from)?.status,
     };
   });
@@ -115,6 +121,7 @@ async function getEmailMessages(
 type NewsletterCountResult = {
   from: string;
   fromName: string | null;
+  minFromName: string | null;
   count: number;
   inboxEmails: number;
   readEmails: number;
@@ -124,6 +131,7 @@ type NewsletterCountResult = {
 type NewsletterCountRawResult = {
   from: string;
   fromName: string | null;
+  minFromName: string | null;
   count: number;
   inboxEmails: number;
   readEmails: number;
@@ -207,7 +215,8 @@ async function getNewsletterCounts(
     WITH email_message_stats AS (
       SELECT 
         "from",
-        MAX("fromName") as "fromName",
+        MAX(NULLIF("fromName", '')) as "fromName",
+        MIN(NULLIF("fromName", '')) as "minFromName",
         COUNT(*)::int as "count",
         SUM(CASE WHEN inbox = true THEN 1 ELSE 0 END)::int as "inboxEmails",
         SUM(CASE WHEN read = true THEN 1 ELSE 0 END)::int as "readEmails",
@@ -228,6 +237,7 @@ async function getNewsletterCounts(
     return results.map((result) => ({
       from: result.from,
       fromName: result.fromName,
+      minFromName: result.minFromName,
       count: result.count,
       inboxEmails: result.inboxEmails,
       readEmails: result.readEmails,

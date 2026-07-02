@@ -1,6 +1,6 @@
 import "server-only";
 import EmailReplyParser from "email-reply-parser";
-import { convert } from "html-to-text";
+import { convert, type FormatCallback } from "html-to-text";
 import type { ParsedMessage } from "@/utils/types";
 import { removeExcessiveWhitespace, truncate } from "@/utils/string";
 import { env } from "@/env";
@@ -12,22 +12,57 @@ export function parseReply(plainText: string) {
   return result;
 }
 
+const IMAGE_ALT_MAX_LENGTH = 160;
+const IMAGE_PLACEHOLDER = "[image]";
+const GENERIC_IMAGE_ALT_TEXT_PATTERN =
+  /^(?:avatar|decorative|graphic|icon|image|img|logo|photo|picture|pixel|spacer|tracking pixel)$/i;
+
 // important to do before processing html emails
 // this will cut down an email from 100,000 characters to 1,000 characters in some cases
-function htmlToText(html: string, removeLinks = true, removeImages = true) {
+function htmlToText(
+  html: string,
+  {
+    includeLinkUrls = false,
+    includeImageAltText = false,
+  }: Pick<
+    EmailToContentOptions,
+    "includeLinkUrls" | "includeImageAltText"
+  > = {},
+) {
   const text = convert(html, {
     wordwrap: 130,
-    // this removes links and images.
-    // might want to change this in the future if we're searching for links like Unsubscribe
+    formatters: { imageAltText: formatImageAltText },
     selectors: [
-      ...(removeLinks
-        ? [{ selector: "a", options: { ignoreHref: true } }]
-        : []),
-      ...(removeImages ? [{ selector: "img", format: "skip" }] : []),
+      {
+        selector: "a",
+        options: includeLinkUrls
+          ? { hideLinkHrefIfSameAsText: true }
+          : { ignoreHref: true },
+      },
+      {
+        selector: "img",
+        format: includeImageAltText ? "imageAltText" : "skip",
+      },
     ],
   });
 
   return text;
+}
+
+const formatImageAltText: FormatCallback = (elem, _walk, builder) => {
+  builder.addInline(getImageText(elem.attribs?.alt), {
+    noWordTransform: true,
+  });
+};
+
+function getImageText(value: unknown) {
+  if (typeof value !== "string") return IMAGE_PLACEHOLDER;
+
+  const altText = removeExcessiveWhitespace(value).trim();
+  if (!altText) return IMAGE_PLACEHOLDER;
+  if (GENERIC_IMAGE_ALT_TEXT_PATTERN.test(altText)) return IMAGE_PLACEHOLDER;
+
+  return `[image: ${truncate(altText, IMAGE_ALT_MAX_LENGTH)}]`;
 }
 
 export function getEmailClient(messageId: string) {
@@ -40,21 +75,21 @@ export function getEmailClient(messageId: string) {
   return emailClient;
 }
 
-function removeForwardedContent(text: string): string {
-  const forwardPatterns = [
-    // Gmail style
-    /(?:\r?\n|\r)?(?:-{3,}|_{3,})\s*Forwarded message\s*(?:-{3,}|_{3,})/i,
-    // Simple forward markers
-    /(?:\r?\n|\r)?(?:-{3,}|_{3,})\s*Forward(?:ed)?(?:\s*message)?(?:-{3,}|_{3,})/i,
-    // Email headers
-    /(?:\r?\n|\r)?From:[\s\S]*?Subject:/m,
-    // iOS/Mac style
-    /(?:\r?\n|\r)?Begin forwarded message:/im,
-    // Outlook style
-    /(?:\r?\n|\r)?Original Message/i,
-  ];
+const FORWARDED_CONTENT_PATTERNS = [
+  // Gmail style
+  /(?:\r?\n|\r)?(?:-{3,}|_{3,})\s*Forwarded message\s*(?:-{3,}|_{3,})/i,
+  // Simple forward markers
+  /(?:\r?\n|\r)?(?:-{3,}|_{3,})\s*Forward(?:ed)?(?:\s*message)?(?:-{3,}|_{3,})/i,
+  // Forwarded email header blocks
+  /(?:^|\r?\n)From:\s*[^\r\n]+(?:\r?\n(?:Date|Sent|To|Cc|Bcc|Subject):\s*[^\r\n]+){2,}/im,
+  // iOS/Mac style
+  /(?:\r?\n|\r)?Begin forwarded message:/im,
+  // Outlook style
+  /(?:\r?\n|\r)?Original Message/i,
+];
 
-  for (const pattern of forwardPatterns) {
+export function stripForwardedContent(text: string): string {
+  for (const pattern of FORWARDED_CONTENT_PATTERNS) {
     const parts = text.split(pattern);
     if (parts.length > 1) {
       // Take content before the forward marker and clean it
@@ -69,6 +104,8 @@ export type EmailToContentOptions = {
   maxLength?: number;
   extractReply?: boolean;
   removeForwarded?: boolean;
+  includeLinkUrls?: boolean;
+  includeImageAltText?: boolean;
 };
 
 export function emailToContent(
@@ -77,12 +114,17 @@ export function emailToContent(
     maxLength = 2000,
     extractReply = false,
     removeForwarded = false,
+    includeLinkUrls = false,
+    includeImageAltText = false,
   }: EmailToContentOptions = {},
 ): string {
   let content = "";
 
   if (email.textHtml) {
-    content = htmlToText(email.textHtml);
+    content = htmlToText(email.textHtml, {
+      includeLinkUrls,
+      includeImageAltText,
+    });
   } else if (email.textPlain) {
     content = email.textPlain;
   } else if (email.snippet) {
@@ -94,7 +136,7 @@ export function emailToContent(
   }
 
   if (removeForwarded) {
-    content = removeForwardedContent(content);
+    content = stripForwardedContent(content);
   }
 
   content = removeExcessiveWhitespace(content);

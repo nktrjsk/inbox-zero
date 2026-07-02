@@ -5,12 +5,13 @@ import useSWRInfinite from "swr/infinite";
 import { useSetAtom } from "jotai";
 import { List } from "@/components/email-list/EmailList";
 import { LoadingContent } from "@/components/LoadingContent";
-import type { ThreadsQuery } from "@/app/api/threads/validation";
+import type { ThreadsQuery } from "@/utils/threads/validation";
 import type { ThreadsResponse } from "@/app/api/threads/route";
 import { refetchEmailListAtom } from "@/store/email";
 import { BetaBanner } from "@/app/(app)/[emailAccountId]/mail/BetaBanner";
 import { ClientOnly } from "@/components/ClientOnly";
 import { PermissionsCheck } from "@/app/(app)/[emailAccountId]/PermissionsCheck";
+import { createSearchParams } from "@/utils/url";
 
 export default function Mail(props: {
   searchParams: Promise<{ type?: string; labelId?: string }>;
@@ -36,9 +37,7 @@ export default function Mail(props: {
     if (pageIndex > 0 && previousPageData?.nextPageToken) {
       query.nextPageToken = previousPageData.nextPageToken;
     }
-
-    // biome-ignore lint/suspicious/noExplicitAny: params
-    const queryParams = new URLSearchParams(query as any);
+    const queryParams = createSearchParams(query);
 
     return `/api/threads?${queryParams.toString()}`;
   };

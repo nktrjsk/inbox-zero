@@ -44,6 +44,7 @@ import {
   getActionTypesForCategoryAction,
 } from "@/utils/rule/consts";
 import { actionClient, actionClientUser } from "@/utils/actions/safe-action";
+import { assertRuleIsNotOrgManaged } from "@/utils/organizations/rules";
 import { env } from "@/env";
 import { prefixPath } from "@/utils/path";
 import { ONE_WEEK_MINUTES } from "@/utils/date";
@@ -55,13 +56,15 @@ import { isGoogleProvider } from "@/utils/email/provider-types";
 import { bulkProcessInboxEmails } from "@/utils/ai/choose-rule/bulk-process-emails";
 import { getEmailAccountForRuleExecution } from "@/utils/user/get";
 import type { AttachmentSourceInput } from "@/utils/attachments/source-schema";
+import { assertCanUseDigestsIfNeeded } from "@/utils/premium/server";
+import { toCreateOrUpdateRuleCondition } from "@/utils/rule/create-rule-condition";
 
 export const createRuleAction = actionClient
   .metadata({ name: "createRule" })
   .inputSchema(createRuleBody)
   .action(
     async ({
-      ctx: { emailAccountId, logger, provider },
+      ctx: { emailAccountId, userId, logger, provider },
       parsedInput: {
         name,
         runOnThreads,
@@ -70,6 +73,8 @@ export const createRuleAction = actionClient
         conditionalOperator,
       },
     }) => {
+      await assertCanUseDigestsIfNeeded(userId, actions ?? []);
+
       const conditions = flattenConditions(conditionsInput, logger);
 
       const resolvedActions = await resolveActionLabels(
@@ -83,15 +88,15 @@ export const createRuleAction = actionClient
         const rule = await createRule({
           result: {
             name,
-            condition: {
-              aiInstructions: conditions.instructions ?? null,
+            condition: toCreateOrUpdateRuleCondition({
+              aiInstructions: conditions.instructions,
               conditionalOperator: conditionalOperator || null,
               static: {
-                from: conditions.from || null,
-                to: conditions.to || null,
-                subject: conditions.subject || null,
+                from: conditions.from,
+                to: conditions.to,
+                subject: conditions.subject,
               },
-            },
+            }),
             actions: resolvedActions.map(mapActionToSanitizedFields),
           },
           emailAccountId,
@@ -112,7 +117,7 @@ export const updateRuleAction = actionClient
   .inputSchema(updateRuleBody)
   .action(
     async ({
-      ctx: { emailAccountId, logger, provider },
+      ctx: { emailAccountId, userId, logger, provider },
       parsedInput: {
         id,
         name,
@@ -122,6 +127,10 @@ export const updateRuleAction = actionClient
         conditionalOperator,
       },
     }) => {
+      await assertRuleIsNotOrgManaged({ ruleId: id, emailAccountId });
+
+      await assertCanUseDigestsIfNeeded(userId, actions);
+
       const conditions = flattenConditions(conditionsInput, logger);
 
       const resolvedActions = await resolveActionLabels(
@@ -136,15 +145,15 @@ export const updateRuleAction = actionClient
           ruleId: id,
           result: {
             name: name || "",
-            condition: {
-              aiInstructions: conditions.instructions ?? null,
+            condition: toCreateOrUpdateRuleCondition({
+              aiInstructions: conditions.instructions,
               conditionalOperator: conditionalOperator || null,
               static: {
-                from: conditions.from || null,
-                to: conditions.to || null,
-                subject: conditions.subject || null,
+                from: conditions.from,
+                to: conditions.to,
+                subject: conditions.subject,
               },
-            },
+            }),
             actions: resolvedActions.map(mapActionToSanitizedFields),
           },
           emailAccountId,
@@ -165,6 +174,8 @@ export const updateRuleSettingsAction = actionClient
   .inputSchema(updateRuleSettingsBody)
   .action(
     async ({ ctx: { emailAccountId }, parsedInput: { id, instructions } }) => {
+      await assertRuleIsNotOrgManaged({ ruleId: id, emailAccountId });
+
       const currentRule = await prisma.rule.findUnique({
         where: { id, emailAccountId },
       });
@@ -280,9 +291,14 @@ export const deleteRuleAction = actionClient
           emailAccountId,
         },
       },
-      select: { systemType: true, groupId: true },
+      select: { systemType: true, groupId: true, organizationRuleId: true },
     });
     if (!rule) return; // already deleted
+    if (rule.organizationRuleId) {
+      throw new SafeError(
+        "This rule is managed by your organization and can't be deleted here.",
+      );
+    }
     if (rule.systemType) {
       throw new SafeError(
         "Default rules cannot be deleted. Disable them instead.",
@@ -500,13 +516,13 @@ export const toggleAllRulesAction = actionClient
   .action(async ({ ctx: { emailAccountId }, parsedInput: { enabled } }) => {
     if (enabled) {
       await prisma.rule.updateMany({
-        where: { emailAccountId },
+        where: { emailAccountId, organizationRuleId: null },
         data: { enabled },
       });
     } else {
       await prisma.$transaction([
         prisma.rule.updateMany({
-          where: { emailAccountId },
+          where: { emailAccountId, organizationRuleId: null },
           data: { enabled },
         }),
         prisma.emailAccount.update({
@@ -561,11 +577,11 @@ export const copyRulesFromAccountAction = actionClientUser
         throw new SafeError("Target account not found or unauthorized");
       }
 
-      // Fetch selected rules from source account
       const sourceRules = await prisma.rule.findMany({
         where: {
           emailAccountId: sourceEmailAccountId,
           id: { in: ruleIds },
+          organizationRuleId: null,
         },
         include: { actions: true },
       });
@@ -574,9 +590,16 @@ export const copyRulesFromAccountAction = actionClientUser
         return { copiedCount: 0, replacedCount: 0 };
       }
 
-      // Fetch existing rules in target account to check for duplicates
+      await assertCanUseDigestsIfNeeded(
+        userId,
+        sourceRules.flatMap((rule) => rule.actions),
+      );
+
       const targetRules = await prisma.rule.findMany({
-        where: { emailAccountId: targetEmailAccountId },
+        where: {
+          emailAccountId: targetEmailAccountId,
+          organizationRuleId: null,
+        },
         select: { id: true, name: true, systemType: true },
       });
 
@@ -687,6 +710,7 @@ async function toggleRule({
   logger: Logger;
 }) {
   if (ruleId) {
+    await assertRuleIsNotOrgManaged({ ruleId, emailAccountId });
     return await setRuleEnabled({ ruleId, emailAccountId, enabled });
   }
 
@@ -834,6 +858,8 @@ function mapActionToSanitizedFields(action: {
 }
 
 function handleRuleError(error: unknown, logger: Logger) {
+  if (error instanceof SafeError) throw error;
+
   if (isDuplicateError(error, "name")) {
     throw new SafeError("Rule name already exists");
   }
@@ -1026,12 +1052,19 @@ export const importRulesAction = actionClient
   .metadata({ name: "importRules" })
   .inputSchema(importRulesBody)
   .action(
-    async ({ ctx: { emailAccountId, logger }, parsedInput: { rules } }) => {
+    async ({
+      ctx: { emailAccountId, userId, logger },
+      parsedInput: { rules },
+    }) => {
       logger.info("Importing rules", { count: rules.length });
 
-      // Fetch existing rules to check for duplicates by name or systemType
+      await assertCanUseDigestsIfNeeded(
+        userId,
+        rules.flatMap((rule) => rule.actions),
+      );
+
       const existingRules = await prisma.rule.findMany({
-        where: { emailAccountId },
+        where: { emailAccountId, organizationRuleId: null },
         select: { id: true, name: true, systemType: true },
       });
 

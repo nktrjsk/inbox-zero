@@ -2,7 +2,6 @@ import {
   useFeatureFlagEnabled,
   useFeatureFlagVariantKey,
 } from "posthog-js/react";
-import type { OnboardingFlowVariant } from "@/app/(app)/[emailAccountId]/onboarding/onboardingFlow";
 import { env } from "@/env";
 
 export function useCleanerEnabled() {
@@ -27,6 +26,15 @@ export function useIntegrationsEnabled() {
 export function useSmartFilingEnabled() {
   const posthogEnabled = useFeatureFlagEnabled("smart-filing");
   return env.NEXT_PUBLIC_SMART_FILING_ENABLED || posthogEnabled;
+}
+
+export function useBookingLinksEnabled() {
+  const posthogEnabled = useFeatureFlagEnabled("booking-links");
+  return env.NEXT_PUBLIC_BOOKING_LINKS_ENABLED || posthogEnabled;
+}
+
+export function useTeamsEnabled() {
+  return useFeatureFlagEnabled("microsoft-teams");
 }
 
 const HERO_FLAG_NAME = "hero-copy-7";
@@ -79,9 +87,17 @@ export function useWelcomePricingVariant() {
   );
 }
 
-export function useOnboardingFlowVariant() {
+export type OnboardingBulkUnsubscribeVariant = "control" | "inline-unsubscribe";
+
+// A/B test for the onboarding bulk-unsubscribe step: "control" shows the
+// static marketing slide, "inline-unsubscribe" shows the personalized,
+// actionable list. Reading the flag here is the experiment exposure
+// ($feature_flag_called). Defaults to control until the flag resolves and when
+// PostHog is unavailable (e.g. self-hosted), preserving the existing step.
+export function useOnboardingBulkUnsubscribeVariant() {
   return (
-    (useFeatureFlagVariantKey("onboarding-flow") as OnboardingFlowVariant) ||
-    "control"
+    (useFeatureFlagVariantKey(
+      "onboarding-bulk-unsubscribe",
+    ) as OnboardingBulkUnsubscribeVariant) || "control"
   );
 }

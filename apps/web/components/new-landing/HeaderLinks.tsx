@@ -22,6 +22,7 @@ import {
 
 const navigation = [
   { name: "Enterprise", href: "/enterprise" },
+  { name: "Case Studies", href: "/case-studies" },
   { name: "Pricing", href: "/pricing" },
 ];
 
@@ -152,6 +153,7 @@ function EnhancedListItem({
   ...props
 }: React.ComponentPropsWithoutRef<"li"> & {
   href: string;
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   icon: React.ComponentType<any>;
   iconColor: string;
   gradient: string;

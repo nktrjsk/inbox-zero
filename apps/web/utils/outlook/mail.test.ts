@@ -1,8 +1,9 @@
 import type { Message } from "@microsoft/microsoft-graph-types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OutlookClient } from "@/utils/outlook/client";
-import { createScopedLogger } from "@/utils/logger";
-import { sendEmailWithHtml } from "./mail";
+import { createTestLogger } from "@/__tests__/helpers";
+import type { EmailForAction } from "@/utils/ai/types";
+import { draftEmail, forwardEmail, sendEmailWithHtml } from "./mail";
 
 vi.mock("@/utils/mail", () => ({
   ensureEmailSendingEnabled: vi.fn(),
@@ -18,12 +19,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("parses formatted recipients when sending a new draft", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const sendPost = vi.fn(async () => ({}));
 
     const client = createMockOutlookClient((path) => {
@@ -40,7 +42,7 @@ describe("sendEmailWithHtml", () => {
         subject: "Subject",
         messageHtml: "<p>Hello</p>",
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     expect(draftPost).toHaveBeenCalledWith(
@@ -71,12 +73,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("decodes base64 string attachments before uploading", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const attachmentPost = vi.fn(async () => ({}));
     const sendPost = vi.fn(async () => ({}));
 
@@ -105,7 +108,7 @@ describe("sendEmailWithHtml", () => {
           },
         ],
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     expect(attachmentPost).toHaveBeenCalledWith(
@@ -117,12 +120,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("keeps plain text attachment strings as utf-8", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const attachmentPost = vi.fn(async () => ({}));
     const sendPost = vi.fn(async () => ({}));
 
@@ -151,7 +155,7 @@ describe("sendEmailWithHtml", () => {
           },
         ],
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     expect(attachmentPost).toHaveBeenCalledWith(
@@ -163,12 +167,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("keeps malformed base64 attachment strings as utf-8", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const attachmentPost = vi.fn(async () => ({}));
     const sendPost = vi.fn(async () => ({}));
 
@@ -197,7 +202,7 @@ describe("sendEmailWithHtml", () => {
           },
         ],
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     expect(attachmentPost).toHaveBeenCalledWith(
@@ -211,12 +216,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("retries upload-session chunks and sends them as octet-stream", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const createUploadSessionPost = vi.fn(async () => ({
       uploadUrl: "https://upload.example.test/session",
     }));
@@ -258,7 +264,7 @@ describe("sendEmailWithHtml", () => {
           },
         ],
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     expect(createUploadSessionPost).toHaveBeenCalledWith(
@@ -294,12 +300,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("resumes upload-session progress after a retried chunk returns 416", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const createUploadSessionPost = vi.fn(async () => ({
       uploadUrl: "https://upload.example.test/session",
     }));
@@ -368,7 +375,7 @@ describe("sendEmailWithHtml", () => {
           },
         ],
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     const statusCallIndex = fetchMock.mock.calls.findIndex(
@@ -385,12 +392,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("falls back to local chunk progress when upload-session status is unavailable", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const createUploadSessionPost = vi.fn(async () => ({
       uploadUrl: "https://upload.example.test/session",
     }));
@@ -443,7 +451,7 @@ describe("sendEmailWithHtml", () => {
           },
         ],
       },
-      createScopedLogger("outlook-mail-test"),
+      createTestLogger(),
     );
 
     const statusCallIndex = fetchMock.mock.calls.findIndex(
@@ -460,12 +468,13 @@ describe("sendEmailWithHtml", () => {
   });
 
   it("surfaces unexpected upload-session status failures during 416 recovery", async () => {
-    const draftPost = vi.fn(async () => {
-      return {
-        id: "draft-1",
-        conversationId: "conversation-1",
-      } as Message;
-    });
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
     const createUploadSessionPost = vi.fn(async () => ({
       uploadUrl: "https://upload.example.test/session",
     }));
@@ -510,7 +519,7 @@ describe("sendEmailWithHtml", () => {
             },
           ],
         },
-        createScopedLogger("outlook-mail-test"),
+        createTestLogger(),
       ),
     ).rejects.toMatchObject({
       error: expect.objectContaining({
@@ -524,18 +533,268 @@ describe("sendEmailWithHtml", () => {
   });
 });
 
+describe("forwardEmail", () => {
+  it("creates a forward draft, applies the formatted sender, and sends it", async () => {
+    const getMessage = vi.fn(
+      async () =>
+        ({
+          id: "message-1",
+          conversationId: "conversation-1",
+          subject: "Original subject",
+          bodyPreview: "Original preview",
+          body: { content: "<p>Original body</p>" },
+          from: {
+            emailAddress: {
+              address: "sender@example.com",
+              name: "Sender Name",
+            },
+          },
+          toRecipients: [
+            {
+              emailAddress: {
+                address: "recipient@example.com",
+                name: "Recipient Name",
+              },
+            },
+          ],
+          receivedDateTime: "2025-02-06T22:35:00.000Z",
+        }) as Message,
+    );
+    const createForwardDraft = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+          from: {
+            emailAddress: {
+              address: "owner@example.com",
+            },
+          },
+        }) as Message,
+    );
+    const updateDraft = vi.fn(async () => ({}));
+    const sendDraft = vi.fn(async () => ({}));
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1") return { get: getMessage };
+      if (path === "/me/messages/message-1/createForward") {
+        return { post: createForwardDraft };
+      }
+      if (path === "/me/messages/draft-1") return { patch: updateDraft };
+      if (path === "/me/messages/draft-1/send") return { post: sendDraft };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    await forwardEmail(
+      client,
+      {
+        messageId: "message-1",
+        to: "Recipient Name <recipient@example.com>",
+        cc: "CC Person <cc@example.com>",
+        bcc: "bcc@example.com",
+        content: "Forwarding this",
+        from: "Owner Name <owner@example.com>",
+      },
+      createTestLogger(),
+    );
+
+    expect(createForwardDraft).toHaveBeenCalledWith({});
+    expect(updateDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toRecipients: [
+          {
+            emailAddress: {
+              address: "recipient@example.com",
+              name: "Recipient Name",
+            },
+          },
+        ],
+        ccRecipients: [
+          {
+            emailAddress: {
+              address: "cc@example.com",
+              name: "CC Person",
+            },
+          },
+        ],
+        bccRecipients: [
+          {
+            emailAddress: {
+              address: "bcc@example.com",
+            },
+          },
+        ],
+        from: {
+          emailAddress: {
+            address: "owner@example.com",
+            name: "Owner Name",
+          },
+        },
+        subject: "Fwd: Original subject",
+        body: expect.objectContaining({
+          contentType: "html",
+          content: expect.stringContaining("Forwarding this"),
+        }),
+      }),
+    );
+    expect(sendDraft).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("draftEmail", () => {
+  it("uses explicit recipient override when drafting a follow-up from a sent message", async () => {
+    const getOriginalReadStatus = vi.fn(async () => ({ isRead: true }));
+    const createReplyAllDraft = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
+    const updateDraft = vi.fn(async () => ({ id: "draft-1" }) as Message);
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1") {
+        return { get: getOriginalReadStatus };
+      }
+      if (path === "/me/messages/message-1/createReplyAll") {
+        return { post: createReplyAllDraft };
+      }
+      if (path === "/me/messages/draft-1") return { patch: updateDraft };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    await draftEmail(
+      client,
+      {
+        id: "message-1",
+        threadId: "conversation-1",
+        headers: {
+          from: "Owner Name <owner@example.com>",
+          to: "Recipient Name <recipient@example.com>",
+          subject: "Original subject",
+          date: "2026-01-01T12:00:00.000Z",
+        },
+        rawRecipients: {
+          from: {
+            emailAddress: {
+              address: "owner@example.com",
+              name: "Owner Name",
+            },
+          },
+          toRecipients: [
+            {
+              emailAddress: {
+                address: "recipient@example.com",
+                name: "Recipient Name",
+              },
+            },
+          ],
+          ccRecipients: [],
+        },
+        textPlain: "Original body",
+        textHtml: "<p>Original body</p>",
+      } as EmailForAction,
+      {
+        to: "Recipient Name <recipient@example.com>",
+        content: "Draft body",
+      },
+      "owner@example.com",
+      createTestLogger(),
+    );
+
+    expect(updateDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toRecipients: [
+          {
+            emailAddress: {
+              address: "recipient@example.com",
+              name: "Recipient Name",
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  it("clears default reply-all CC and BCC recipients when no recipients are requested", async () => {
+    const getOriginalReadStatus = vi.fn(async () => ({ isRead: true }));
+    const createReplyAllDraft = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
+    const updateDraft = vi.fn(async () => ({ id: "draft-1" }) as Message);
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1") {
+        return { get: getOriginalReadStatus };
+      }
+      if (path === "/me/messages/message-1/createReplyAll") {
+        return { post: createReplyAllDraft };
+      }
+      if (path === "/me/messages/draft-1") return { patch: updateDraft };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    await draftEmail(
+      client,
+      {
+        id: "message-1",
+        threadId: "conversation-1",
+        headers: {
+          from: "Sender Name <sender@example.com>",
+          to: "user@example.com",
+          subject: "Original subject",
+          date: "2026-01-01T12:00:00.000Z",
+        },
+        textPlain: "Original body",
+        textHtml: "<p>Original body</p>",
+      } as EmailForAction,
+      {
+        content: "Draft body",
+      },
+      "user@example.com",
+      createTestLogger(),
+    );
+
+    expect(createReplyAllDraft).toHaveBeenCalledWith({});
+    expect(updateDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toRecipients: [
+          {
+            emailAddress: {
+              address: "sender@example.com",
+              name: "Sender Name",
+            },
+          },
+        ],
+        ccRecipients: [],
+        bccRecipients: [],
+      }),
+    );
+  });
+});
+
 function createMockOutlookClient(
   getEndpoint: (path: string) => {
+    get?: () => Promise<unknown>;
     post?: (body: unknown) => Promise<unknown>;
     patch?: (body: unknown) => Promise<unknown>;
   },
 ): OutlookClient {
   const api = vi.fn((path: string) => {
     const endpoint = getEndpoint(path);
-    return {
+    const request = {
+      get: endpoint.get ?? vi.fn(async () => ({})),
       post: endpoint.post ?? vi.fn(async () => ({})),
       patch: endpoint.patch ?? vi.fn(async () => ({})),
+      select: vi.fn(() => request),
+      header: vi.fn(() => request),
     };
+    return request;
   });
 
   return {

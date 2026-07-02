@@ -3,6 +3,7 @@ export const DEFAULT_PROVIDER = "DEFAULT";
 export const Provider = {
   OPEN_AI: "openai",
   AZURE: "azure",
+  AZURE_FOUNDRY: "azure-foundry",
   VERTEX: "vertex",
   ANTHROPIC: "anthropic",
   BEDROCK: "bedrock",
@@ -12,6 +13,8 @@ export const Provider = {
   AI_GATEWAY: "aigateway",
   OLLAMA: "ollama",
   OPENAI_COMPATIBLE: "openai-compatible",
+  CODEX_CLI: "codex-cli",
+  CLAUDE_CODE: "claude-code",
 };
 
 export const providerOptions: { label: string; value: string }[] = [

@@ -3,6 +3,8 @@ import type { Properties } from "posthog-js";
 import { env } from "@/env";
 import { createScopedLogger } from "@/utils/logger";
 import { hash } from "@/utils/hash";
+import prisma from "@/utils/prisma";
+import { redis } from "@/utils/redis";
 
 const logger = createScopedLogger("posthog");
 let posthogLlmClient: PostHog | undefined;
@@ -35,17 +37,17 @@ export function isPosthogLlmEvalApproved(email: string) {
 }
 
 async function getPosthogUserId(options: { email: string }) {
-  const personsEndpoint = `https://app.posthog.com/api/projects/${env.POSTHOG_PROJECT_ID}/persons/`;
+  const personsEndpoint = new URL(
+    `https://app.posthog.com/api/projects/${env.POSTHOG_PROJECT_ID}/persons/`,
+  );
+  personsEndpoint.searchParams.set("distinct_id", options.email);
 
   // 1. find user id by distinct id
-  const responseGet = await fetch(
-    `${personsEndpoint}?distinct_id=${options.email}`,
-    {
-      headers: {
-        Authorization: `Bearer ${env.POSTHOG_API_SECRET}`,
-      },
+  const responseGet = await fetch(personsEndpoint.toString(), {
+    headers: {
+      Authorization: `Bearer ${env.POSTHOG_API_SECRET}`,
     },
-  );
+  });
 
   const resGet: { results: { id: string; distinct_ids: string[] }[] } =
     await responseGet.json();
@@ -130,6 +132,7 @@ export async function aliasPosthogUser({
 export async function posthogCaptureEvent(
   email: string,
   event: string,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   properties?: Record<string, any>,
   sendFeatureFlags?: boolean,
 ) {
@@ -209,6 +212,7 @@ export async function trackError({
   });
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 export async function trackTrialStarted(email: string, attributes: any) {
   return posthogCaptureEvent(email, "Premium trial started", {
     ...attributes,
@@ -220,6 +224,7 @@ export async function trackTrialStarted(email: string, attributes: any) {
   });
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 export async function trackUpgradedToPremium(email: string, attributes: any) {
   return posthogCaptureEvent(email, "Upgraded to premium", {
     ...attributes,
@@ -233,6 +238,7 @@ export async function trackUpgradedToPremium(email: string, attributes: any) {
 
 export async function trackSubscriptionTrialStarted(
   email: string,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   attributes: any,
 ) {
   return posthogCaptureEvent(email, "Premium subscription trial started", {
@@ -262,6 +268,7 @@ export async function trackBillingTrialStarted(
 export async function trackSubscriptionCustom(
   email: string,
   status: string,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   attributes: any,
 ) {
   const event = `Premium subscription ${status}`;
@@ -278,6 +285,7 @@ export async function trackSubscriptionCustom(
 
 export async function trackSubscriptionStatusChanged(
   email: string,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   attributes: any,
 ) {
   return posthogCaptureEvent(email, "Subscription status changed", {
@@ -293,6 +301,7 @@ export async function trackSubscriptionStatusChanged(
 export async function trackSubscriptionCancelled(
   email: string,
   status: string,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   attributes: any,
 ) {
   return posthogCaptureEvent(email, "Cancelled premium subscription", {
@@ -308,6 +317,7 @@ export async function trackSubscriptionCancelled(
 export async function trackSwitchedPremiumPlan(
   email: string,
   status: string,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   attributes: any,
 ) {
   return posthogCaptureEvent(email, "Switched premium plan", {
@@ -338,12 +348,88 @@ export async function trackPaymentSuccess({
   });
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 export async function trackStripeEvent(email: string, data: any) {
   return posthogCaptureEvent(email, "Stripe event", data);
 }
 
+export async function trackUserDeletionRequested(userId: string) {
+  return posthogCaptureEvent(
+    "anonymous",
+    "User deletion requested",
+    { userId },
+    false,
+  );
+}
+
 export async function trackUserDeleted(userId: string) {
   return posthogCaptureEvent("anonymous", "User deleted", { userId }, false);
+}
+
+export const FIRST_TIME_EVENTS = {
+  FIRST_AUTOMATED_RULE_RUN: "First automated rule run",
+  FIRST_DRAFT_SENT: "First AI draft sent",
+  FIRST_CHAT_MESSAGE: "First chat message",
+} as const;
+
+type FirstTimeEvent =
+  (typeof FIRST_TIME_EVENTS)[keyof typeof FIRST_TIME_EVENTS];
+
+const MAX_FIRST_TIME_EVENT_CACHE_SIZE = 1000;
+const firedFirstTimeEvents = new Map<string, true>();
+
+/**
+ * Uses User.email as distinctId (not EmailAccount.email) so the event attaches
+ * to the same PostHog person as signup/billing events.
+ */
+export async function trackFirstTimeEvent({
+  emailAccountId,
+  event,
+  properties,
+}: {
+  emailAccountId: string;
+  event: FirstTimeEvent;
+  properties?: Record<string, unknown>;
+}) {
+  const key = `first-event:${emailAccountId}:${event}`;
+  if (markFirstTimeEventCacheHit(key)) return;
+
+  try {
+    const firstTime = await redis.set(key, "1", { nx: true });
+    addFirstTimeEventCacheKey(key);
+    if (!firstTime) return;
+
+    const emailAccount = await prisma.emailAccount.findUnique({
+      where: { id: emailAccountId },
+      select: { user: { select: { email: true } } },
+    });
+    const userEmail = emailAccount?.user?.email;
+    if (!userEmail) return;
+
+    await posthogCaptureEvent(userEmail, event, {
+      emailAccountId,
+      ...properties,
+    });
+  } catch (error) {
+    logger.error("Error tracking first-time event", { error, event });
+  }
+}
+
+export async function trackOnboardingAnswer(
+  email: string,
+  answers: {
+    surveyFeatures?: string[];
+    surveyRole?: string;
+    surveyGoal?: string;
+    surveyCompanySize?: number;
+    surveySource?: string;
+    surveyImprovements?: string;
+  },
+) {
+  return posthogCaptureEvent(email, "Onboarding answer submitted", {
+    ...answers,
+    $set: answers,
+  });
 }
 
 function getPosthogLlmEvalApprovedEmails() {
@@ -352,4 +438,22 @@ function getPosthogLlmEvalApprovedEmails() {
       .map((email) => email.trim().toLowerCase())
       .filter(Boolean) ?? []
   );
+}
+
+function markFirstTimeEventCacheHit(key: string) {
+  if (!firedFirstTimeEvents.has(key)) return false;
+
+  firedFirstTimeEvents.delete(key);
+  firedFirstTimeEvents.set(key, true);
+  return true;
+}
+
+function addFirstTimeEventCacheKey(key: string) {
+  firedFirstTimeEvents.delete(key);
+  firedFirstTimeEvents.set(key, true);
+
+  if (firedFirstTimeEvents.size <= MAX_FIRST_TIME_EVENT_CACHE_SIZE) return;
+
+  const oldestKey = firedFirstTimeEvents.keys().next().value;
+  if (oldestKey) firedFirstTimeEvents.delete(oldestKey);
 }

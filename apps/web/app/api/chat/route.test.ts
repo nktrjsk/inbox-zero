@@ -1,9 +1,6 @@
-vi.mock("server-only", () => ({}));
-
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmailAccount } from "@/__tests__/helpers";
-import { createScopedLogger } from "@/utils/logger";
 import prisma from "@/utils/__mocks__/prisma";
 
 const {
@@ -48,31 +45,19 @@ vi.mock("ai", () => ({
   createUIMessageStreamResponse: mockCreateUIMessageStreamResponse,
 }));
 
-vi.mock("@/utils/middleware", () => ({
-  withEmailAccount:
-    (
-      _scope: string,
-      handler: (
-        request: NextRequest & {
-          auth: { userId: string; emailAccountId: string; email: string };
-          logger: ReturnType<typeof createScopedLogger>;
-        },
-      ) => Promise<Response>,
-    ) =>
-    async (request: NextRequest) => {
-      const authRequest = request as NextRequest & {
-        auth: { userId: string; emailAccountId: string; email: string };
-        logger: ReturnType<typeof createScopedLogger>;
-      };
-      authRequest.auth = {
-        userId: "user-1",
-        emailAccountId: "email-account-id",
-        email: "user@test.com",
-      };
-      authRequest.logger = createScopedLogger("test/chat-route");
-      return handler(authRequest);
+vi.mock("@/utils/middleware", async () => {
+  const { createWithEmailAccountTestMiddleware } = await vi.importActual<
+    typeof import("@/__tests__/helpers")
+  >("@/__tests__/helpers");
+
+  return createWithEmailAccountTestMiddleware({
+    auth: {
+      userId: "user-1",
+      emailAccountId: "email-account-id",
+      email: "user@test.com",
     },
-}));
+  });
+});
 
 vi.mock("@/utils/prisma");
 
@@ -206,6 +191,19 @@ describe("chat route rule freshness persistence", () => {
         lastSeenRulesRevision: 6,
       },
     });
+  });
+
+  it("returns 404 when the email account cannot be loaded", async () => {
+    mockGetEmailAccountWithAi.mockResolvedValueOnce(null);
+
+    const response = await POST(createRequest());
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({
+      error: "Email account not found",
+    });
+    expect(mockGetInboxStatsForChatContext).not.toHaveBeenCalled();
+    expect(mockAiProcessAssistantChat).not.toHaveBeenCalled();
   });
 
   it("records the first seen rules revision for chats that have not seen rules yet", async () => {
@@ -418,6 +416,25 @@ describe("chat route rule freshness persistence", () => {
       consoleErrorSpy.mockRestore();
     }
   });
+
+  it("does not persist empty assistant messages", async () => {
+    streamState.finishMessages = [
+      {
+        id: "assistant-empty",
+        role: "assistant",
+        parts: [],
+      },
+    ];
+    mockAiProcessAssistantChat.mockResolvedValueOnce(
+      createAssistantStreamResult({
+        finishMessage: streamState.finishMessages[0],
+      }),
+    );
+
+    await POST(createRequest());
+
+    expect(prisma.chatMessage.createMany).not.toHaveBeenCalled();
+  });
 });
 
 function createRequest() {
@@ -437,7 +454,11 @@ function createRequest() {
   });
 }
 
-function createAssistantStreamResult() {
+function createAssistantStreamResult({
+  finishMessage = streamState.finishMessages[0] ?? null,
+}: {
+  finishMessage?: (typeof streamState.finishMessages)[number] | null;
+} = {}) {
   return {
     toUIMessageStream: ({
       onFinish,
@@ -448,7 +469,7 @@ function createAssistantStreamResult() {
     }) =>
       (async function* () {
         onFinish?.({
-          responseMessage: streamState.finishMessages[0] ?? null,
+          responseMessage: finishMessage,
         });
         yield { type: "text-start", id: "part-1" };
         yield { type: "text-end", id: "part-1" };

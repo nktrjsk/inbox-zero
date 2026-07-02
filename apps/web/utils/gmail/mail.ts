@@ -52,15 +52,14 @@ export const sendEmailBody = z.object({
 export type SendEmailBody = z.infer<typeof sendEmailBody>;
 type MailSendEmailBody = WithMailerAttachments<SendEmailBody>;
 
-const encodeMessage = (message: Buffer) => {
-  return Buffer.from(message)
+const encodeMessage = (message: Buffer) =>
+  Buffer.from(message)
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
-};
 
-const createMail = async (options: Mail.Options) => {
+export const createMail = async (options: Mail.Options) => {
   const mailComposer = new MailComposer(options);
   const message = await mailComposer.compile().build();
   return encodeMessage(message);
@@ -212,6 +211,7 @@ export async function forwardEmail(
     cc?: string;
     bcc?: string;
     content?: string;
+    from?: string;
   },
 ) {
   ensureEmailSendingEnabled();
@@ -241,6 +241,7 @@ export async function forwardEmail(
 
   const raw = await createRawMailMessage({
     to: options.to,
+    from: options.from,
     cc: options.cc,
     bcc: options.bcc,
     subject: forwardEmailSubject(message.headers.subject),
@@ -279,7 +280,7 @@ export async function draftEmail(
     bcc?: string;
     attachments?: Attachment[];
   },
-  userEmail: string,
+  userEmails: string | string[],
 ) {
   const { html } = createReplyContent({
     textContent: args.content,
@@ -293,7 +294,7 @@ export async function draftEmail(
   const recipients = buildReplyAllRecipients(
     originalEmail.headers,
     args.to,
-    userEmail,
+    userEmails,
   );
 
   // Merge CC from reply-all with CC from args

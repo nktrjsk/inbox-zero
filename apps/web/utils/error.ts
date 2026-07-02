@@ -2,7 +2,7 @@ import {
   captureException as sentryCaptureException,
   setUser,
 } from "@sentry/nextjs";
-import { APICallError, RetryError } from "ai";
+import { APICallError, NoObjectGeneratedError, RetryError } from "ai";
 import type { FlattenedValidationErrors } from "next-safe-action";
 import {
   getProviderRateLimitApiErrorType,
@@ -11,6 +11,7 @@ import {
 } from "@/utils/email/rate-limit-mode-error";
 import { createScopedLogger, type Logger } from "@/utils/logger";
 
+// biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 export type ErrorMessage = { error: string; data?: any };
 export type ZodError = {
   error: { issues: { code: string; message: string }[] };
@@ -24,6 +25,7 @@ export type ApiErrorType = {
 const RATE_LIMIT_MESSAGE_TEMPLATE =
   "{provider} is temporarily limiting requests. Please try again shortly.";
 
+// biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 export function isError(value: any): value is ErrorMessage | ZodError {
   return value?.error;
 }
@@ -34,7 +36,9 @@ export function isGmailError(
   return (
     typeof error === "object" &&
     error !== null &&
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
     Array.isArray((error as any).errors) &&
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
     (error as any).errors.length > 0
   );
 }
@@ -48,6 +52,7 @@ export type CaptureExceptionContext = {
   emailAccountId?: string | null;
   userId?: string | null;
   userEmail?: string;
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   extra?: Record<string, any>;
   sampleRate?: number;
 };
@@ -153,15 +158,27 @@ export class SafeError extends Error {
   }
 }
 
+const INVALID_GRANT_ERROR_MARKERS = ["invalid_grant", "AADSTS50173"] as const;
+
+export function isInvalidGrantError(error: unknown): boolean {
+  const message = getErrorMessage(error);
+  if (!message) return false;
+
+  return INVALID_GRANT_ERROR_MARKERS.some((marker) => message.includes(marker));
+}
+
 export function isGmailInsufficientPermissionsError(error: unknown): boolean {
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   return (error as any)?.errors?.[0]?.reason === "insufficientPermissions";
 }
 
 export function isGmailRateLimitExceededError(error: unknown): boolean {
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   return (error as any)?.errors?.[0]?.reason === "rateLimitExceeded";
 }
 
 export function isGmailQuotaExceededError(error: unknown): boolean {
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   return (error as any)?.errors?.[0]?.reason === "quotaExceeded";
 }
 
@@ -297,6 +314,17 @@ export function isKnownOutlookError(error: unknown): boolean {
   );
 }
 
+// Provider content moderation refused to produce structured output. Retrying
+// the same model is futile; a fallback model may succeed. Handles p-retry
+// context wrappers that expose the real error on an `error` property.
+export function isContentFilterRefusal(error: unknown): boolean {
+  const unwrapped = (error as { error?: unknown })?.error ?? error;
+  return (
+    NoObjectGeneratedError.isInstance(unwrapped) &&
+    unwrapped.finishReason === "content-filter"
+  );
+}
+
 // we don't want to capture these errors in Sentry
 export function isKnownApiError(error: unknown): boolean {
   return (
@@ -305,6 +333,7 @@ export function isKnownApiError(error: unknown): boolean {
     isGmailRateLimitExceededError(error) ||
     isGmailQuotaExceededError(error) ||
     isKnownOutlookError(error) ||
+    isContentFilterRefusal(error) ||
     (APICallError.isInstance(error) &&
       (isIncorrectAPIKeyError(error) ||
         isInvalidAIModelError(error) ||
@@ -348,6 +377,7 @@ export function checkCommonErrors(
   if (isGmailRateLimitExceededError(error)) {
     logger.warn("Gmail rate limit exceeded for url", { url });
     const errorMessage =
+      // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
       (error as any)?.errors?.[0]?.message ?? "Unknown error";
     return {
       type: getProviderRateLimitApiErrorType("google"),
@@ -411,13 +441,13 @@ export function getErrorMessage(error: unknown): string | undefined {
   if (error instanceof Error) return error.message;
 
   const outer = asRecord(error);
-  if (!outer) return undefined;
+  if (!outer) return;
 
   const directMessage = getStringProp(outer, "message");
   if (directMessage) return directMessage;
 
   const nested = asRecord(outer.error);
-  if (!nested) return undefined;
+  if (!nested) return;
 
   return getStringProp(nested, "message");
 }

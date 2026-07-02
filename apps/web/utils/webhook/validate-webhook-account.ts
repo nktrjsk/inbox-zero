@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { env } from "@/env";
-import { hasAiAccess, isPremium } from "@/utils/premium";
+import {
+  getUserTier,
+  hasAiAccess,
+  isPremiumRecord,
+  premiumEntitlementSelect,
+} from "@/utils/premium";
 import { unwatchEmails } from "@/utils/email/watch-manager";
 import { createEmailProvider } from "@/utils/email/provider";
 import {
@@ -24,6 +29,7 @@ const webhookEmailAccountSelect = {
   userId: true,
   about: true,
   multiRuleSelectionEnabled: true,
+  sensitiveDataPolicy: true,
   timezone: true,
   calendarBookingLink: true,
   draftReplyConfidence: true,
@@ -45,7 +51,9 @@ const webhookEmailAccountSelect = {
   },
   rules: {
     where: { enabled: true },
-    include: { actions: true },
+    include: {
+      actions: true,
+    },
   },
   user: {
     select: {
@@ -53,11 +61,7 @@ const webhookEmailAccountSelect = {
       aiModel: true,
       aiApiKey: true,
       premium: {
-        select: {
-          lemonSqueezyRenewsAt: true,
-          stripeSubscriptionStatus: true,
-          tier: true,
-        },
+        select: premiumEntitlementSelect,
       },
     },
   },
@@ -89,27 +93,23 @@ export async function getWebhookEmailAccount(
         subscriptionId: where.watchEmailsSubscriptionId,
       });
 
-      const [foundAccount] = await prisma.$queryRaw<Array<{ id: string }>>`
-        SELECT id FROM "EmailAccount"
-        WHERE "watchEmailsSubscriptionHistory" @> ${JSON.stringify([
-          { subscriptionId: where.watchEmailsSubscriptionId },
-        ])}::jsonb
-        LIMIT 1
-      `;
+      emailAccount = await prisma.emailAccount.findFirst({
+        where: {
+          watchEmailsSubscriptionHistory: {
+            array_contains: [
+              { subscriptionId: where.watchEmailsSubscriptionId },
+            ],
+          },
+        },
+        select: webhookEmailAccountSelect,
+      });
 
-      if (foundAccount) {
-        emailAccount = await prisma.emailAccount.findUnique({
-          where: { id: foundAccount.id },
-          select: webhookEmailAccountSelect,
+      if (emailAccount) {
+        logger.info("Found account by historical subscription ID", {
+          subscriptionId: where.watchEmailsSubscriptionId,
+          email: emailAccount.email,
+          currentSubscriptionId: emailAccount.watchEmailsSubscriptionId,
         });
-
-        if (emailAccount) {
-          logger.info("Found account by historical subscription ID", {
-            subscriptionId: where.watchEmailsSubscriptionId,
-            email: emailAccount.email,
-            currentSubscriptionId: emailAccount.watchEmailsSubscriptionId,
-          });
-        }
       }
     }
   }
@@ -161,7 +161,7 @@ export async function cleanupWebhookAccountOnRateLimitSkip(
 
   const premium = getWebhookAccountPremium(emailAccount);
   const userHasAiAccess = hasAiAccess(
-    premium?.tier || null,
+    getUserTier(premium),
     !!emailAccount.user.aiApiKey,
   );
   const shouldUnwatch =
@@ -232,6 +232,8 @@ export async function validateWebhookAccount(
   if (!premium) {
     logger.info("Account not premium", {
       lemonSqueezyRenewsAt: emailAccount.user.premium?.lemonSqueezyRenewsAt,
+      appleExpiresAt: emailAccount.user.premium?.appleExpiresAt,
+      appleRevokedAt: emailAccount.user.premium?.appleRevokedAt,
       stripeSubscriptionStatus:
         emailAccount.user.premium?.stripeSubscriptionStatus,
     });
@@ -244,14 +246,12 @@ export async function validateWebhookAccount(
     return { success: false, response: NextResponse.json({ ok: true }) };
   }
 
-  const userHasAiAccess = hasAiAccess(
-    premium.tier,
-    !!emailAccount.user.aiApiKey,
-  );
+  const tier = getUserTier(premium);
+  const userHasAiAccess = hasAiAccess(tier, !!emailAccount.user.aiApiKey);
 
   if (!userHasAiAccess) {
     logger.info("Does not have ai access - unwatching", {
-      tier: premium.tier,
+      tier,
       hasApiKey: !!emailAccount.user.aiApiKey,
     });
     await unwatchEmails({
@@ -294,11 +294,17 @@ function getWebhookAccountPremium(
   emailAccount: NonNullable<ValidatedWebhookAccountData>,
 ) {
   return env.NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS
-    ? { tier: "PROFESSIONAL_ANNUALLY" as const }
-    : isPremium(
-          emailAccount.user.premium?.lemonSqueezyRenewsAt || null,
-          emailAccount.user.premium?.stripeSubscriptionStatus || null,
-        )
+    ? {
+        tier: "PROFESSIONAL_ANNUALLY" as const,
+        stripeSubscriptionStatus: "active",
+        lemonSqueezyRenewsAt: null,
+        appleSubscriptionStatus: null,
+        appleExpiresAt: null,
+        appleRevokedAt: null,
+        adminGrantExpiresAt: null,
+        adminGrantTier: null,
+      }
+    : isPremiumRecord(emailAccount.user.premium)
       ? emailAccount.user.premium
       : undefined;
 }

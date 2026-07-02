@@ -5,14 +5,18 @@ import {
 } from "@/generated/prisma/enums";
 import type { ReplyMemory } from "@/generated/prisma/client";
 import { getUserInfoPrompt } from "@/utils/ai/helpers";
-import { extractDomainFromEmail } from "@/utils/email";
+import { extractDomainFromEmail, isPublicEmailDomain } from "@/utils/email";
 import { createGenerateObject } from "@/utils/llms";
-import { getModel } from "@/utils/llms/model";
+import { getModelForUseCase, LlmUseCase } from "@/utils/llms/use-cases";
+import {
+  appendOllamaOnlySystemGuidance,
+  isOllamaProvider,
+} from "@/utils/llms/ollama-guidance";
 import { isDefined } from "@/utils/types";
 import type { getEmailAccountWithAi } from "@/utils/user/get";
 
 const MAX_MEMORIES_PER_EDIT = 3;
-const MAX_EXISTING_MEMORIES_IN_PROMPT = 12;
+const MAX_EXISTING_MEMORIES_IN_PROMPT = 16;
 
 const newReplyMemorySchema = z.object({
   content: z.string().trim().min(1).max(400),
@@ -73,6 +77,7 @@ export async function aiExtractReplyMemoriesFromDraftEdit({
   }
 
   const senderDomain = extractDomainFromEmail(normalizedSenderEmail);
+  const allowDomainScope = !isPublicEmailDomain(senderDomain);
   const prompt = getPrompt({
     senderEmail: normalizedSenderEmail,
     senderDomain,
@@ -85,7 +90,10 @@ export async function aiExtractReplyMemoriesFromDraftEdit({
     emailAccount,
   });
 
-  const modelOptions = getModel(emailAccount.user, "economy");
+  const modelOptions = getModelForUseCase(
+    emailAccount.user,
+    LlmUseCase.ReplyMemoryExtraction,
+  );
   const generateObject = createGenerateObject({
     emailAccount,
     label: "Reply memory extraction",
@@ -95,9 +103,15 @@ export async function aiExtractReplyMemoriesFromDraftEdit({
 
   const result = await generateObject({
     ...modelOptions,
-    system: getSystemPrompt(),
+    system: appendOllamaOnlySystemGuidance(
+      { system: getSystemPrompt({ allowDomainScope }) },
+      modelOptions,
+      getOllamaReplyMemoryGuidance({ allowDomainScope }),
+    ).system,
     prompt,
-    schema: replyMemorySchema,
+    schema: isOllamaProvider(modelOptions.provider)
+      ? ollamaReplyMemorySchema
+      : replyMemorySchema,
   });
 
   return result.object.memories
@@ -127,7 +141,14 @@ export async function aiExtractReplyMemoriesFromDraftEdit({
 
       if (
         newMemory.scopeType === ReplyMemoryScopeType.TOPIC &&
-        !newMemory.scopeValue.length
+        !isValidTopicScopeValue(newMemory.scopeValue)
+      ) {
+        return null;
+      }
+
+      if (
+        newMemory.scopeType === ReplyMemoryScopeType.DOMAIN &&
+        !allowDomainScope
       ) {
         return null;
       }
@@ -232,7 +253,23 @@ function normalizeMemoryText(value: string) {
   return value.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function getSystemPrompt() {
+function isValidTopicScopeValue(value: string) {
+  const normalizedTopic = value.trim();
+  if (!normalizedTopic) return false;
+  if (normalizedTopic.length > 80) return false;
+  if (normalizedTopic.split(/ +/).length > 10) return false;
+
+  return /^[\p{L}\p{N}][\p{L}\p{N} /&+-]*$/u.test(normalizedTopic);
+}
+
+function getSystemPrompt({ allowDomainScope }: { allowDomainScope: boolean }) {
+  const domainScopeLine = allowDomainScope
+    ? "- DOMAIN: applies to one sender domain\n"
+    : "";
+  const domainRuleLine = allowDomainScope
+    ? "- For DOMAIN scope, use the exact sender domain from the context.\n"
+    : "- DOMAIN scope is unavailable because the sender domain is a public email provider. Use SENDER for sender-specific rules, GLOBAL for broad account rules, or TOPIC for reusable topics.\n";
+
   return `You analyze how a user edits AI-generated email reply drafts and turn durable patterns into reusable drafting memories.
 
 Return only memories that are likely to help with future drafts.
@@ -245,14 +282,16 @@ Memory kinds:
 Scopes:
 - GLOBAL: applies broadly to the user's replies
 - SENDER: applies to one sender email address
-- DOMAIN: applies to one sender domain
-- TOPIC: applies to a reusable topic or subject area
+${domainScopeLine}- TOPIC: applies to a reusable topic or subject area
 
 Rules:
 - Return at most ${MAX_MEMORIES_PER_EDIT} memories.
-- Skip one-off contextual details that should not be reused later.
-- If the edit only changes a meeting time, date, greeting, sign-off, or other thread-specific logistics, return no memory unless the user stated a stable rule.
+- Learn from the user's substantive edit, not from content that was already present in the AI draft.
+- Before creating a memory, apply this durability test: would following it in a future unrelated thread be correct without the original context? If not, return no memory for that idea.
+- Skip one-off logistics, temporary states, completed actions, current documents or attachments, and ad hoc or explicitly one-time exceptions unless the edit explicitly reveals a stable policy, preference, fact, or repeatable process.
+- For current documents, attachments, or completed actions, do not create memories that simply say to send, share, attach, confirm, or complete the item. Only store a stable rule for how that class of request should be handled in the future.
 - Prefer concise, direct drafting instructions.
+- Do not copy example sentences from the draft or sent reply into memory content. Describe the reusable rule instead.
 - Each memory should be a single prompt-ready instruction or fact in the content field. Do not split the same idea across a title and body.
 - Do not infer a durable style preference from a single scheduling choice or one-off availability update.
 - Do not store a PREFERENCE memory that simply repeats the user's explicit writing style setting.
@@ -262,13 +301,41 @@ Rules:
 - Use PREFERENCE for stable tone, length, formatting, or phrasing preferences.
 - For GLOBAL scope, leave scopeValue empty.
 - For SENDER scope, use the exact sender email from the context.
-- For DOMAIN scope, use the exact sender domain from the context.
-- For TOPIC scope, use a short stable topic phrase such as "pricing" or "refunds".
+${domainRuleLine}- For TOPIC scope, use a short stable topic phrase such as "pricing" or "refunds".
+- TOPIC scope values must be short topic labels, not copied sentences or arbitrary thread text.
 - Always include a scopeValue field. Use an empty string for GLOBAL scope.
-- If an existing memory already captures the same durable idea, return its id in matchingExistingMemoryId and set newMemory to null.
+- Prefer matching an existing memory over creating a new one when the existing memory substantially covers the same durable idea, even if the wording is different.
+- A single edit can match multiple existing memories, such as one factual/procedure memory and one style preference. Return every matching id that is useful evidence for the edit, up to the maximum.
+- If any existing memory already captures a durable idea from the edit, return its id in matchingExistingMemoryId and set newMemory to null for that idea.
 - If the edit teaches a new durable memory, set matchingExistingMemoryId to null and fill newMemory.
 - Only return ids from the provided existing memory list.
-- Be conservative about matching existing memories. Only match when the existing memory clearly already covers the same durable idea.
+- Be conservative about creating new memories. Only create a new memory when none of the provided existing memories substantially covers that durable idea.
 - Work language-agnostically. The memories may be written in any language.
 - If nothing durable was learned, return an empty array.`;
+}
+
+const ollamaReplyMemoryDecisionSchema = z.object({
+  matchingExistingMemoryId: z.string().trim().min(1).nullable(),
+  newMemory: newReplyMemorySchema.nullable(),
+});
+
+const ollamaReplyMemorySchema = z.object({
+  memories: z.array(ollamaReplyMemoryDecisionSchema).max(MAX_MEMORIES_PER_EDIT),
+});
+
+function getOllamaReplyMemoryGuidance({
+  allowDomainScope,
+}: {
+  allowDomainScope: boolean;
+}) {
+  return [
+    'Each item in "memories" must have both "matchingExistingMemoryId" and "newMemory".',
+    'For an existing memory match, use {"matchingExistingMemoryId":"existing-id","newMemory":null}.',
+    'For a new memory, use {"matchingExistingMemoryId":null,"newMemory":{"content":"...","kind":"FACT","scopeType":"TOPIC","scopeValue":"pricing"}}.',
+    "Use kind values exactly: FACT, PREFERENCE, PROCEDURE.",
+    `Use scopeType values exactly: GLOBAL, SENDER,${allowDomainScope ? " DOMAIN," : ""} TOPIC.`,
+    "Stable business facts, pricing, billing rules, product limits, policies, and qualification requirements are FACT memories unless the edit says they are temporary or one-time.",
+    'FACT memory content should preserve concrete details such as numeric amounts, product limits, and billing conditions instead of becoming generic instructions like "provide pricing details".',
+    "Use PROCEDURE only when the edit teaches a repeatable process or sequence of steps.",
+  ] as const;
 }

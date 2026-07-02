@@ -5,32 +5,49 @@ import { GmailLabel } from "@/utils/gmail/label";
 import * as gmailLabelModule from "@/utils/gmail/label";
 import { GmailProvider } from "./google";
 
-vi.mock("server-only", () => ({}));
-
-const { envMock, gmailMailMock } = vi.hoisted(() => ({
-  envMock: {
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    EMAIL_ENCRYPT_SECRET: "test-encrypt-secret",
-    EMAIL_ENCRYPT_SALT: "test-encrypt-salt",
-  },
-  gmailMailMock: {
-    draftEmail: vi.fn().mockResolvedValue({ data: { id: "draft-1" } }),
-    forwardEmail: vi.fn(),
-    replyToEmail: vi.fn(),
-    sendEmailWithPlainText: vi.fn(),
-    sendEmailWithHtml: vi.fn(),
-  },
-}));
+const { envMock, gmailMailMock, gmailDraftMock, gmailSignatureMock } =
+  vi.hoisted(() => ({
+    envMock: {
+      NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
+      EMAIL_ENCRYPT_SECRET: "test-encrypt-secret",
+      EMAIL_ENCRYPT_SALT: "test-encrypt-salt",
+    },
+    gmailMailMock: {
+      draftEmail: vi.fn().mockResolvedValue({ data: { id: "draft-1" } }),
+      forwardEmail: vi.fn(),
+      replyToEmail: vi.fn(),
+      sendEmailWithPlainText: vi.fn(),
+      sendEmailWithHtml: vi.fn(),
+    },
+    gmailDraftMock: {
+      getDraft: vi.fn(),
+      deleteDraft: vi.fn(),
+      sendDraft: vi.fn(),
+    },
+    gmailSignatureMock: {
+      getGmailSignatures: vi.fn().mockResolvedValue([]),
+    },
+  }));
 
 vi.mock("@/env", () => ({
   env: envMock,
 }));
 
-vi.mock("@/utils/gmail/mail", () => gmailMailMock);
+vi.mock("@/utils/gmail/mail", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/utils/gmail/mail")>();
+  return { ...actual, ...gmailMailMock };
+});
+
+vi.mock("@/utils/gmail/draft", () => gmailDraftMock);
+
+vi.mock("@/utils/gmail/signature-settings", () => gmailSignatureMock);
 
 describe("GmailProvider.getLatestMessageInThread", () => {
   afterEach(() => {
     envMock.NEXT_PUBLIC_AUTO_DRAFT_DISABLED = false;
+    vi.clearAllMocks();
+    gmailMailMock.draftEmail.mockResolvedValue({ data: { id: "draft-1" } });
+    gmailSignatureMock.getGmailSignatures.mockResolvedValue([]);
   });
 
   it("returns latest non-draft message when newest message is a draft", async () => {
@@ -97,6 +114,141 @@ describe("GmailProvider.getLatestMessageInThread", () => {
 
     expect(result).toEqual({ draftId: "" });
     expect(gmailMailMock.draftEmail).not.toHaveBeenCalled();
+  });
+
+  it("passes Gmail send-as aliases when creating drafts", async () => {
+    gmailSignatureMock.getGmailSignatures.mockResolvedValue([
+      {
+        email: "user@example.com",
+        signature: "",
+        isDefault: true,
+      },
+      {
+        email: "alias@example.com",
+        signature: "",
+        isDefault: false,
+      },
+    ]);
+    const provider = new GmailProvider({} as any);
+    const message = createParsedMessage({
+      id: "message-1",
+      internalDate: "1000",
+    });
+    const args = { content: "Follow up" };
+
+    const result = await provider.draftEmail(message, args, "user@example.com");
+
+    expect(result).toEqual({ draftId: "draft-1" });
+    expect(gmailMailMock.draftEmail).toHaveBeenCalledWith(
+      expect.anything(),
+      message,
+      args,
+      ["user@example.com", "alias@example.com"],
+    );
+  });
+});
+
+describe("GmailProvider.getSentMessageIds", () => {
+  it("filters sent messages with Gmail labelIds and second-accurate date bounds", async () => {
+    const list = vi.fn().mockResolvedValue({
+      data: {
+        messages: [{ id: "message-1", threadId: "thread-1" }],
+        nextPageToken: "next-page",
+      },
+    });
+    const provider = new GmailProvider({
+      users: { messages: { list } },
+    } as any);
+
+    const result = await provider.getSentMessageIds({
+      maxResults: 50,
+      after: new Date("2026-03-31T12:00:00.000Z"),
+      before: new Date("2026-04-30T17:00:00.000Z"),
+      pageToken: "page-1",
+    });
+
+    expect(list).toHaveBeenCalledWith({
+      userId: "me",
+      maxResults: 50,
+      q: "after:1774958399 before:1777568401",
+      pageToken: "page-1",
+      labelIds: [GmailLabel.SENT],
+    });
+    expect(result).toEqual({
+      messages: [{ id: "message-1", threadId: "thread-1" }],
+      nextPageToken: "next-page",
+    });
+  });
+
+  it("omits the Gmail search query when no date range is provided", async () => {
+    const list = vi.fn().mockResolvedValue({ data: { messages: [] } });
+    const provider = new GmailProvider({
+      users: { messages: { list } },
+    } as any);
+
+    await provider.getSentMessageIds({
+      maxResults: 50,
+    });
+
+    expect(list).toHaveBeenCalledWith({
+      userId: "me",
+      maxResults: 50,
+      q: undefined,
+      pageToken: undefined,
+      labelIds: [GmailLabel.SENT],
+    });
+  });
+});
+
+describe("GmailProvider.updateDraft", () => {
+  it("keeps Gmail threading metadata and MIME-encodes non-ASCII subjects", async () => {
+    const update = vi.fn().mockResolvedValue({ data: {} });
+    const provider = new GmailProvider({
+      users: { drafts: { update } },
+    } as any);
+    const subject = "Re: ok but you NEED to share your secrets 👀🔍";
+
+    gmailDraftMock.getDraft.mockResolvedValueOnce(
+      createParsedMessage({
+        id: "draft-message-1",
+        internalDate: "1000",
+        threadId: "thread-special",
+        subject,
+        labelIds: [GmailLabel.DRAFT],
+        headers: {
+          to: "sender@example.com",
+          subject,
+          "in-reply-to": "<original@example.com>",
+          references: "<root@example.com> <original@example.com>",
+        },
+      }),
+    );
+
+    await provider.updateDraft("r-123", {
+      subject,
+      messageHtml: "<p>Edited response.</p>",
+    });
+
+    expect(update).toHaveBeenCalledWith({
+      userId: "me",
+      id: "r-123",
+      requestBody: {
+        message: {
+          threadId: "thread-special",
+          raw: expect.any(String),
+        },
+      },
+    });
+
+    const raw = update.mock.calls[0]?.[0]?.requestBody?.message?.raw;
+    const decodedMessage = decodeBase64Url(raw);
+
+    expect(decodedMessage).toContain("Subject: =?UTF-8?");
+    expect(decodedMessage).toContain("In-Reply-To: <original@example.com>");
+    expect(decodedMessage).toContain(
+      "References: <root@example.com> <original@example.com>",
+    );
+    expect(decodedMessage).toContain("Edited response.");
   });
 });
 
@@ -192,29 +344,40 @@ function createThread(messages: ParsedMessage[]): EmailThread {
 function createParsedMessage({
   id,
   internalDate,
+  threadId = "thread-1",
   labelIds,
+  subject = "Subject",
+  headers,
 }: {
   id: string;
   internalDate: string;
+  threadId?: string;
   labelIds?: string[];
+  subject?: string;
+  headers?: Partial<ParsedMessage["headers"]>;
 }): ParsedMessage {
   return {
     id,
-    threadId: "thread-1",
+    threadId,
     labelIds,
     snippet: "",
     historyId: "history-1",
     inline: [],
     headers: {
-      subject: "Subject",
+      subject,
       from: "sender@example.com",
       to: "recipient@example.com",
       date: "Mon, 01 Jan 2026 00:00:00 +0000",
+      ...headers,
     },
-    subject: "Subject",
+    subject,
     date: "Mon, 01 Jan 2026 00:00:00 +0000",
     internalDate,
     textPlain: "",
     textHtml: "",
   };
+}
+
+function decodeBase64Url(value: string): string {
+  return Buffer.from(value, "base64url").toString("utf8");
 }

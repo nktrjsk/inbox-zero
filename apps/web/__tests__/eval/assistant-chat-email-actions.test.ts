@@ -13,6 +13,7 @@ import {
   captureAssistantChatTrace,
   getFirstMatchingToolCall,
   getLastMatchingToolCall,
+  getStableMessageCacheKey,
   summarizeRecordedToolCalls,
   type RecordedToolCall,
 } from "@/__tests__/eval/assistant-chat-eval-utils";
@@ -24,11 +25,11 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-email-actions
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-email-actions
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
-const evalReporter = createEvalReporter();
+const evalReporter = createEvalReporter({
+  evalName: "assistant-chat-email-actions",
+});
 const logger = createScopedLogger("eval-assistant-chat-email-actions");
 const scenarios: EvalScenario[] = [
   {
@@ -52,6 +53,33 @@ const scenarios: EvalScenario[] = [
     reportName: "reply uses search then replyEmail",
     prompt:
       "Reply to the email from ops@partner.example and say Tuesday at 2pm works for me.",
+    searchMessages: [
+      getMockMessage({
+        id: "msg-reply-1",
+        threadId: "thread-reply-1",
+        from: "ops@partner.example",
+        subject: "Question on the revised plan",
+        snippet: "Can you send your answer today?",
+        labelIds: ["UNREAD"],
+      }),
+    ],
+    expectation: {
+      kind: "reply_email",
+      searchExpectation:
+        "A search query focused on finding the email from ops@partner.example about the revised plan.",
+      messageId: "msg-reply-1",
+      contentExpectation:
+        "Reply content that clearly says Tuesday at 2pm works for the sender.",
+      disallowedTools: ["sendEmail"],
+      forbidInlineEmailMarkup: true,
+    },
+  },
+  {
+    title:
+      "uses replyEmail instead of fabricated inline email markup when explaining and drafting a missed reply",
+    reportName: "missed reply explanation still uses replyEmail",
+    prompt:
+      "Why didn't you draft a reply to the email from ops@partner.example? Draft one now saying Tuesday at 2pm works for me.",
     searchMessages: [
       getMockMessage({
         id: "msg-reply-1",
@@ -147,13 +175,15 @@ vi.mock("@/utils/senders/unsubscribe", () => ({
 
 vi.mock("@/utils/prisma");
 
-vi.mock("@/env", () => ({
-  env: {
-    NEXT_PUBLIC_EMAIL_SEND_ENABLED: true,
-    NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
-    NEXT_PUBLIC_BASE_URL: "http://localhost:3000",
-  },
-}));
+vi.mock("@/env", async () => {
+  const { buildAssistantChatEvalEnv } = await vi.importActual<
+    typeof import("@/__tests__/eval/assistant-chat-eval-env")
+  >("@/__tests__/eval/assistant-chat-eval-env");
+
+  return {
+    env: buildAssistantChatEvalEnv(),
+  };
+});
 
 describe.runIf(shouldRunEval)("Eval: assistant chat email actions", () => {
   beforeEach(() => {
@@ -205,32 +235,44 @@ describe.runIf(shouldRunEval)("Eval: assistant chat email actions", () => {
       test(
         scenario.title,
         async () => {
-          if (scenario.searchMessages) {
-            mockSearchMessages.mockResolvedValueOnce({
-              messages: scenario.searchMessages,
-              nextPageToken: undefined,
-            });
-          }
+          const messages = [
+            { role: "user" as const, content: scenario.prompt },
+          ];
+          const record = await evalReporter.recordCached(
+            {
+              testName: scenario.reportName,
+              model: model.label,
+              cacheKeyParts: [
+                { model, scenario: getScenarioCacheKey(scenario), messages },
+              ],
+            },
+            async () => {
+              if (scenario.searchMessages) {
+                mockSearchMessages.mockResolvedValueOnce({
+                  messages: scenario.searchMessages,
+                  nextPageToken: undefined,
+                });
+              }
 
-          const result = await runAssistantChat({
-            emailAccount,
-            messages: [{ role: "user", content: scenario.prompt }],
-          });
+              const result = await runAssistantChat({
+                emailAccount,
+                messages,
+              });
 
-          const evaluation = await evaluateScenario(
-            result,
-            scenario.prompt,
-            scenario.expectation,
+              const evaluation = await evaluateScenario(
+                result,
+                scenario.prompt,
+                scenario.expectation,
+              );
+
+              return {
+                pass: evaluation.pass,
+                actual: evaluation.actual,
+              };
+            },
           );
 
-          evalReporter.record({
-            testName: scenario.reportName,
-            model: model.label,
-            pass: evaluation.pass,
-            actual: evaluation.actual,
-          });
-
-          expect(evaluation.pass).toBe(true);
+          expect(record.pass, record.actual).toBe(true);
         },
         TIMEOUT,
       );
@@ -322,6 +364,13 @@ type EvalScenario = {
   searchMessages?: ReturnType<typeof getMockMessage>[];
   expectation: ScenarioExpectation;
 };
+
+function getScenarioCacheKey(scenario: EvalScenario) {
+  return {
+    ...scenario,
+    searchMessages: getStableMessageCacheKey(scenario.searchMessages),
+  };
+}
 
 function isSearchInboxInput(input: unknown): input is SearchInboxInput {
   return (

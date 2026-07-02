@@ -1,5 +1,3 @@
-vi.mock("server-only", () => ({}));
-
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import prisma from "@/utils/__mocks__/prisma";
@@ -19,30 +17,11 @@ vi.mock("@/env", () => ({
 }));
 
 vi.mock("@/utils/middleware", async () => {
-  const { createScopedLogger } =
-    await vi.importActual<typeof import("@/utils/logger")>("@/utils/logger");
+  const { createWithErrorTestMiddleware } = await vi.importActual<
+    typeof import("@/__tests__/helpers")
+  >("@/__tests__/helpers");
 
-  return {
-    withError:
-      (
-        _name: string,
-        handler: (
-          request: NextRequest,
-          context: { params: Promise<{ integration: string }> },
-        ) => Promise<Response>,
-      ) =>
-      async (
-        request: NextRequest,
-        context: { params: Promise<{ integration: string }> },
-      ) => {
-        (
-          request as NextRequest & {
-            logger: ReturnType<typeof createScopedLogger>;
-          }
-        ).logger = createScopedLogger("test/mcp-callback");
-        return handler(request, context);
-      },
-  };
+  return createWithErrorTestMiddleware();
 });
 
 vi.mock("@/utils/prisma");
@@ -122,6 +101,34 @@ describe("mcp callback route", () => {
     expect(location).toContain("/integrations");
     expect(location).toContain("error=invalid_state_format");
     expect(mockHandleOAuthCallback).not.toHaveBeenCalled();
+  });
+
+  it("rejects a signed callback state that does not match the browser state cookie", async () => {
+    const attackerState = generateSignedOAuthState({
+      userId: "attacker-user",
+      emailAccountId: "attacker-email-account",
+      type: "notion-mcp",
+    });
+    const victimState = generateSignedOAuthState({
+      userId: "victim-user",
+      emailAccountId: "victim-email-account",
+      type: "notion-mcp",
+    });
+
+    const response = await GET(
+      createRequest({
+        queryState: attackerState,
+        cookieState: victimState,
+      }),
+      params,
+    );
+
+    const location = response.headers.get("location");
+    expect(location).toContain("/integrations");
+    expect(location).toContain("error=invalid_state");
+    expect(prisma.emailAccount.findFirst).not.toHaveBeenCalled();
+    expect(mockHandleOAuthCallback).not.toHaveBeenCalled();
+    expect(mockSyncMcpTools).not.toHaveBeenCalled();
   });
 
   it("accepts a matching signed state and continues the OAuth flow", async () => {

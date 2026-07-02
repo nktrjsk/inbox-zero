@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ParsedMessage } from "@/utils/types";
-import { createScopedLogger } from "@/utils/logger";
+import { createTestLogger } from "@/__tests__/helpers";
 import {
   ReplyMemoryKind,
   ReplyMemoryScopeType,
@@ -20,7 +20,6 @@ const { mockCreateGenerateObject, mockGenerateObject } = vi.hoisted(() => {
   return { mockCreateGenerateObject, mockGenerateObject };
 });
 
-vi.mock("server-only", () => ({}));
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/llms", () => ({
   createGenerateObject: mockCreateGenerateObject,
@@ -55,7 +54,7 @@ vi.mock("@/utils/user/get", () => ({
   }),
 }));
 
-const logger = createScopedLogger("reply-memory-test");
+const logger = createTestLogger();
 
 describe("reply-memory", () => {
   beforeEach(() => {
@@ -223,6 +222,46 @@ describe("reply-memory", () => {
     );
   });
 
+  it("does not retrieve domain-scoped reply memories for public email domains", async () => {
+    vi.mocked(prisma.replyMemory.findMany)
+      .mockResolvedValueOnce([
+        createReplyMemory({
+          id: "sender-memory",
+          content: "Use the sender-specific instruction.",
+          kind: ReplyMemoryKind.FACT,
+          scopeType: ReplyMemoryScopeType.SENDER,
+          scopeValue: "customer@gmail.com",
+        }),
+      ] as any)
+      .mockResolvedValueOnce([
+        createReplyMemory({
+          id: "global-memory",
+          content: "Use the global instruction.",
+          kind: ReplyMemoryKind.PROCEDURE,
+          scopeType: ReplyMemoryScopeType.GLOBAL,
+        }),
+      ] as any);
+    vi.mocked(prisma.$queryRaw).mockResolvedValue([] as any);
+
+    const result = await getReplyMemoriesForPrompt({
+      emailAccountId: "account-1",
+      senderEmail: "customer@gmail.com",
+      emailContent: "Can you help with my event?",
+      logger,
+    });
+
+    expect(result.selectedMemories).toHaveLength(2);
+    expect(prisma.replyMemory.findMany).toHaveBeenCalledTimes(2);
+    expect(prisma.replyMemory.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          scopeType: ReplyMemoryScopeType.DOMAIN,
+          scopeValue: "gmail.com",
+        }),
+      }),
+    );
+  });
+
   it("keeps sender memories ahead of newer global memories when retrieval is capped", async () => {
     vi.mocked(prisma.replyMemory.findMany)
       .mockResolvedValueOnce([
@@ -335,9 +374,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -375,7 +412,7 @@ describe("reply-memory", () => {
         isLearnedStyleEvidence: true,
       },
       orderBy: { updatedAt: "desc" },
-      take: 4,
+      take: 8,
     });
     expect(prisma.replyMemory.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -404,6 +441,49 @@ describe("reply-memory", () => {
       where: { id: "draft-send-log-1" },
       data: {
         replyMemoryProcessedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it("skips queued draft learning when the sent message did not reply to the source sender", async () => {
+    vi.mocked(prisma.draftSendLog.updateMany).mockResolvedValue({
+      count: 0,
+    });
+    vi.mocked(prisma.draftSendLog.findMany).mockResolvedValue([
+      createDraftSendLog({
+        replyMemorySentText: `Can someone check this?
+
+---------- Forwarded message ----------
+From: sender@example.com
+Subject: Pricing question
+
+Can you send pricing?`,
+      }),
+    ] as any);
+    vi.mocked(prisma.draftSendLog.update).mockResolvedValue({} as any);
+
+    const provider = createReplyMemoryProvider({
+      sentMessage: createSentMessage({
+        to: "teammate@example.com",
+        subject: "Fwd: Pricing question",
+      }),
+    });
+
+    await syncReplyMemoriesFromDraftSendLogs({
+      emailAccountId: "account-1",
+      provider: provider as any,
+      logger,
+    });
+
+    expect(provider.getMessage).toHaveBeenCalledWith("source-1");
+    expect(provider.getMessage).toHaveBeenCalledWith("sent-1");
+    expect(mockGenerateObject).not.toHaveBeenCalled();
+    expect(prisma.replyMemory.upsert).not.toHaveBeenCalled();
+    expect(prisma.draftSendLog.update).toHaveBeenCalledWith({
+      where: { id: "draft-send-log-1" },
+      data: {
+        replyMemoryProcessedAt: expect.any(Date),
+        replyMemorySentText: null,
       },
     });
   });
@@ -447,9 +527,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -510,26 +588,14 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
-    const testLogger = createScopedLogger("reply-memory-test-unknown-id");
-    const warnSpy = vi.spyOn(testLogger, "warn").mockImplementation(() => {});
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
       provider: provider as any,
-      logger: testLogger,
+      logger: createTestLogger(),
     });
 
-    expect(warnSpy).toHaveBeenCalledWith(
-      "Reply memory extraction returned unknown existing memory id",
-      {
-        emailAccountId: "account-1",
-        draftSendLogId: "draft-send-log-1",
-        matchingExistingMemoryId: "missing-pricing-memory",
-      },
-    );
     expect(prisma.replyMemory.update).not.toHaveBeenCalled();
     expect(prisma.replyMemory.upsert).not.toHaveBeenCalled();
     expect(prisma.replyMemorySource.upsert).not.toHaveBeenCalled();
@@ -573,9 +639,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -618,9 +682,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -748,9 +810,7 @@ describe("reply-memory", () => {
         },
       });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -905,9 +965,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -960,21 +1018,22 @@ describe("reply-memory", () => {
     vi.mocked(prisma.draftSendLog.updateMany).mockResolvedValue({
       count: 0,
     });
-    vi.mocked(prisma.draftSendLog.findMany).mockImplementation(async () => {
-      return draftSendLogs
-        .filter(
-          (log) =>
-            !log.replyMemoryProcessedAt &&
-            !!log.replyMemorySentText &&
-            log.replyMemoryAttemptCount < 3,
-        )
-        .sort(
-          (left, right) =>
-            left.replyMemoryAttemptCount - right.replyMemoryAttemptCount ||
-            left.createdAt.getTime() - right.createdAt.getTime(),
-        )
-        .slice(0, 5) as any;
-    });
+    vi.mocked(prisma.draftSendLog.findMany).mockImplementation(
+      async () =>
+        draftSendLogs
+          .filter(
+            (log) =>
+              !log.replyMemoryProcessedAt &&
+              !!log.replyMemorySentText &&
+              log.replyMemoryAttemptCount < 3,
+          )
+          .sort(
+            (left, right) =>
+              left.replyMemoryAttemptCount - right.replyMemoryAttemptCount ||
+              left.createdAt.getTime() - right.createdAt.getTime(),
+          )
+          .slice(0, 5) as any,
+    );
     vi.mocked(prisma.draftSendLog.update).mockImplementation(
       async ({ where, data }: any) => {
         const log = draftSendLogs.find((entry) => entry.id === where.id)!;
@@ -999,6 +1058,7 @@ describe("reply-memory", () => {
 
     const provider = {
       getMessage: vi.fn().mockImplementation(async (messageId: string) => {
+        if (messageId.startsWith("sent")) return createSentMessage();
         if (messageId === "source-fail") return null;
         return createSourceMessage();
       }),
@@ -1085,9 +1145,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -1116,9 +1174,9 @@ describe("reply-memory", () => {
     ] as any);
     vi.mocked(prisma.draftSendLog.update).mockResolvedValue({} as any);
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage({ from: "" })),
-    };
+    const provider = createReplyMemoryProvider({
+      sourceMessage: createSourceMessage({ from: "" }),
+    });
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -1164,9 +1222,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -1217,9 +1273,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -1227,6 +1281,61 @@ describe("reply-memory", () => {
       logger,
     });
 
+    expect(prisma.replyMemory.upsert).not.toHaveBeenCalled();
+  });
+
+  it("skips domain memories for public email domains", async () => {
+    vi.mocked(prisma.draftSendLog.updateMany).mockResolvedValue({
+      count: 0,
+    });
+    vi.mocked(prisma.draftSendLog.findMany).mockResolvedValue([
+      createDraftSendLog({
+        replyMemorySentText: "Use the portal link for signup issues.",
+      }),
+    ] as any);
+    vi.mocked(prisma.replyMemory.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.replyMemory.upsert).mockResolvedValue(
+      createReplyMemory({}) as any,
+    );
+    vi.mocked(prisma.draftSendLog.update).mockResolvedValue({} as any);
+    mockGenerateObject.mockResolvedValue({
+      object: {
+        memories: [
+          newReplyMemoryDecision({
+            content: "For signup issues, send the portal link.",
+            kind: ReplyMemoryKind.PROCEDURE,
+            scopeType: ReplyMemoryScopeType.DOMAIN,
+            scopeValue: "gmail.com",
+          }),
+        ],
+      },
+    });
+
+    const provider = createReplyMemoryProvider({
+      sourceMessage: createSourceMessage({
+        from: "Customer <customer@gmail.com>",
+      }),
+      sentMessage: createSentMessage({ to: "customer@gmail.com" }),
+    });
+
+    await syncReplyMemoriesFromDraftSendLogs({
+      emailAccountId: "account-1",
+      provider: provider as any,
+      logger,
+    });
+
+    expect(prisma.replyMemory.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: expect.not.arrayContaining([
+            {
+              scopeType: ReplyMemoryScopeType.DOMAIN,
+              scopeValue: "gmail.com",
+            },
+          ]),
+        }),
+      }),
+    );
     expect(prisma.replyMemory.upsert).not.toHaveBeenCalled();
   });
 
@@ -1263,9 +1372,7 @@ describe("reply-memory", () => {
       },
     });
 
-    const provider = {
-      getMessage: vi.fn().mockResolvedValue(createSourceMessage()),
-    };
+    const provider = createReplyMemoryProvider();
 
     await syncReplyMemoriesFromDraftSendLogs({
       emailAccountId: "account-1",
@@ -1342,6 +1449,122 @@ describe("reply-memory", () => {
         scopeValue: "",
       }),
     ]);
+  });
+
+  it("filters malformed topic scope values returned by extraction", async () => {
+    mockGenerateObject.mockResolvedValue({
+      object: {
+        memories: [
+          newReplyMemoryDecision({
+            content: "Mention the returning candidate discount.",
+            kind: ReplyMemoryKind.PROCEDURE,
+            scopeType: ReplyMemoryScopeType.TOPIC,
+            scopeValue: "returning candidates, use this note from the thread.",
+          }),
+          newReplyMemoryDecision({
+            content: "Use copied multiline text as a topic.",
+            kind: ReplyMemoryKind.FACT,
+            scopeType: ReplyMemoryScopeType.TOPIC,
+            scopeValue: "webinar\nlinks",
+          }),
+          newReplyMemoryDecision({
+            content: "Use copied tabbed text as a topic.",
+            kind: ReplyMemoryKind.FACT,
+            scopeType: ReplyMemoryScopeType.TOPIC,
+            scopeValue: "webinar\tlinks",
+          }),
+          newReplyMemoryDecision({
+            content: "Tell users the webinar link is available in the portal.",
+            kind: ReplyMemoryKind.FACT,
+            scopeType: ReplyMemoryScopeType.TOPIC,
+            scopeValue: "webinar links",
+          }),
+        ],
+      },
+    });
+
+    const result = await aiExtractReplyMemoriesFromDraftEdit({
+      emailAccount: {
+        id: "account-1",
+        userId: "user-1",
+        email: "user@example.com",
+        about: null,
+        multiRuleSelectionEnabled: false,
+        timezone: "UTC",
+        calendarBookingLink: null,
+        name: "User",
+        user: {
+          aiProvider: null,
+          aiModel: null,
+          aiApiKey: null,
+        },
+        account: {
+          provider: "google",
+        },
+      } as any,
+      incomingEmailContent:
+        "A previous automated note included an unrelated sentence. Where do I find the webinar link?",
+      draftText: "You should receive instructions by email.",
+      sentText:
+        "The webinar link is emailed shortly before the event and is available in the portal.",
+      senderEmail: "attendee@example.com",
+      existingMemories: [],
+    });
+
+    expect(result).toEqual([
+      newReplyMemoryDecision({
+        content: "Tell users the webinar link is available in the portal.",
+        kind: ReplyMemoryKind.FACT,
+        scopeType: ReplyMemoryScopeType.TOPIC,
+        scopeValue: "webinar links",
+      }),
+    ]);
+  });
+
+  it("does not offer or return domain-scoped memories for public email domains", async () => {
+    mockGenerateObject.mockResolvedValue({
+      object: {
+        memories: [
+          newReplyMemoryDecision({
+            content: "For signup issues, send the portal link.",
+            kind: ReplyMemoryKind.PROCEDURE,
+            scopeType: ReplyMemoryScopeType.DOMAIN,
+            scopeValue: "gmail.com",
+          }),
+        ],
+      },
+    });
+
+    const result = await aiExtractReplyMemoriesFromDraftEdit({
+      emailAccount: {
+        id: "account-1",
+        userId: "user-1",
+        email: "user@example.com",
+        about: null,
+        multiRuleSelectionEnabled: false,
+        timezone: "UTC",
+        calendarBookingLink: null,
+        name: "User",
+        user: {
+          aiProvider: null,
+          aiModel: null,
+          aiApiKey: null,
+        },
+        account: {
+          provider: "google",
+        },
+      } as any,
+      incomingEmailContent: "I cannot sign up for the event.",
+      draftText: "Try again later.",
+      sentText: "Please log in to the portal and try signing up again.",
+      senderEmail: "customer@gmail.com",
+      existingMemories: [],
+    });
+
+    const systemPrompt = mockGenerateObject.mock.calls[0]?.[0]?.system;
+    expect(systemPrompt).not.toContain("- DOMAIN: applies");
+    expect(systemPrompt).toContain("DOMAIN scope is unavailable");
+    expect(result).toEqual([]);
   });
 
   it("caps extracted reply memories at the per-edit limit", async () => {
@@ -1581,9 +1804,45 @@ function createSourceMessage(
   } as ParsedMessage;
 }
 
+function createSentMessage(
+  overrides: Partial<ParsedMessage["headers"]> = {},
+): ParsedMessage {
+  return {
+    id: "sent-1",
+    threadId: "thread-1",
+    internalDate: "1710000000000",
+    headers: {
+      from: "user@example.com",
+      to: "sales@example.com",
+      subject: "Re: Pricing question",
+      date: "2026-03-17T10:10:00.000Z",
+      "message-id": "<sent-1@example.com>",
+      ...overrides,
+    },
+    textPlain: "Pricing depends on seat count.",
+    textHtml: "<p>Pricing depends on seat count.</p>",
+  } as ParsedMessage;
+}
+
+function createReplyMemoryProvider({
+  sourceMessage = createSourceMessage(),
+  sentMessage = createSentMessage(),
+}: {
+  sourceMessage?: ParsedMessage | null;
+  sentMessage?: ParsedMessage | null;
+} = {}) {
+  return {
+    getMessage: vi.fn().mockImplementation(async (messageId: string) => {
+      if (messageId.startsWith("sent")) return sentMessage;
+      return sourceMessage;
+    }),
+  };
+}
+
 function createDraftSendLog(
   overrides: Partial<{
     id: string;
+    sentMessageId: string;
     replyMemorySentText: string;
     replyMemoryAttemptCount: number;
     draftText: string;
@@ -1596,6 +1855,7 @@ function createDraftSendLog(
   return {
     id: overrides.id ?? "draft-send-log-1",
     createdAt: overrides.createdAt ?? new Date("2026-03-17T10:00:00.000Z"),
+    sentMessageId: overrides.sentMessageId ?? "sent-1",
     replyMemoryAttemptCount: overrides.replyMemoryAttemptCount ?? 0,
     replyMemoryProcessedAt: overrides.replyMemoryProcessedAt ?? null,
     replyMemorySentText:

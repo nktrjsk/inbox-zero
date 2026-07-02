@@ -68,6 +68,7 @@ export async function createScheduledAction({
         folderName: actionItem.folderName,
         folderId: actionItem.folderId,
         staticAttachments: actionItem.staticAttachments ?? undefined,
+        selectedAttachments: actionItem.selectedAttachments ?? undefined,
       },
     });
 
@@ -265,12 +266,12 @@ async function scheduleMessage({
   deduplicationId: string;
 }) {
   const client = getQstashClient();
-  const url = `${getInternalApiUrl()}/api/scheduled-actions/execute`;
-
   const notBefore = getUnixTime(addMinutes(new Date(), delayInMinutes));
 
   try {
     if (client) {
+      const url = `${getInternalApiUrl()}/api/scheduled-actions/execute`;
+
       const response = await client.publishJSON({
         url,
         body: payload,

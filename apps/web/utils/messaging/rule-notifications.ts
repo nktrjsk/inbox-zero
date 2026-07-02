@@ -4,6 +4,9 @@ import {
   Button,
   Card,
   CardText,
+  LinkButton,
+  Select,
+  SelectOption,
   type ActionEvent,
   type CardElement,
   type CardChild,
@@ -13,7 +16,10 @@ import {
 import { cardToBlockKit, cardToFallbackText } from "@chat-adapter/slack";
 import prisma from "@/utils/prisma";
 import { createSlackClient } from "@/utils/messaging/providers/slack/client";
-import { resolveSlackRouteDestination } from "@/utils/messaging/providers/slack/send";
+import {
+  disableSlackLinkUnfurls,
+  resolveSlackRouteDestination,
+} from "@/utils/messaging/providers/slack/send";
 import { sendAutomationMessage } from "@/utils/automation-jobs/messaging";
 import {
   escapeSlackText,
@@ -21,6 +27,8 @@ import {
 } from "@/utils/messaging/providers/slack/format";
 import {
   ActionType,
+  AttachmentSourceType,
+  DraftEmailStatus,
   MessagingMessageStatus,
   MessagingProvider,
   MessagingRoutePurpose,
@@ -37,31 +45,66 @@ import {
 } from "@/utils/string";
 import { analyzeCalendarEvent } from "@/utils/parse/calender-event";
 import { createEmailProvider } from "@/utils/email/provider";
+import { getFormattedSenderAddress } from "@/utils/email/get-formatted-sender-address";
 import { resolveActionAttachments } from "@/utils/ai/action-attachments";
+import { quotePlainTextContent } from "@/utils/email/quoted-plain-text";
 import { formatReplySubject } from "@/utils/email/subject";
-import { extractDraftPlainText } from "@/utils/ai/choose-rule/draft-management";
+import { emailToContent } from "@/utils/mail";
+import {
+  extractDraftPlainText,
+  stripQuotedContent,
+} from "@/utils/ai/choose-rule/draft-management";
 import type { ParsedMessage } from "@/utils/types";
 import he from "he";
 import { isDraftReplyActionType } from "@/utils/actions/draft-reply";
-import { extractNameFromEmail } from "@/utils/email";
+import { extractEmailAddress, extractNameFromEmail } from "@/utils/email";
+import {
+  isGoogleProvider,
+  isMicrosoftProvider,
+} from "@/utils/email/provider-types";
+import {
+  isMessagingChannelOperational,
+  isOperationalSlackChannel,
+} from "@/utils/messaging/channel-validity";
+import {
+  getSlackTeamId,
+  getTelegramChatId,
+} from "@/utils/messaging/action-event-identifiers";
+import { getMessagingAdapterRegistry } from "@/utils/messaging/chat-sdk/adapters";
+import { markdownToTelegramText } from "@/utils/messaging/providers/telegram/format";
 import { getMessagingRoute } from "@/utils/messaging/routes";
+import { getEmailUrlForOptionalMessage } from "@/utils/url";
+import {
+  attachmentSourceInputSchema,
+  selectedAttachmentSchema,
+} from "@/utils/attachments/source-schema";
 
 const DRAFT_PREVIEW_MAX_CHARS = 900;
-const SUMMARY_PREVIEW_MAX_CHARS = 280;
-const SLACK_DRAFT_SEND_ACTION_ID = "rule_draft_send";
-const SLACK_DRAFT_EDIT_ACTION_ID = "rule_draft_edit";
-const SLACK_DRAFT_DISMISS_ACTION_ID = "rule_draft_dismiss";
-const SLACK_NOTIFY_ARCHIVE_ACTION_ID = "rule_notify_archive";
-const SLACK_NOTIFY_MARK_READ_ACTION_ID = "rule_notify_mark_read";
+const SUMMARY_PREVIEW_MAX_CHARS = 2000;
+const MAX_DRAFT_ATTACHMENT_NAMES = 5;
+const RULE_DRAFT_SEND_ACTION_ID = "rule_draft_send";
+const RULE_DRAFT_EDIT_ACTION_ID = "rule_draft_edit";
+const RULE_DRAFT_DISMISS_ACTION_ID = "rule_draft_dismiss";
+const RULE_NOTIFY_ARCHIVE_ACTION_ID = "rule_notify_archive";
+const RULE_NOTIFY_MARK_READ_ACTION_ID = "rule_notify_mark_read";
+const RULE_NOTIFY_MORE_ACTION_ID = "rule_notify_more";
+const RULE_NOTIFY_TRASH_ACTION_ID = "rule_notify_trash";
+const RULE_NOTIFY_MARK_SPAM_ACTION_ID = "rule_notify_mark_spam";
 export const SLACK_DRAFT_EDIT_MODAL_ID = "rule_draft_edit_modal";
 const SLACK_DRAFT_EDIT_FIELD_ID = "draft_content";
+const WEB_REPLY_HANDLED_TEXT = "Already replied on the web.";
+const DRAFT_ALREADY_SENT_TEXT = "Draft already sent. No action needed.";
 
-export const SLACK_RULE_NOTIFICATION_ACTION_IDS = [
-  SLACK_DRAFT_SEND_ACTION_ID,
-  SLACK_DRAFT_EDIT_ACTION_ID,
-  SLACK_DRAFT_DISMISS_ACTION_ID,
-  SLACK_NOTIFY_ARCHIVE_ACTION_ID,
-  SLACK_NOTIFY_MARK_READ_ACTION_ID,
+export const RULE_NOTIFICATION_ACTION_IDS = [
+  RULE_DRAFT_SEND_ACTION_ID,
+  RULE_DRAFT_EDIT_ACTION_ID,
+  RULE_DRAFT_DISMISS_ACTION_ID,
+  RULE_NOTIFY_ARCHIVE_ACTION_ID,
+  RULE_NOTIFY_MARK_READ_ACTION_ID,
+  RULE_NOTIFY_MORE_ACTION_ID,
+  // Keep legacy direct listeners for Slack cards posted before destructive actions moved into More.
+  RULE_NOTIFY_TRASH_ACTION_ID,
+  RULE_NOTIFY_MARK_SPAM_ACTION_ID,
 ] as const;
 
 type NotificationContext = NonNullable<
@@ -74,6 +117,13 @@ type NotificationContent = {
   title: string;
 };
 
+type NotificationContentFormat = "plain" | "slack";
+
+type NotificationOpenLink = {
+  label: string;
+  url: string;
+};
+
 type NotificationEmailPreview = {
   headers: {
     from: string;
@@ -84,6 +134,42 @@ type NotificationEmailPreview = {
   textHtml?: string;
   attachments?: Array<{ filename: string }>;
 };
+
+export function buildSlackRuleNotificationPreviewBlocks({
+  actionId,
+  actionType,
+  email,
+  systemType = null,
+  draftContent,
+  draftAttachmentNames,
+  openLink,
+}: {
+  actionId: string;
+  actionType: ActionType;
+  email: NotificationEmailPreview;
+  systemType?: SystemType | null;
+  draftContent?: string | null;
+  draftAttachmentNames?: string[];
+  openLink?: NotificationOpenLink | null;
+}) {
+  const content = buildNotificationContent({
+    actionType,
+    email,
+    systemType,
+    draftContent,
+    draftAttachmentNames,
+    format: "slack",
+  });
+
+  return cardToBlockKit(
+    buildNotificationCard({
+      actionId,
+      actionType,
+      content,
+      openLink,
+    }),
+  );
+}
 
 type MessagingRuleNotificationResult = {
   delivered: boolean;
@@ -106,6 +192,110 @@ export async function sendMessagingRuleNotification({
   });
 
   return result.delivered;
+}
+
+export async function replaceMessagingDraftNotificationsWithHandledOnWebState({
+  executedRuleId,
+  logger,
+}: {
+  executedRuleId: string;
+  logger: Logger;
+}) {
+  await replaceMessagingDraftNotificationsWithTerminalState({
+    executedRuleId,
+    logger,
+    terminalStatus: MessagingMessageStatus.EXPIRED,
+    terminalMessage: WEB_REPLY_HANDLED_TEXT,
+  });
+}
+
+export async function replaceMessagingDraftNotificationsWithDraftSentState({
+  executedRuleId,
+  logger,
+  excludeExecutedActionId,
+}: {
+  executedRuleId: string;
+  logger: Logger;
+  excludeExecutedActionId?: string;
+}) {
+  await replaceMessagingDraftNotificationsWithTerminalState({
+    executedRuleId,
+    logger,
+    excludeExecutedActionId,
+    terminalStatus: MessagingMessageStatus.DRAFT_SENT,
+    terminalMessage: DRAFT_ALREADY_SENT_TEXT,
+  });
+}
+
+async function replaceMessagingDraftNotificationsWithTerminalState({
+  executedRuleId,
+  logger,
+  excludeExecutedActionId,
+  terminalStatus,
+  terminalMessage,
+}: {
+  executedRuleId: string;
+  logger: Logger;
+  excludeExecutedActionId?: string;
+  terminalStatus: MessagingMessageStatus;
+  terminalMessage: string;
+}) {
+  try {
+    const notificationActions = await prisma.executedAction.findMany({
+      where: {
+        id: excludeExecutedActionId
+          ? { not: excludeExecutedActionId }
+          : undefined,
+        executedRuleId,
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingMessageId: { not: null },
+        messagingChannel: {
+          isConnected: true,
+        },
+        OR: [
+          { messagingMessageStatus: null },
+          {
+            messagingMessageStatus: {
+              in: [
+                MessagingMessageStatus.SENT,
+                MessagingMessageStatus.DRAFT_EDITED,
+              ],
+            },
+          },
+        ],
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    const results = await Promise.allSettled(
+      notificationActions.map(({ id }) =>
+        replaceMessagingDraftNotificationWithTerminalState({
+          executedActionId: id,
+          logger,
+          terminalStatus,
+          terminalMessage,
+        }),
+      ),
+    );
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        logger.warn("Failed to collapse one messaging draft notification", {
+          executedRuleId,
+          terminalStatus,
+          error: result.reason,
+        });
+      }
+    }
+  } catch (error) {
+    logger.warn("Failed to collapse messaging draft notifications", {
+      executedRuleId,
+      terminalStatus,
+      error,
+    });
+  }
 }
 
 export async function getMessagingRuleNotificationResult({
@@ -145,6 +335,17 @@ export async function getMessagingRuleNotificationResult({
     });
   }
 
+  if (
+    context.messagingChannel?.provider === MessagingProvider.TELEGRAM &&
+    isDraftReplyActionType(context.type)
+  ) {
+    return sendTelegramRuleNotificationWithContext({
+      context,
+      email,
+      logger,
+    });
+  }
+
   return sendLinkedRuleNotification({
     context,
     email,
@@ -163,9 +364,7 @@ async function sendSlackRuleNotificationWithContext({
 }): Promise<MessagingRuleNotificationResult> {
   if (
     !context.messagingChannel ||
-    !context.messagingChannel.isConnected ||
-    context.messagingChannel.provider !== MessagingProvider.SLACK ||
-    !context.messagingChannel.accessToken
+    !isOperationalSlackChannel(context.messagingChannel)
   ) {
     logger.warn("Skipping messaging notification with inactive Slack channel", {
       executedActionId: context.id,
@@ -200,16 +399,28 @@ async function sendSlackRuleNotificationWithContext({
     return { delivered: false, kind: "none" };
   }
 
+  const draftContent = await getNotificationDraftContent({
+    context,
+    logger,
+  });
+  const draftAttachmentNames = getNotificationDraftAttachmentNames({
+    context,
+    logger,
+  });
+
   const content = buildNotificationContent({
     actionType: context.type,
     email,
     systemType: context.executedRule.rule?.systemType ?? null,
-    draftContent: context.content,
+    draftContent,
+    draftAttachmentNames,
+    format: "slack",
   });
 
   const rootMessageId =
     (await findSlackRootMessageId({
       executedActionId: context.id,
+      emailAccountId: context.executedRule.emailAccount.id,
       messagingChannelId: context.messagingChannel.id,
       threadId: context.executedRule.threadId,
     })) ?? null;
@@ -218,6 +429,7 @@ async function sendSlackRuleNotificationWithContext({
     actionId: context.id,
     actionType: context.type,
     content,
+    openLink: getNotificationOpenLink(context),
   });
 
   try {
@@ -258,7 +470,7 @@ async function sendLinkedRuleNotification({
 }): Promise<MessagingRuleNotificationResult> {
   if (
     !context.messagingChannel ||
-    !context.messagingChannel.isConnected ||
+    !isMessagingChannelOperational(context.messagingChannel) ||
     (context.messagingChannel.provider !== MessagingProvider.TEAMS &&
       context.messagingChannel.provider !== MessagingProvider.TELEGRAM)
   ) {
@@ -277,7 +489,10 @@ async function sendLinkedRuleNotification({
     MessagingRoutePurpose.RULE_NOTIFICATIONS,
   );
 
-  if (!route) {
+  if (
+    !route &&
+    !hasLinkedMessagingDirectMessageDestination(context.messagingChannel)
+  ) {
     logger.warn(
       "Skipping messaging notification with no linked channel route",
       {
@@ -289,11 +504,22 @@ async function sendLinkedRuleNotification({
     return { delivered: false, kind: "none" };
   }
 
+  const draftContent = await getNotificationDraftContent({
+    context,
+    logger,
+  });
+  const draftAttachmentNames = getNotificationDraftAttachmentNames({
+    context,
+    logger,
+  });
+
   const content = buildNotificationContent({
     actionType: context.type,
     email,
     systemType: context.executedRule.rule?.systemType ?? null,
-    draftContent: context.content,
+    draftContent,
+    draftAttachmentNames,
+    format: "plain",
   });
   const text = buildMessagingRuleNotificationText({
     actionType: context.type,
@@ -328,15 +554,129 @@ async function sendLinkedRuleNotification({
   }
 }
 
-export async function handleSlackRuleNotificationAction({
+function hasLinkedMessagingDirectMessageDestination(channel: {
+  provider: MessagingProvider;
+  providerUserId?: string | null;
+  teamId?: string | null;
+}) {
+  switch (channel.provider) {
+    case MessagingProvider.TEAMS:
+      return Boolean(channel.providerUserId);
+    case MessagingProvider.TELEGRAM:
+      return Boolean(channel.teamId || channel.providerUserId);
+    default:
+      return false;
+  }
+}
+
+async function sendTelegramRuleNotificationWithContext({
+  context,
+  email,
+  logger,
+}: {
+  context: NotificationContext;
+  email: NotificationEmailPreview;
+  logger: Logger;
+}): Promise<MessagingRuleNotificationResult> {
+  if (
+    !context.messagingChannel?.isConnected ||
+    context.messagingChannel.provider !== MessagingProvider.TELEGRAM
+  ) {
+    logger.warn("Skipping Telegram notification with inactive channel", {
+      executedActionId: context.id,
+      messagingChannelId: context.messagingChannelId,
+    });
+    return { delivered: false, kind: "none" };
+  }
+
+  const route = getMessagingRoute(
+    context.messagingChannel.routes,
+    MessagingRoutePurpose.RULE_NOTIFICATIONS,
+  );
+  const destination = route?.targetId || context.messagingChannel.teamId;
+
+  if (!destination) {
+    logger.warn("Skipping Telegram notification with no route destination", {
+      executedActionId: context.id,
+      messagingChannelId: context.messagingChannelId,
+    });
+    return { delivered: false, kind: "none" };
+  }
+
+  let telegramAdapter: ReturnType<
+    typeof getMessagingAdapterRegistry
+  >["typedAdapters"]["telegram"];
+
+  try {
+    telegramAdapter = getMessagingAdapterRegistry().typedAdapters.telegram;
+  } catch {
+    telegramAdapter = undefined;
+  }
+
+  if (!telegramAdapter) {
+    logger.warn("Skipping Telegram notification without adapter", {
+      executedActionId: context.id,
+      messagingChannelId: context.messagingChannelId,
+    });
+    return { delivered: false, kind: "none" };
+  }
+
+  const draftContent = await getNotificationDraftContent({
+    context,
+    logger,
+  });
+  const draftAttachmentNames = getNotificationDraftAttachmentNames({
+    context,
+    logger,
+  });
+
+  const content = buildNotificationContent({
+    actionType: context.type,
+    email,
+    systemType: context.executedRule.rule?.systemType ?? null,
+    draftContent,
+    draftAttachmentNames,
+    format: "plain",
+  });
+
+  try {
+    const threadId = await telegramAdapter.openDM(destination);
+    const response = await telegramAdapter.postMessage(
+      threadId,
+      buildTelegramNotificationCard({
+        actionId: context.id,
+        content,
+        openLink: getNotificationOpenLink(context),
+      }),
+    );
+
+    await prisma.executedAction.update({
+      where: { id: context.id },
+      data: {
+        messagingMessageId: response.id ?? threadId,
+        messagingMessageSentAt: new Date(),
+        messagingMessageStatus: MessagingMessageStatus.SENT,
+      },
+    });
+    return { delivered: true, kind: "interactive" };
+  } catch (error) {
+    logger.warn("Failed to send Telegram rule notification", {
+      executedActionId: context.id,
+      error,
+    });
+    return { delivered: false, kind: "none" };
+  }
+}
+
+export async function handleRuleNotificationAction({
   event,
   logger,
 }: {
   event: ActionEvent;
   logger: Logger;
 }) {
-  const executedActionId = event.value?.trim();
-  if (!executedActionId) {
+  const selection = getRuleNotificationActionSelection(event);
+  if (!selection) {
     await postNotificationFeedback({
       event,
       logger,
@@ -345,30 +685,53 @@ export async function handleSlackRuleNotificationAction({
     return;
   }
 
-  const context = await getAuthorizedNotificationContext({
-    executedActionId,
-    logger,
-    teamId: getSlackTeamId(event.raw),
-    userId: event.user.userId,
-    event,
-  });
+  const context =
+    event.adapter.name === "telegram"
+      ? await getAuthorizedTelegramNotificationContext({
+          executedActionId: selection.executedActionId,
+          logger,
+          chatId: getTelegramChatId(event),
+          userId: event.user.userId,
+          event,
+        })
+      : await getAuthorizedSlackNotificationContext({
+          executedActionId: selection.executedActionId,
+          logger,
+          teamId: getSlackTeamId(event.raw),
+          userId: event.user.userId,
+          event,
+        });
   if (!context) return;
 
-  switch (event.actionId) {
-    case SLACK_DRAFT_SEND_ACTION_ID:
+  switch (selection.actionId) {
+    case RULE_DRAFT_SEND_ACTION_ID:
       await handleDraftSend({ context, event, logger });
       return;
-    case SLACK_DRAFT_EDIT_ACTION_ID:
+    case RULE_DRAFT_EDIT_ACTION_ID:
+      if (context.messagingChannel?.provider !== MessagingProvider.SLACK) {
+        await postNotificationFeedback({
+          event,
+          logger,
+          text: "Edit isn't available here yet. Reply here with what you want changed instead.",
+        });
+        return;
+      }
       await handleDraftEdit({ context, event, logger });
       return;
-    case SLACK_DRAFT_DISMISS_ACTION_ID:
-      await handleDraftDismiss({ context, event, logger });
+    case RULE_DRAFT_DISMISS_ACTION_ID:
+      await handleDismissNotification({ context, event, logger });
       return;
-    case SLACK_NOTIFY_ARCHIVE_ACTION_ID:
+    case RULE_NOTIFY_ARCHIVE_ACTION_ID:
       await handleArchiveNotification({ context, event, logger });
       return;
-    case SLACK_NOTIFY_MARK_READ_ACTION_ID:
+    case RULE_NOTIFY_MARK_READ_ACTION_ID:
       await handleMarkReadNotification({ context, event, logger });
+      return;
+    case RULE_NOTIFY_TRASH_ACTION_ID:
+      await handleTrashNotification({ context, event, logger });
+      return;
+    case RULE_NOTIFY_MARK_SPAM_ACTION_ID:
+      await handleMarkSpamNotification({ context, event, logger });
       return;
     default:
       await postNotificationFeedback({
@@ -391,7 +754,7 @@ export async function handleSlackRuleNotificationModalSubmit({
     return { action: "close" };
   }
 
-  const context = await getAuthorizedNotificationContext({
+  const context = await getAuthorizedSlackNotificationContext({
     executedActionId,
     logger,
     teamId: getSlackTeamId(event.raw),
@@ -415,34 +778,38 @@ export async function handleSlackRuleNotificationModalSubmit({
     return { action: "close" };
   }
 
-  const siblingDraftAction = await getSiblingEmailDraftAction({
-    executedActionId: context.id,
-    executedRuleId: context.executedRule.id,
-  });
+  const mailboxDraftAction = getMailboxDraftActionForMessagingDraft(context);
 
-  if (siblingDraftAction?.draftId) {
+  if (mailboxDraftAction?.draftId) {
     try {
       const provider = await createProviderForContext(context, logger);
 
-      await provider.updateDraft(siblingDraftAction.draftId, {
+      await provider.updateDraft(mailboxDraftAction.draftId, {
         messageHtml: convertNewlinesToBr(escapeHtml(nextContent)),
-        ...(siblingDraftAction.subject
-          ? { subject: siblingDraftAction.subject }
+        ...(mailboxDraftAction.subject
+          ? { subject: mailboxDraftAction.subject }
           : {}),
       });
     } catch (error) {
       logger.warn("Failed to sync edited Slack draft back to email draft", {
         executedActionId: context.id,
-        siblingDraftActionId: siblingDraftAction.id,
+        mailboxDraftActionId: mailboxDraftAction.id,
         error,
       });
+      return {
+        action: "errors",
+        errors: {
+          [SLACK_DRAFT_EDIT_FIELD_ID]:
+            "I couldn't update that draft. Please try again.",
+        },
+      };
     }
   }
 
   await prisma.executedAction.updateMany({
     where: {
       id: {
-        in: [context.id, siblingDraftAction?.id].filter(Boolean) as string[],
+        in: [context.id, mailboxDraftAction?.id].filter(Boolean) as string[],
       },
     },
     data: {
@@ -450,31 +817,80 @@ export async function handleSlackRuleNotificationModalSubmit({
     },
   });
 
-  await prisma.executedAction.update({
-    where: { id: context.id },
-    data: {
-      messagingMessageStatus: MessagingMessageStatus.DRAFT_EDITED,
-    },
-  });
+  try {
+    await sendDraftReplyFromNotification({
+      context: { ...context, content: nextContent },
+      logger,
+      editMessage: async (card) => {
+        if (!event.relatedMessage) {
+          throw new Error(
+            "Slack draft modal submitted without related message",
+          );
+        }
 
-  const content = buildNotificationContent({
-    actionType: context.type,
-    email: await getSourceMessageSummary(context, logger),
-    systemType: context.executedRule.rule?.systemType ?? null,
-    draftContent: nextContent,
-  });
-
-  if (event.relatedMessage) {
-    await event.relatedMessage.edit(
-      buildNotificationCard({
-        actionId: context.id,
-        actionType: context.type,
-        content,
-      }),
-    );
+        await event.relatedMessage.edit(card);
+      },
+    });
+  } catch (error) {
+    logger.warn("Failed to send edited Slack draft notification reply", {
+      executedActionId: context.id,
+      error,
+    });
+    return {
+      action: "errors",
+      errors: {
+        [SLACK_DRAFT_EDIT_FIELD_ID]:
+          "I couldn't send that draft. Please try again.",
+      },
+    };
   }
 
   return { action: "close" };
+}
+
+function getRuleNotificationActionSelection(event: ActionEvent): {
+  actionId: string;
+  executedActionId: string;
+} | null {
+  const value = event.value?.trim();
+  if (!value) return null;
+
+  if (event.actionId !== RULE_NOTIFY_MORE_ACTION_ID) {
+    if (!isDirectRuleNotificationActionId(event.actionId)) return null;
+
+    return {
+      actionId: event.actionId,
+      executedActionId: value,
+    };
+  }
+
+  const separatorIndex = value.indexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === value.length - 1) return null;
+
+  const selectedActionId = value.slice(0, separatorIndex);
+  if (
+    selectedActionId !== RULE_NOTIFY_TRASH_ACTION_ID &&
+    selectedActionId !== RULE_NOTIFY_MARK_SPAM_ACTION_ID
+  ) {
+    return null;
+  }
+
+  return {
+    actionId: selectedActionId,
+    executedActionId: value.slice(separatorIndex + 1),
+  };
+}
+
+function isDirectRuleNotificationActionId(actionId: string) {
+  return (
+    actionId === RULE_DRAFT_SEND_ACTION_ID ||
+    actionId === RULE_DRAFT_EDIT_ACTION_ID ||
+    actionId === RULE_DRAFT_DISMISS_ACTION_ID ||
+    actionId === RULE_NOTIFY_ARCHIVE_ACTION_ID ||
+    actionId === RULE_NOTIFY_MARK_READ_ACTION_ID ||
+    actionId === RULE_NOTIFY_TRASH_ACTION_ID ||
+    actionId === RULE_NOTIFY_MARK_SPAM_ACTION_ID
+  );
 }
 
 async function handleDraftSend({
@@ -495,108 +911,22 @@ async function handleDraftSend({
     return;
   }
 
-  const provider = await createProviderForContext(context, logger);
-
-  const siblingDraftAction = await getSiblingEmailDraftAction({
-    executedActionId: context.id,
-    executedRuleId: context.executedRule.id,
-  });
-
   try {
-    const finalDraftContent = await getEditableDraftContent({
+    const result = await sendDraftReplyFromNotification({
       context,
-      provider,
-      siblingDraftAction,
-    });
-    const sourceMessageSummary = await getSourceMessageSummaryForProvider({
-      context,
-      provider,
-    });
-    const notificationContent = buildNotificationContent({
-      actionType: context.type,
-      email: sourceMessageSummary,
-      systemType: context.executedRule.rule?.systemType ?? null,
-      draftContent: finalDraftContent,
-    });
-
-    if (siblingDraftAction?.draftId) {
-      await provider.sendDraft(siblingDraftAction.draftId);
-    } else {
-      const sourceMessage = await provider.getMessage(
-        context.executedRule.messageId,
-      );
-      const attachments = await resolveActionAttachments({
-        email: sourceMessage,
-        emailAccountId: context.executedRule.emailAccount.id,
-        executedRule: {
-          id: context.executedRule.id,
-          threadId: context.executedRule.threadId,
-          emailAccountId: context.executedRule.emailAccount.id,
-          ruleId: context.executedRule.ruleId,
-        } as ExecutedRule,
-        userId: context.executedRule.emailAccount.userId,
-        logger,
-        staticAttachments: context.staticAttachments,
-        includeAiSelectedAttachments: true,
-      });
-
-      const content = context.content?.trim();
-      if (!content) {
-        await expireNotificationCard({
-          event,
-          logger,
-          actionId: context.id,
-          title: "Draft unavailable",
-          message: "This draft is no longer available.",
-        });
-        return;
-      }
-
-      await provider.sendEmailWithHtml({
-        replyToEmail: {
-          threadId: sourceMessage.threadId,
-          headerMessageId: sourceMessage.headers["message-id"] || "",
-          references: sourceMessage.headers.references,
-          messageId: sourceMessage.id,
-        },
-        to:
-          context.to ||
-          sourceMessage.headers["reply-to"] ||
-          sourceMessage.headers.from,
-        cc: context.cc ?? undefined,
-        bcc: context.bcc ?? undefined,
-        subject:
-          context.subject || formatReplySubject(sourceMessage.headers.subject),
-        messageHtml: convertNewlinesToBr(escapeHtml(content)),
-        attachments: serializeMailAttachments(attachments),
-      });
-    }
-
-    await prisma.executedAction.update({
-      where: { id: context.id },
-      data: {
-        messagingMessageStatus: MessagingMessageStatus.DRAFT_SENT,
-        wasDraftSent: true,
+      logger,
+      editMessage: async (card) => {
+        await event.adapter.editMessage(event.threadId, event.messageId, card);
       },
     });
 
-    if (siblingDraftAction?.id) {
-      await prisma.executedAction.update({
-        where: { id: siblingDraftAction.id },
-        data: {
-          wasDraftSent: true,
-        },
+    if (result === "draft_unavailable") {
+      await postNotificationFeedback({
+        event,
+        logger,
+        text: "This draft is no longer available.",
       });
     }
-
-    await event.adapter.editMessage(
-      event.threadId,
-      event.messageId,
-      buildHandledNotificationCard({
-        content: notificationContent,
-        status: "Reply sent.",
-      }),
-    );
   } catch (error) {
     logger.warn("Failed to send Slack draft notification reply", {
       executedActionId: context.id,
@@ -608,6 +938,299 @@ async function handleDraftSend({
       text: "I couldn't send that draft. Please try again.",
     });
   }
+}
+
+async function sendDraftReplyFromNotification({
+  context,
+  logger,
+  editMessage,
+}: {
+  context: NotificationContext;
+  logger: Logger;
+  editMessage: (card: CardElement) => Promise<void>;
+}): Promise<"sent" | "draft_unavailable"> {
+  const provider = await createProviderForContext(context, logger);
+
+  const mailboxDraftAction = getMailboxDraftActionForMessagingDraft(context);
+  const finalDraftContent = await getEditableDraftContent({
+    context,
+    provider,
+    mailboxDraftAction,
+  });
+  const sourceMessageSummary = await getSourceMessageSummaryForProvider({
+    context,
+    provider,
+  });
+  const draftAttachmentNames = getNotificationDraftAttachmentNames({
+    context,
+    logger,
+  });
+  const notificationContent = buildNotificationContent({
+    actionType: context.type,
+    email: sourceMessageSummary,
+    systemType: context.executedRule.rule?.systemType ?? null,
+    draftContent: finalDraftContent,
+    draftAttachmentNames,
+    format:
+      context.messagingChannel?.provider === MessagingProvider.SLACK
+        ? "slack"
+        : "plain",
+  });
+
+  if (mailboxDraftAction?.draftId) {
+    await provider.sendDraft(mailboxDraftAction.draftId);
+  } else {
+    const sourceMessage = await provider.getMessage(
+      context.executedRule.messageId,
+    );
+    const attachments = await resolveActionAttachments({
+      email: sourceMessage,
+      emailAccount: {
+        email: context.executedRule.emailAccount.email,
+        id: context.executedRule.emailAccount.id,
+        userId: context.executedRule.emailAccount.userId,
+      },
+      executedRule: {
+        id: context.executedRule.id,
+        threadId: context.executedRule.threadId,
+        emailAccountId: context.executedRule.emailAccount.id,
+        ruleId: context.executedRule.ruleId,
+      } as ExecutedRule,
+      logger,
+      staticAttachments: context.staticAttachments,
+      selectedAttachments: context.selectedAttachments,
+      includeAiSelectedAttachments: true,
+    });
+
+    const content = context.content?.trim();
+    if (!content) {
+      await prisma.executedAction.update({
+        where: { id: context.id },
+        data: {
+          messagingMessageStatus: MessagingMessageStatus.EXPIRED,
+        },
+      });
+
+      await editMessage(
+        buildTerminalCard({
+          title: "Draft unavailable",
+          message: "This draft is no longer available.",
+        }),
+      );
+
+      return "draft_unavailable";
+    }
+
+    const formattedFrom = await getFormattedSenderAddress({
+      emailAccountId: context.executedRule.emailAccount.id,
+      fallbackEmail: context.executedRule.emailAccount.email,
+    });
+
+    await provider.sendEmailWithHtml(
+      buildNotificationReplySendBody({
+        sourceMessage,
+        fallbackThreadId: context.executedRule.threadId,
+        to: context.to,
+        cc: context.cc,
+        bcc: context.bcc,
+        subject: context.subject,
+        content,
+        formattedFrom,
+        attachments: serializeMailAttachments(attachments),
+      }),
+    );
+  }
+
+  try {
+    await Promise.all([
+      prisma.executedAction.update({
+        where: { id: context.id },
+        data: {
+          draftStatus: DraftEmailStatus.LIKELY_SENT,
+          messagingMessageStatus: MessagingMessageStatus.DRAFT_SENT,
+        },
+      }),
+      ...(mailboxDraftAction?.id && mailboxDraftAction.id !== context.id
+        ? [
+            prisma.executedAction.update({
+              where: { id: mailboxDraftAction.id },
+              data: { draftStatus: DraftEmailStatus.LIKELY_SENT },
+            }),
+          ]
+        : []),
+    ]);
+  } catch (error) {
+    logger.warn("Failed to mark notification draft reply as sent", {
+      executedActionId: context.id,
+      mailboxDraftActionId: mailboxDraftAction?.id,
+      error,
+    });
+  }
+
+  await updateSentDraftNotificationMessage({
+    context,
+    logger,
+    editMessage,
+    card: buildHandledNotificationCardForProvider({
+      provider: context.messagingChannel?.provider,
+      content: notificationContent,
+      openLink: getNotificationOpenLink(context),
+      status: "Reply sent.",
+    }),
+  });
+
+  await replaceMessagingDraftNotificationsWithDraftSentState({
+    executedRuleId: context.executedRule.id,
+    logger,
+    excludeExecutedActionId: context.id,
+  });
+
+  return "sent";
+}
+
+async function updateSentDraftNotificationMessage({
+  context,
+  logger,
+  editMessage,
+  card,
+}: {
+  context: NotificationContext;
+  logger: Logger;
+  editMessage: (card: CardElement) => Promise<void>;
+  card: CardElement;
+}) {
+  try {
+    await editMessage(card);
+    return;
+  } catch (error) {
+    logger.warn("Failed to update sent draft notification message", {
+      executedActionId: context.id,
+      error,
+    });
+  }
+
+  await updateStoredSlackNotificationMessage({
+    context,
+    logger,
+    card,
+  });
+}
+
+async function updateStoredSlackNotificationMessage({
+  context,
+  logger,
+  card,
+}: {
+  context: NotificationContext;
+  logger: Logger;
+  card: CardElement;
+}) {
+  if (
+    !context.messagingMessageId ||
+    !context.messagingChannel ||
+    !isOperationalSlackChannel(context.messagingChannel)
+  ) {
+    return;
+  }
+
+  const route = getMessagingRoute(
+    context.messagingChannel.routes,
+    MessagingRoutePurpose.RULE_NOTIFICATIONS,
+  );
+
+  try {
+    const destinationChannelId = await resolveSlackRouteDestination({
+      accessToken: context.messagingChannel.accessToken,
+      route,
+    });
+
+    if (!destinationChannelId) {
+      logger.warn(
+        "Skipping sent Slack draft notification update with no route",
+        {
+          executedActionId: context.id,
+          messagingChannelId: context.messagingChannelId,
+        },
+      );
+      return;
+    }
+
+    await updateSlackCard({
+      accessToken: context.messagingChannel.accessToken,
+      channel: destinationChannelId,
+      ts: context.messagingMessageId,
+      card,
+    });
+  } catch (error) {
+    logger.warn("Failed to update stored Slack draft notification message", {
+      executedActionId: context.id,
+      messagingMessageId: context.messagingMessageId,
+      error,
+    });
+  }
+}
+
+async function updateSlackCard({
+  accessToken,
+  channel,
+  ts,
+  card,
+}: {
+  accessToken: string;
+  channel: string;
+  ts: string;
+  card: CardElement;
+}) {
+  await createSlackClient(accessToken).chat.update(
+    disableSlackLinkUnfurls({
+      channel,
+      ts,
+      text: cardToFallbackText(card),
+      blocks: cardToBlockKit(card),
+    }),
+  );
+}
+
+export function buildNotificationReplySendBody({
+  sourceMessage,
+  fallbackThreadId,
+  to,
+  cc,
+  bcc,
+  subject,
+  content,
+  formattedFrom,
+  attachments,
+}: {
+  sourceMessage: Pick<ParsedMessage, "id" | "threadId" | "headers">;
+  fallbackThreadId: string;
+  to?: string | null;
+  cc?: string | null;
+  bcc?: string | null;
+  subject?: string | null;
+  content: string;
+  formattedFrom?: string | null;
+  attachments: Array<{
+    filename: string;
+    content: string;
+    contentType: string;
+  }>;
+}) {
+  return {
+    replyToEmail: {
+      threadId: sourceMessage.threadId || fallbackThreadId,
+      headerMessageId: sourceMessage.headers["message-id"] || "",
+      references: sourceMessage.headers.references,
+      messageId: sourceMessage.id,
+    },
+    to: to || sourceMessage.headers["reply-to"] || sourceMessage.headers.from,
+    cc: cc ?? undefined,
+    bcc: bcc ?? undefined,
+    subject: subject || formatReplySubject(sourceMessage.headers.subject),
+    messageHtml: convertNewlinesToBr(escapeHtml(content)),
+    ...(formattedFrom ? { from: formattedFrom } : {}),
+    attachments,
+  };
 }
 
 async function handleDraftEdit({
@@ -630,20 +1253,18 @@ async function handleDraftEdit({
 
   const provider = await createProviderForContext(context, logger);
 
-  const siblingDraftAction = await getSiblingEmailDraftAction({
-    executedActionId: context.id,
-    executedRuleId: context.executedRule.id,
-  });
+  const mailboxDraftAction = getMailboxDraftActionForMessagingDraft(context);
   const initialContent = await getEditableDraftContent({
     context,
     provider,
-    siblingDraftAction,
+    mailboxDraftAction,
   });
 
   await event.openModal({
     type: "modal",
     callbackId: SLACK_DRAFT_EDIT_MODAL_ID,
     title: "Edit draft",
+    submitLabel: "Send reply",
     privateMetadata: context.id,
     children: [
       {
@@ -657,7 +1278,7 @@ async function handleDraftEdit({
   });
 }
 
-async function handleDraftDismiss({
+async function handleDismissNotification({
   context,
   event,
   logger,
@@ -670,7 +1291,9 @@ async function handleDraftDismiss({
     await postNotificationFeedback({
       event,
       logger,
-      text: "That draft has already been handled.",
+      text: isDraftReplyActionType(context.type)
+        ? "That draft has already been handled."
+        : "That notification has already been handled.",
     });
     return;
   }
@@ -686,7 +1309,11 @@ async function handleDraftDismiss({
     event.threadId,
     event.messageId,
     buildTerminalCard({
-      title: "Draft reply",
+      title: isDraftReplyActionType(context.type)
+        ? "Draft reply"
+        : getInfoNotificationTitle(
+            context.executedRule.rule?.systemType ?? null,
+          ),
       message: "Dismissed.",
     }),
   );
@@ -745,7 +1372,61 @@ async function handleMarkReadNotification({
   );
 }
 
-async function getAuthorizedNotificationContext({
+async function handleTrashNotification({
+  context,
+  event,
+  logger,
+}: {
+  context: NotificationContext;
+  event: ActionEvent;
+  logger: Logger;
+}) {
+  const provider = await createProviderForContext(context, logger);
+
+  await provider.trashThread(
+    context.executedRule.threadId,
+    context.executedRule.emailAccount.email,
+    "user",
+  );
+
+  await event.adapter.editMessage(
+    event.threadId,
+    event.messageId,
+    buildTerminalCard({
+      title: getInfoNotificationTitle(
+        context.executedRule.rule?.systemType ?? null,
+      ),
+      message: "Moved to trash.",
+    }),
+  );
+}
+
+async function handleMarkSpamNotification({
+  context,
+  event,
+  logger,
+}: {
+  context: NotificationContext;
+  event: ActionEvent;
+  logger: Logger;
+}) {
+  const provider = await createProviderForContext(context, logger);
+
+  await provider.markSpam(context.executedRule.threadId);
+
+  await event.adapter.editMessage(
+    event.threadId,
+    event.messageId,
+    buildTerminalCard({
+      title: getInfoNotificationTitle(
+        context.executedRule.rule?.systemType ?? null,
+      ),
+      message: "Marked as spam.",
+    }),
+  );
+}
+
+async function getAuthorizedSlackNotificationContext({
   executedActionId,
   logger,
   teamId,
@@ -762,8 +1443,7 @@ async function getAuthorizedNotificationContext({
 
   if (
     !context?.messagingChannel ||
-    context.messagingChannel.provider !== MessagingProvider.SLACK ||
-    !context.messagingChannel.isConnected
+    !isOperationalSlackChannel(context.messagingChannel)
   ) {
     if (event) {
       await postNotificationFeedback({
@@ -803,6 +1483,70 @@ async function getAuthorizedNotificationContext({
   return context;
 }
 
+async function getAuthorizedTelegramNotificationContext({
+  executedActionId,
+  logger,
+  chatId,
+  userId,
+  event,
+}: {
+  executedActionId: string;
+  logger: Logger;
+  chatId: string | null;
+  userId: string;
+  event?: ActionEvent;
+}) {
+  const context = await getNotificationContext(executedActionId);
+
+  if (
+    !context?.messagingChannel ||
+    context.messagingChannel.provider !== MessagingProvider.TELEGRAM ||
+    !context.messagingChannel.isConnected
+  ) {
+    if (event) {
+      await postNotificationFeedback({
+        event,
+        logger,
+        text: "This notification is no longer active.",
+      });
+    }
+    return null;
+  }
+
+  if (
+    context.messagingChannel.providerUserId &&
+    context.messagingChannel.providerUserId !== userId
+  ) {
+    if (event) {
+      await postNotificationFeedback({
+        event,
+        logger,
+        text: "You don't have permission to act on this notification.",
+      });
+    }
+    return null;
+  }
+
+  const expectedChatId =
+    getMessagingRoute(
+      context.messagingChannel.routes,
+      MessagingRoutePurpose.RULE_NOTIFICATIONS,
+    )?.targetId ?? context.messagingChannel.teamId;
+
+  if (chatId && expectedChatId !== chatId) {
+    if (event) {
+      await postNotificationFeedback({
+        event,
+        logger,
+        text: "This notification no longer matches this chat.",
+      });
+    }
+    return null;
+  }
+
+  return context;
+}
+
 async function getNotificationContext(executedActionId: string) {
   return prisma.executedAction.findUnique({
     where: { id: executedActionId },
@@ -816,7 +1560,9 @@ async function getNotificationContext(executedActionId: string) {
       bcc: true,
       draftId: true,
       staticAttachments: true,
+      selectedAttachments: true,
       messagingChannelId: true,
+      messagingMessageId: true,
       messagingMessageStatus: true,
       executedRule: {
         select: {
@@ -840,6 +1586,22 @@ async function getNotificationContext(executedActionId: string) {
             select: {
               systemType: true,
             },
+          },
+          actionItems: {
+            where: {
+              id: { not: executedActionId },
+              type: ActionType.DRAFT_EMAIL,
+              draftId: { not: null },
+            },
+            select: {
+              id: true,
+              draftId: true,
+              subject: true,
+            },
+            orderBy: {
+              createdAt: "asc",
+            },
+            take: 1,
           },
         },
       },
@@ -865,45 +1627,34 @@ async function getNotificationContext(executedActionId: string) {
   });
 }
 
-async function getSiblingEmailDraftAction({
-  executedActionId,
-  executedRuleId,
-}: {
-  executedActionId: string;
-  executedRuleId: string;
-}) {
-  return prisma.executedAction.findFirst({
-    where: {
-      executedRuleId,
-      id: { not: executedActionId },
-      type: ActionType.DRAFT_EMAIL,
-      draftId: { not: null },
-    },
-    select: {
-      id: true,
-      draftId: true,
-      subject: true,
-    },
-    orderBy: {
-      createdAt: "asc",
-    },
-  });
+function getMailboxDraftActionForMessagingDraft(context: NotificationContext) {
+  if (context.draftId) {
+    return {
+      id: context.id,
+      draftId: context.draftId,
+      subject: context.subject,
+    };
+  }
+
+  return context.executedRule.actionItems?.[0] ?? null;
 }
 
 async function getEditableDraftContent({
   context,
   provider,
-  siblingDraftAction,
+  mailboxDraftAction,
 }: {
   context: NotificationContext;
   provider: Awaited<ReturnType<typeof createEmailProvider>>;
-  siblingDraftAction: Awaited<ReturnType<typeof getSiblingEmailDraftAction>>;
+  mailboxDraftAction: Awaited<
+    ReturnType<typeof getMailboxDraftActionForMessagingDraft>
+  >;
 }) {
-  if (siblingDraftAction?.draftId) {
+  if (mailboxDraftAction?.draftId) {
     try {
-      const latestDraft = await provider.getDraft(siblingDraftAction.draftId);
+      const latestDraft = await provider.getDraft(mailboxDraftAction.draftId);
       if (latestDraft) {
-        const text = extractDraftPlainText(latestDraft).trim();
+        const text = stripQuotedContent(extractDraftPlainText(latestDraft));
         if (text) return text;
       }
     } catch {
@@ -911,15 +1662,91 @@ async function getEditableDraftContent({
     }
   }
 
-  return context.content || "";
+  return stripQuotedContent(context.content || "");
 }
 
-async function getSourceMessageSummary(
-  context: NotificationContext,
+async function getNotificationDraftContent({
+  context,
+  logger,
+}: {
+  context: NotificationContext;
+  logger: Logger;
+}) {
+  if (!isDraftReplyActionType(context.type)) return context.content;
+
+  const mailboxDraftAction = getMailboxDraftActionForMessagingDraft(context);
+
+  if (!mailboxDraftAction?.draftId) return context.content;
+
+  try {
+    const provider = await createProviderForContext(context, logger);
+
+    return await getEditableDraftContent({
+      context,
+      provider,
+      mailboxDraftAction,
+    });
+  } catch (error) {
+    logger.warn(
+      "Failed to load synced mailbox draft for notification preview",
+      {
+        executedActionId: context.id,
+        mailboxDraftActionId: mailboxDraftAction.id,
+        error,
+      },
+    );
+    return context.content;
+  }
+}
+
+function getNotificationDraftAttachmentNames({
+  context,
+  logger,
+}: {
+  context: NotificationContext;
+  logger: Logger;
+}) {
+  if (!isDraftReplyActionType(context.type)) return [];
+
+  const staticAttachmentNames = getStaticDraftAttachmentNames(
+    context.staticAttachments,
+  );
+  const selectedAttachmentNames = getSelectedDraftAttachmentNames(
+    context.selectedAttachments,
+    logger,
+    context.id,
+  );
+
+  return [...selectedAttachmentNames, ...staticAttachmentNames];
+}
+
+function getStaticDraftAttachmentNames(raw: unknown) {
+  if (!raw || !Array.isArray(raw) || raw.length === 0) return [];
+
+  const parsed = attachmentSourceInputSchema.array().safeParse(raw);
+  if (!parsed.success) return [];
+
+  return parsed.data
+    .filter((attachment) => attachment.type === AttachmentSourceType.FILE)
+    .map((attachment) => attachment.name);
+}
+
+function getSelectedDraftAttachmentNames(
+  raw: unknown,
   logger: Logger,
+  executedActionId: string,
 ) {
-  const provider = await createProviderForContext(context, logger);
-  return getSourceMessageSummaryForProvider({ context, provider });
+  if (!raw || !Array.isArray(raw) || raw.length === 0) return [];
+
+  const parsed = selectedAttachmentSchema.array().safeParse(raw);
+  if (!parsed.success) {
+    logger.warn("Skipping invalid selected attachment metadata", {
+      executedActionId,
+    });
+    return [];
+  }
+
+  return parsed.data.map((attachment) => attachment.filename);
 }
 
 async function getSourceMessageSummaryForProvider({
@@ -948,34 +1775,60 @@ function buildNotificationContent({
   email,
   systemType,
   draftContent,
+  draftAttachmentNames,
+  format,
 }: {
   actionType: ActionType;
   email: NotificationEmailPreview;
-  systemType: SystemType | string | null;
+  systemType: SystemType | null;
   draftContent?: string | null;
+  draftAttachmentNames?: string[];
+  format: NotificationContentFormat;
 }): NotificationContent {
   if (isDraftReplyActionType(actionType)) {
-    const senderName = escapeSlackText(
+    const senderName = formatNotificationText(
       extractNameFromEmail(email.headers.from),
+      format,
     );
-    const subject = escapeSlackText(
+    const senderEmail = formatNotificationText(
+      extractEmailAddress(email.headers.from),
+      format,
+    );
+    const senderDisplay =
+      senderEmail && senderName !== senderEmail
+        ? `${senderName} (${senderEmail})`
+        : senderName;
+    const subject = formatNotificationText(
       truncate(he.decode(email.headers.subject), 80),
+      format,
     );
 
-    const emailPreview = buildEmailPreview(email);
-    const draftPreview = buildDraftPreview(draftContent);
+    const emailPreview = buildEmailPreview(email, { format });
+    const draftPreview = buildDraftPreview(draftContent, { format });
 
-    const parts = [`You got an email from *${senderName}* about "${subject}".`];
+    const summary = `You got an email from *${senderDisplay}*.\n*Subject:* ${subject}`;
 
+    const details: string[] = [];
     if (emailPreview) {
-      parts.push(`They wrote:\n${blockquote(emailPreview)}`);
+      const preview =
+        format === "slack"
+          ? quotePlainTextContent(emailPreview) || emailPreview
+          : emailPreview;
+      details.push(`💬 *They wrote:*\n${preview}`);
+    }
+    details.push(`✍️ *I drafted a reply for you:*\n${draftPreview}`);
+    const attachmentSummary = buildDraftAttachmentSummary(
+      draftAttachmentNames,
+      { format },
+    );
+    if (attachmentSummary) {
+      details.push(`📎 *Attachments:* ${attachmentSummary}`);
     }
 
-    parts.push(`I drafted a reply for you:\n${blockquote(draftPreview)}`);
-
     return {
-      title: "Draft reply",
-      summary: parts.join("\n\n"),
+      title: "✍️ I drafted a reply for you",
+      summary,
+      details,
     };
   }
 
@@ -990,24 +1843,47 @@ function buildNotificationContent({
         ? `When: ${calendarEvent.eventDateString}`
         : null,
       calendarEvent.organizer ? `Organizer: ${calendarEvent.organizer}` : null,
-      buildEmailPreview(email),
+      buildEmailPreview(email, { format }),
     ].filter(Boolean);
 
     return {
-      title: "Calendar invite",
+      title: "📅 Calendar invite for you",
       summary: lines.join("\n"),
     };
   }
 
   return {
-    title: "Email notification",
+    title: getNotificationTitleForSystemType(systemType),
     summary: buildEmailSummary(email),
     details: [
       buildNotificationDetailSection({
         label: "Preview",
-        value: buildEmailPreview(email),
+        value: buildEmailPreview(email, { format }),
       }),
     ].filter(Boolean) as string[],
+  };
+}
+
+function getDraftReplyButtons({
+  actionId,
+  openLink,
+}: {
+  actionId: string;
+  openLink?: NotificationOpenLink | null;
+}) {
+  return {
+    send: Button({
+      id: RULE_DRAFT_SEND_ACTION_ID,
+      label: "Send reply",
+      style: "primary",
+      value: actionId,
+    }),
+    open: openLink ? LinkButton(openLink) : null,
+    dismiss: Button({
+      id: RULE_DRAFT_DISMISS_ACTION_ID,
+      label: "Dismiss",
+      value: actionId,
+    }),
   };
 }
 
@@ -1015,45 +1891,61 @@ function buildNotificationCard({
   actionId,
   actionType,
   content,
+  openLink,
 }: {
   actionId: string;
   actionType: ActionType;
   content: NotificationContent;
+  openLink?: NotificationOpenLink | null;
 }): CardElement {
   const children = buildNotificationCardBody(content);
+  const draftButtons = getDraftReplyButtons({ actionId, openLink });
 
   children.push(
     Actions(
       isDraftReplyActionType(actionType)
         ? [
+            draftButtons.send,
             Button({
-              id: SLACK_DRAFT_SEND_ACTION_ID,
-              label: "Send reply",
-              style: "primary",
-              value: actionId,
-            }),
-            Button({
-              id: SLACK_DRAFT_EDIT_ACTION_ID,
+              id: RULE_DRAFT_EDIT_ACTION_ID,
               label: "Edit draft",
               value: actionId,
             }),
-            Button({
-              id: SLACK_DRAFT_DISMISS_ACTION_ID,
-              label: "Dismiss",
-              value: actionId,
-            }),
+            ...(draftButtons.open ? [draftButtons.open] : []),
+            draftButtons.dismiss,
           ]
         : [
             Button({
-              id: SLACK_NOTIFY_ARCHIVE_ACTION_ID,
+              id: RULE_NOTIFY_ARCHIVE_ACTION_ID,
               label: "Archive",
               style: "primary",
               value: actionId,
             }),
             Button({
-              id: SLACK_NOTIFY_MARK_READ_ACTION_ID,
+              id: RULE_NOTIFY_MARK_READ_ACTION_ID,
               label: "Mark read",
               value: actionId,
+            }),
+            ...(openLink ? [LinkButton(openLink)] : []),
+            Button({
+              id: RULE_DRAFT_DISMISS_ACTION_ID,
+              label: "Dismiss",
+              value: actionId,
+            }),
+            Select({
+              id: RULE_NOTIFY_MORE_ACTION_ID,
+              label: "More",
+              placeholder: "More",
+              options: [
+                SelectOption({
+                  label: "Delete",
+                  value: `${RULE_NOTIFY_TRASH_ACTION_ID}:${actionId}`,
+                }),
+                SelectOption({
+                  label: "Spam",
+                  value: `${RULE_NOTIFY_MARK_SPAM_ACTION_ID}:${actionId}`,
+                }),
+              ],
             }),
           ],
     ),
@@ -1078,15 +1970,104 @@ function buildTerminalCard({
   });
 }
 
-function buildHandledNotificationCard({
+function buildTelegramNotificationCard({
+  actionId,
   content,
+  openLink,
+}: {
+  actionId: string;
+  content: NotificationContent;
+  openLink?: NotificationOpenLink | null;
+}): CardElement {
+  const children = buildNotificationCardBody(
+    sanitizeTelegramNotificationContent(content),
+  );
+  const { send, open, dismiss } = getDraftReplyButtons({
+    actionId,
+    openLink,
+  });
+  children.push(Actions([send, ...(open ? [open] : []), dismiss]));
+
+  return Card({
+    children,
+  });
+}
+
+function buildTelegramHandledNotificationCard({
+  content,
+  openLink,
   status,
 }: {
   content: NotificationContent;
+  openLink?: NotificationOpenLink | null;
+  status: string;
+}): CardElement {
+  const children = buildNotificationCardBody(
+    sanitizeTelegramNotificationContent(content),
+  );
+  children.push(CardText(sanitizeTelegramCardText(`Status: ${status}`)));
+  if (openLink) {
+    children.push(Actions([LinkButton(openLink)]));
+  }
+
+  return Card({
+    children,
+  });
+}
+
+function buildHandledNotificationCardForProvider({
+  provider,
+  content,
+  openLink,
+  status,
+}: {
+  provider?: MessagingProvider | null;
+  content: NotificationContent;
+  openLink?: NotificationOpenLink | null;
+  status: string;
+}): CardElement {
+  if (provider === MessagingProvider.TELEGRAM) {
+    return buildTelegramHandledNotificationCard({ content, openLink, status });
+  }
+
+  return buildHandledNotificationCard({ content, openLink, status });
+}
+
+function sanitizeTelegramNotificationContent(
+  content: NotificationContent,
+): NotificationContent {
+  return {
+    title: sanitizeTelegramCardText(content.title),
+    summary: sanitizeTelegramCardText(content.summary),
+    details: content.details?.map(sanitizeTelegramCardText),
+  };
+}
+
+function sanitizeTelegramCardText(text: string) {
+  return neutralizeTelegramAutolinks(markdownToTelegramText(text));
+}
+
+function neutralizeTelegramAutolinks(text: string) {
+  return text.replace(
+    /https?:\/\/\S+|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
+    (value) => `\`${value.replace(/`/g, "'")}\``,
+  );
+}
+
+function buildHandledNotificationCard({
+  content,
+  openLink,
+  status,
+}: {
+  content: NotificationContent;
+  openLink?: NotificationOpenLink | null;
   status: string;
 }): CardElement {
   const children = buildNotificationCardBody(content);
   children.push(CardText(`Status: ${status}`));
+  if (openLink) {
+    children.push(Actions([LinkButton(openLink)]));
+  }
 
   return Card({
     title: content.title,
@@ -1094,13 +2075,41 @@ function buildHandledNotificationCard({
   });
 }
 
-function buildDraftPreview(content?: string | null) {
+function buildDraftPreview(
+  content: string | null | undefined,
+  { format }: { format: NotificationContentFormat },
+) {
   if (!content?.trim()) return "No draft preview available.";
 
-  return truncate(
+  const preview = stripQuotedContent(
     removeExcessiveWhitespace(richTextToSlackMrkdwn(he.decode(content))).trim(),
+  );
+  return truncate(
+    format === "slack" ? preview : stripSlackFormatting(preview),
     DRAFT_PREVIEW_MAX_CHARS,
   );
+}
+
+function buildDraftAttachmentSummary(
+  attachmentNames: string[] | null | undefined,
+  { format }: { format: NotificationContentFormat },
+) {
+  const uniqueNames = [
+    ...new Set(
+      (attachmentNames ?? [])
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0),
+    ),
+  ];
+  if (uniqueNames.length === 0) return null;
+
+  const visibleNames = uniqueNames
+    .slice(0, MAX_DRAFT_ATTACHMENT_NAMES)
+    .map((name) => formatNotificationText(name, format));
+  const hiddenCount = uniqueNames.length - visibleNames.length;
+  const suffix = hiddenCount > 0 ? ` and ${hiddenCount} more` : "";
+
+  return `${visibleNames.join(", ")}${suffix}`;
 }
 
 function buildNotificationCardBody(content: NotificationContent): CardChild[] {
@@ -1151,12 +2160,33 @@ function buildEmailSummary(email: {
   ].join("\n");
 }
 
-function buildEmailPreview(email: { snippet: string; textPlain?: string }) {
-  const rawPreview = email.snippet || email.textPlain || "";
-  const preview = removeExcessiveWhitespace(rawPreview).trim();
+function buildEmailPreview(
+  email: {
+    snippet: string;
+    textPlain?: string;
+    textHtml?: string;
+  },
+  { format }: { format: NotificationContentFormat },
+) {
+  const rawPreview = emailToContent(email, {
+    maxLength: 0,
+    extractReply: true,
+    includeLinkUrls: true,
+  });
+  const preview = formatNotificationText(
+    removeExcessiveWhitespace(he.decode(rawPreview)).trim(),
+    format,
+  );
   if (!preview) return null;
 
   return truncate(preview, SUMMARY_PREVIEW_MAX_CHARS);
+}
+
+function formatNotificationText(
+  text: string,
+  format: NotificationContentFormat,
+) {
+  return format === "slack" ? escapeSlackText(text) : text;
 }
 
 function buildNotificationDetailSection({
@@ -1183,18 +2213,45 @@ function createProviderForContext(
   });
 }
 
-function getInfoNotificationTitle(systemType: SystemType | string | null) {
+function getInfoNotificationTitle(systemType: SystemType | null) {
   return systemType === SystemType.CALENDAR
     ? "Calendar invite"
     : "Email notification";
 }
 
+function getNotificationOpenLink(
+  context: NotificationContext,
+): NotificationOpenLink | null {
+  const provider = context.executedRule.emailAccount.account.provider;
+  const label = isGoogleProvider(provider)
+    ? "Open in Gmail"
+    : isMicrosoftProvider(provider)
+      ? "Open in Outlook"
+      : null;
+  if (!label) return null;
+
+  const url = getEmailUrlForOptionalMessage({
+    messageId: context.executedRule.messageId,
+    threadId: context.executedRule.threadId,
+    emailAddress: context.executedRule.emailAccount.email,
+    provider,
+  });
+  if (!url) return null;
+
+  return {
+    label,
+    url,
+  };
+}
+
 async function findSlackRootMessageId({
   executedActionId,
+  emailAccountId,
   messagingChannelId,
   threadId,
 }: {
   executedActionId: string;
+  emailAccountId: string;
   messagingChannelId: string;
   threadId: string;
 }) {
@@ -1204,6 +2261,7 @@ async function findSlackRootMessageId({
       messagingChannelId,
       messagingMessageId: { not: null },
       executedRule: {
+        emailAccountId,
         threadId,
       },
     },
@@ -1236,12 +2294,12 @@ async function postSlackCard({
 }) {
   const client = createSlackClient(accessToken);
 
-  const args = {
+  const args = disableSlackLinkUnfurls({
     channel: destinationChannelId,
     text: cardToFallbackText(card),
     blocks: cardToBlockKit(card),
     ...(rootMessageId ? { thread_ts: rootMessageId } : {}),
-  };
+  });
 
   try {
     const response = await client.chat.postMessage(args);
@@ -1264,37 +2322,193 @@ async function postSlackCard({
   }
 }
 
-async function expireNotificationCard({
-  event,
+async function replaceMessagingDraftNotificationWithTerminalState({
+  executedActionId,
   logger,
-  actionId,
-  title,
-  message,
+  terminalStatus,
+  terminalMessage,
 }: {
-  event: ActionEvent;
+  executedActionId: string;
   logger: Logger;
-  actionId: string;
-  title: string;
-  message: string;
+  terminalStatus: MessagingMessageStatus;
+  terminalMessage: string;
 }) {
-  await prisma.executedAction.update({
-    where: { id: actionId },
+  const updated = await prisma.executedAction.updateMany({
+    where: {
+      id: executedActionId,
+      OR: [
+        { messagingMessageStatus: null },
+        {
+          messagingMessageStatus: {
+            in: [
+              MessagingMessageStatus.SENT,
+              MessagingMessageStatus.DRAFT_EDITED,
+            ],
+          },
+        },
+      ],
+    },
     data: {
-      messagingMessageStatus: MessagingMessageStatus.EXPIRED,
+      messagingMessageStatus: terminalStatus,
     },
   });
 
-  await event.adapter.editMessage(
-    event.threadId,
-    event.messageId,
-    buildTerminalCard({ title, message }),
+  if (updated.count === 0) {
+    return;
+  }
+
+  const context = await getNotificationContext(executedActionId);
+
+  if (!context?.messagingMessageId) {
+    return;
+  }
+
+  if (
+    !context.messagingChannel ||
+    !isMessagingChannelOperational(context.messagingChannel)
+  ) {
+    logger.warn(
+      "Skipping messaging draft notification cleanup for disconnected channel",
+      {
+        executedActionId: context.id,
+        messagingChannelId: context.messagingChannelId,
+        provider: context.messagingChannel?.provider,
+      },
+    );
+    return;
+  }
+
+  const route = getMessagingRoute(
+    context.messagingChannel.routes,
+    MessagingRoutePurpose.RULE_NOTIFICATIONS,
   );
 
-  await postNotificationFeedback({
-    event,
-    logger,
-    text: message,
+  if (!route) {
+    logger.warn("Skipping messaging draft notification cleanup with no route", {
+      executedActionId: context.id,
+      messagingChannelId: context.messagingChannelId,
+      provider: context.messagingChannel.provider,
+    });
+    return;
+  }
+
+  const card = buildTerminalCard({
+    title: "Draft reply",
+    message: terminalMessage,
   });
+
+  try {
+    switch (context.messagingChannel.provider) {
+      case MessagingProvider.SLACK: {
+        const destinationChannelId = await resolveSlackRouteDestination({
+          accessToken: context.messagingChannel.accessToken,
+          route,
+        });
+
+        if (!destinationChannelId) {
+          logger.warn(
+            "Skipping Slack draft notification cleanup with no destination",
+            {
+              executedActionId: context.id,
+              messagingChannelId: context.messagingChannelId,
+            },
+          );
+          return;
+        }
+
+        await updateSlackCard({
+          accessToken: context.messagingChannel.accessToken,
+          channel: destinationChannelId,
+          ts: context.messagingMessageId,
+          card,
+        });
+        break;
+      }
+      case MessagingProvider.TEAMS: {
+        const providerUserId =
+          route.targetType === MessagingRouteTargetType.DIRECT_MESSAGE
+            ? route.targetId
+            : context.messagingChannel.providerUserId;
+
+        if (!providerUserId) {
+          logger.warn(
+            "Skipping Teams draft notification cleanup with no destination user",
+            {
+              executedActionId: context.id,
+              messagingChannelId: context.messagingChannelId,
+            },
+          );
+          return;
+        }
+
+        const teamsAdapter = getMessagingAdapterRegistry().typedAdapters.teams;
+        if (!teamsAdapter) {
+          logger.warn(
+            "Skipping Teams draft notification cleanup without adapter",
+            {
+              executedActionId: context.id,
+              messagingChannelId: context.messagingChannelId,
+            },
+          );
+          return;
+        }
+
+        const threadId = await teamsAdapter.openDM(providerUserId);
+        await teamsAdapter.editMessage(
+          threadId,
+          context.messagingMessageId,
+          terminalMessage,
+        );
+        break;
+      }
+      case MessagingProvider.TELEGRAM: {
+        const destination = route.targetId || context.messagingChannel.teamId;
+        if (!destination) {
+          logger.warn(
+            "Skipping Telegram draft notification cleanup with no destination",
+            {
+              executedActionId: context.id,
+              messagingChannelId: context.messagingChannelId,
+            },
+          );
+          return;
+        }
+
+        const telegramAdapter =
+          getMessagingAdapterRegistry().typedAdapters.telegram;
+        if (!telegramAdapter) {
+          logger.warn(
+            "Skipping Telegram draft notification cleanup without adapter",
+            {
+              executedActionId: context.id,
+              messagingChannelId: context.messagingChannelId,
+            },
+          );
+          return;
+        }
+
+        const threadId = await telegramAdapter.openDM(destination);
+        await telegramAdapter.editMessage(
+          threadId,
+          context.messagingMessageId,
+          terminalMessage,
+        );
+        break;
+      }
+      default:
+        return;
+    }
+  } catch (error) {
+    logger.warn(
+      "Failed to collapse messaging draft notification after terminal state",
+      {
+        executedActionId: context.id,
+        provider: context.messagingChannel.provider,
+        terminalStatus,
+        error,
+      },
+    );
+  }
 }
 
 async function postNotificationFeedback({
@@ -1306,12 +2520,25 @@ async function postNotificationFeedback({
   logger: Logger;
   text: string;
 }) {
-  if (!event.thread) return;
+  const thread = event.thread;
+  if (!thread) return;
+
+  if (event.adapter.name === "slack") {
+    try {
+      await thread.postEphemeral(event.user, text, { fallbackToDM: false });
+      return;
+    } catch (error) {
+      logger.warn("Failed to post Slack notification feedback", {
+        actionId: event.actionId,
+        error,
+      });
+    }
+  }
 
   try {
-    await event.thread.postEphemeral(event.user, text, { fallbackToDM: false });
+    await thread.post(text);
   } catch (error) {
-    logger.warn("Failed to post Slack notification feedback", {
+    logger.warn("Failed to post rule notification feedback", {
       actionId: event.actionId,
       error,
     });
@@ -1350,13 +2577,6 @@ function canSendDraft(status: MessagingMessageStatus | null) {
 
 function canEditDraft(status: MessagingMessageStatus | null) {
   return canSendDraft(status);
-}
-
-function getSlackTeamId(raw: unknown): string | null {
-  if (!raw || typeof raw !== "object") return null;
-
-  const maybeTeam = (raw as { team?: { id?: string } }).team?.id;
-  return maybeTeam || null;
 }
 
 function isSlackError(
@@ -1400,17 +2620,13 @@ function toCalendarPreviewMessage(
   };
 }
 
-function blockquote(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => `>${line}`)
-    .join("\n");
-}
-
 function stripSlackFormatting(text: string) {
   return text
     .replace(/<([^|>]+)\|([^>]+)>/g, "$2: $1")
-    .replace(/\*([^*]+)\*/g, "$1");
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
 }
 
 function getLinkedProviderLimitationText({
@@ -1424,8 +2640,31 @@ function getLinkedProviderLimitationText({
     provider === MessagingProvider.TEAMS ? "Teams" : "Telegram";
 
   if (isDraftReplyActionType(actionType)) {
-    return "One-click draft editing and sending are Slack-only right now. Use Inbox Zero or Slack if you want to edit or send this draft from chat.";
+    return provider === MessagingProvider.TEAMS
+      ? "One-click draft editing and sending aren't available in Teams yet. Use Inbox Zero to review or send this draft."
+      : "Draft editing isn't available in Telegram yet. You can send this draft from Telegram or use Inbox Zero to revise it first.";
   }
 
   return `Quick actions like archive and mark read are Slack-only right now, so this ${providerName} message is view-only.`;
+}
+
+function getNotificationTitleForSystemType(
+  systemType: SystemType | null,
+): string {
+  switch (systemType) {
+    case SystemType.NEWSLETTER:
+      return "📰 New newsletter for you";
+    case SystemType.MARKETING:
+      return "📢 New marketing email for you";
+    case SystemType.RECEIPT:
+      return "🧾 New receipt for you";
+    case SystemType.COLD_EMAIL:
+      return "❄️ Cold email caught";
+    case SystemType.FYI:
+      return "👀 FYI for you";
+    case SystemType.NOTIFICATION:
+      return "🔔 New notification for you";
+    default:
+      return "📬 New email for you";
+  }
 }

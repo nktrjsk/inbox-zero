@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useForm, type SubmitHandler } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import Link from "next/link";
@@ -57,6 +57,13 @@ import {
   FolderNode,
   NoFoldersFound,
 } from "./AllowedFolders";
+import {
+  applyFolderSelection,
+  buildFolderChildrenMap,
+  getRootFolders,
+  mergeFolderChildren,
+  type FolderChildrenMap,
+} from "./allowed-folder-selection";
 import type {
   FolderItem,
   SavedFolder,
@@ -66,6 +73,7 @@ import type { AttachmentPreviewItem } from "@/app/api/user/drive/preview/attachm
 import { LoadingContent } from "@/components/LoadingContent";
 import { getEmailUrlForMessage } from "@/utils/url";
 import { AlertBasic } from "@/components/Alert";
+import { useProductAnalytics } from "@/hooks/useProductAnalytics";
 
 type SetupPhase = "setup" | "loading-attachments" | "preview" | "starting";
 
@@ -79,6 +87,7 @@ type FilingState = {
 
 export function DriveSetup() {
   const { emailAccountId } = useAccount();
+  const analytics = useProductAnalytics("attachments");
   const { data: connectionsData } = useDriveConnections();
   const {
     data: foldersData,
@@ -103,6 +112,10 @@ export function DriveSetup() {
   const { data: attachmentsData, isLoading: attachmentsLoading } =
     useFilingPreviewAttachments(shouldFetchAttachments, {
       onSuccess: (data) => {
+        analytics.captureAction("auto_file_preview_completed", {
+          attachment_count: data.attachments.length,
+          no_attachments_found: data.noAttachmentsFound,
+        });
         // Initialize states and trigger filing for each attachment
         const initial: Record<string, FilingState> = {};
         for (const att of data.attachments) {
@@ -116,11 +129,15 @@ export function DriveSetup() {
             .then((result) => {
               const resultData = result?.data;
               if (result?.serverError) {
+                analytics.captureAction("auto_file_preview_item_failed", {
+                  reason: "server_error",
+                });
                 setFilingStates((prev) => ({
                   ...prev,
                   [key]: { status: "error", error: result.serverError },
                 }));
               } else if (resultData?.skipped) {
+                analytics.captureAction("auto_file_preview_item_skipped");
                 setFilingStates((prev) => ({
                   ...prev,
                   [key]: {
@@ -130,11 +147,15 @@ export function DriveSetup() {
                   },
                 }));
               } else if (resultData) {
+                analytics.captureAction("auto_file_preview_item_filed");
                 setFilingStates((prev) => ({
                   ...prev,
                   [key]: { status: "filed", result: resultData },
                 }));
               } else {
+                analytics.captureAction("auto_file_preview_item_failed", {
+                  reason: "unknown",
+                });
                 setFilingStates((prev) => ({
                   ...prev,
                   [key]: { status: "error", error: "Unknown error" },
@@ -142,6 +163,9 @@ export function DriveSetup() {
               }
             })
             .catch((err) => {
+              analytics.captureAction("auto_file_preview_item_failed", {
+                reason: "exception",
+              });
               setFilingStates((prev) => ({
                 ...prev,
                 [key]: {
@@ -154,6 +178,7 @@ export function DriveSetup() {
         setFilingStates(initial);
       },
       onError: (err) => {
+        analytics.captureAction("auto_file_preview_failed");
         toastError({
           title: "Error fetching preview",
           description:
@@ -174,10 +199,15 @@ export function DriveSetup() {
   }, [userPhase, attachmentsLoading, attachmentsData]);
 
   const handlePreviewClick = useCallback(() => {
+    analytics.captureAction("auto_file_preview_started", {
+      folder_count: foldersData?.savedFolders.length ?? 0,
+      has_connection: Boolean(connection),
+    });
     setUserPhase("previewing");
-  }, []);
+  }, [analytics, connection, foldersData?.savedFolders.length]);
 
   const handleStartFiling = useCallback(async () => {
+    analytics.captureAction("auto_file_enable_started");
     setUserPhase("starting");
     try {
       const result = await updateFilingEnabledAction(emailAccountId, {
@@ -185,6 +215,9 @@ export function DriveSetup() {
       });
 
       if (result?.serverError) {
+        analytics.captureAction("auto_file_enable_failed", {
+          reason: "server_error",
+        });
         toastError({
           title: "Error starting auto-filing",
           description: result.serverError,
@@ -193,9 +226,13 @@ export function DriveSetup() {
         return;
       }
 
+      analytics.captureAction("auto_file_enabled");
       toastSuccess({ description: "Auto-filing started!" });
       await mutateEmail();
     } catch (error) {
+      analytics.captureAction("auto_file_enable_failed", {
+        reason: "exception",
+      });
       toastError({
         title: "Error starting auto-filing",
         description:
@@ -205,7 +242,7 @@ export function DriveSetup() {
       });
       setUserPhase("previewing");
     }
-  }, [emailAccountId, mutateEmail]);
+  }, [analytics, emailAccountId, mutateEmail]);
 
   return (
     <div className="mx-auto max-w-2xl py-8">
@@ -432,6 +469,7 @@ function FilingRow({
   userEmail: string;
   provider: string;
 }) {
+  const analytics = useProductAnalytics("attachments");
   const [correctedPath, setCorrectedPath] = useState<string | null>(null);
   const [isMoving, setIsMoving] = useState(false);
   const [vote, setVote] = useState<boolean | null>(null);
@@ -453,6 +491,7 @@ function FilingRow({
           targetFolderId: folder.folderId,
           targetFolderPath: folder.folderPath,
         });
+        analytics.captureAction("auto_file_preview_item_moved");
         setCorrectedPath(folder.folderPath);
         toastSuccess({ description: `Moved to ${folder.folderName}` });
       } catch {
@@ -462,7 +501,7 @@ function FilingRow({
         setIsMoving(false);
       }
     },
-    [emailAccountId, filingState.result?.filingId],
+    [analytics, emailAccountId, filingState.result?.filingId],
   );
 
   const handleCorrectClick = useCallback(async () => {
@@ -478,8 +517,19 @@ function FilingRow({
     if (result?.serverError) {
       setVote(null);
       toastError({ description: "Failed to submit feedback" });
+    } else {
+      analytics.captureAction("auto_file_preview_feedback_submitted", {
+        feedback_positive: true,
+        item_status: filingState.status,
+      });
     }
-  }, [emailAccountId, filingState.result?.filingId, filingState.filingId]);
+  }, [
+    analytics,
+    emailAccountId,
+    filingState.filingId,
+    filingState.result?.filingId,
+    filingState.status,
+  ]);
 
   const handleWrongClick = useCallback(async () => {
     const filingId = filingState.result?.filingId;
@@ -494,8 +544,18 @@ function FilingRow({
     if (result?.serverError) {
       setVote(null);
       toastError({ description: "Failed to submit feedback" });
+    } else {
+      analytics.captureAction("auto_file_preview_feedback_submitted", {
+        feedback_positive: false,
+        item_status: filingState.status,
+      });
     }
-  }, [emailAccountId, filingState.result?.filingId]);
+  }, [
+    analytics,
+    emailAccountId,
+    filingState.result?.filingId,
+    filingState.status,
+  ]);
 
   const handleSkippedWrongClick = useCallback(async () => {
     const filingId = filingState.filingId;
@@ -510,8 +570,13 @@ function FilingRow({
     if (result?.serverError) {
       setVote(null);
       toastError({ description: "Failed to submit feedback" });
+    } else {
+      analytics.captureAction("auto_file_preview_feedback_submitted", {
+        feedback_positive: false,
+        item_status: filingState.status,
+      });
     }
-  }, [emailAccountId, filingState.filingId]);
+  }, [analytics, emailAccountId, filingState.filingId, filingState.status]);
 
   const isFiled = filingState.status === "filed";
   const isSkipped = filingState.status === "skipped";
@@ -645,109 +710,128 @@ function SetupFolderSelection({
   mutateFolders: () => void;
   isLoading: boolean;
 }) {
+  const analytics = useProductAnalytics("attachments");
   // Optimistic state for folder selection
   const [optimisticFolderIds, setOptimisticFolderIds] = useState<Set<string>>(
     () => new Set(savedFolders.map((f) => f.folderId)),
   );
+  const [childrenByParentId, setChildrenByParentId] =
+    useState<FolderChildrenMap>(() => buildFolderChildrenMap(availableFolders));
   // TODO: This assumes a single drive connection; swap to a selected connection ID when multi-connection UX exists.
   const driveConnectionId = connections[0]?.id ?? null;
 
   // Sync optimistic state when server data changes
   const serverFolderIds = savedFolders.map((f) => f.folderId).join(",");
   const prevServerFolderIds = useRef(serverFolderIds);
-  if (serverFolderIds !== prevServerFolderIds.current) {
+  useEffect(() => {
+    if (serverFolderIds === prevServerFolderIds.current) return;
     prevServerFolderIds.current = serverFolderIds;
     setOptimisticFolderIds(new Set(savedFolders.map((f) => f.folderId)));
-  }
+  }, [savedFolders, serverFolderIds]);
+
+  useEffect(() => {
+    setChildrenByParentId(buildFolderChildrenMap(availableFolders));
+  }, [availableFolders]);
+
+  const handleChildrenLoaded = useCallback(
+    (parentId: string, children: FolderItem[]) => {
+      setChildrenByParentId((prev) =>
+        mergeFolderChildren({ childrenByParentId: prev, parentId, children }),
+      );
+    },
+    [],
+  );
 
   const handleFolderToggle = useCallback(
     async (folder: FolderItem, isChecked: boolean) => {
-      const folderPath = folder.path || folder.name;
-
-      // Optimistic update
-      setOptimisticFolderIds((prev) => {
-        const next = new Set(prev);
-        if (isChecked) {
-          next.add(folder.id);
-        } else {
-          next.delete(folder.id);
-        }
-        return next;
+      const previousFolderIds = optimisticFolderIds;
+      const { nextFolderIds, changedFolders } = applyFolderSelection({
+        folder,
+        isChecked,
+        selectedFolderIds: previousFolderIds,
+        childrenByParentId,
       });
 
-      if (isChecked) {
-        const result = await addFilingFolderAction(emailAccountId, {
-          folderId: folder.id,
-          folderName: folder.name,
-          folderPath,
-          driveConnectionId: folder.driveConnectionId,
-        });
+      setOptimisticFolderIds(nextFolderIds);
 
-        if (result?.serverError) {
-          // Revert on error
-          setOptimisticFolderIds((prev) => {
-            const next = new Set(prev);
-            next.delete(folder.id);
-            return next;
+      try {
+        if (isChecked) {
+          analytics.captureAction("auto_file_folder_selected", {
+            saved_folder_count:
+              optimisticFolderIds.size + changedFolders.length,
           });
-          toastError({
-            title: "Error adding folder",
-            description: result.serverError,
-          });
-        } else {
-          mutateFolders();
-        }
-      } else {
-        const result = await removeFilingFolderAction(emailAccountId, {
-          folderId: folder.id,
-        });
+          const results = await Promise.all(
+            changedFolders.map((changedFolder) =>
+              addFilingFolderAction(emailAccountId, {
+                folderId: changedFolder.id,
+                folderName: changedFolder.name,
+                folderPath: changedFolder.path || changedFolder.name,
+                driveConnectionId: changedFolder.driveConnectionId,
+              }),
+            ),
+          );
+          const serverError = results.find(
+            (result) => result?.serverError,
+          )?.serverError;
 
-        if (result?.serverError) {
-          // Revert on error
-          setOptimisticFolderIds((prev) => {
-            const next = new Set(prev);
-            next.add(folder.id);
-            return next;
-          });
-          toastError({
-            title: "Error removing folder",
-            description: result.serverError,
-          });
+          if (serverError) {
+            setOptimisticFolderIds(previousFolderIds);
+            toastError({
+              title: "Error adding folder",
+              description: serverError,
+            });
+          } else {
+            mutateFolders();
+          }
         } else {
-          mutateFolders();
+          analytics.captureAction("auto_file_folder_removed", {
+            saved_folder_count: Math.max(
+              optimisticFolderIds.size - changedFolders.length,
+              0,
+            ),
+          });
+          const results = await Promise.all(
+            changedFolders.map((changedFolder) =>
+              removeFilingFolderAction(emailAccountId, {
+                folderId: changedFolder.id,
+              }),
+            ),
+          );
+          const serverError = results.find(
+            (result) => result?.serverError,
+          )?.serverError;
+
+          if (serverError) {
+            setOptimisticFolderIds(previousFolderIds);
+            toastError({
+              title: "Error removing folder",
+              description: serverError,
+            });
+          } else {
+            mutateFolders();
+          }
         }
+      } catch {
+        setOptimisticFolderIds(previousFolderIds);
+        toastError({
+          title: isChecked ? "Error adding folder" : "Error removing folder",
+          description: "Please try again.",
+        });
       }
     },
-    [emailAccountId, mutateFolders],
+    [
+      analytics,
+      childrenByParentId,
+      emailAccountId,
+      mutateFolders,
+      optimisticFolderIds,
+    ],
   );
 
-  const rootFolders = useMemo(() => {
-    const folderMap = new Map<string, FolderItem>();
-    const roots: FolderItem[] = [];
-
-    for (const folder of availableFolders) {
-      folderMap.set(folder.id, folder);
-    }
-
-    for (const folder of availableFolders) {
-      if (!folder.parentId || !folderMap.has(folder.parentId)) {
-        roots.push(folder);
-      }
-    }
-
-    return roots;
-  }, [availableFolders]);
-
-  const folderChildrenMap = useMemo(() => {
-    const map = new Map<string, FolderItem[]>();
-    for (const folder of availableFolders) {
-      if (folder.parentId) {
-        if (!map.has(folder.parentId)) map.set(folder.parentId, []);
-        map.get(folder.parentId)!.push(folder);
-      }
-    }
-    return map;
-  }, [availableFolders]);
+  const rootFolders = useMemo(
+    () => getRootFolders(availableFolders),
+    [availableFolders],
+  );
 
   return (
     <div>
@@ -788,7 +872,9 @@ function SetupFolderSelection({
                       onToggle={handleFolderToggle}
                       level={0}
                       parentPath=""
-                      knownChildren={folderChildrenMap.get(folder.id)}
+                      childrenByParentId={childrenByParentId}
+                      onChildrenLoaded={handleChildrenLoaded}
+                      knownChildren={childrenByParentId.get(folder.id)}
                     />
                   ))}
                 </TreeView>
@@ -834,6 +920,7 @@ function SetupRulesForm({
   phase: SetupPhase;
   onPreviewClick: () => void;
 }) {
+  const analytics = useProductAnalytics("attachments");
   const {
     register,
     handleSubmit,
@@ -866,17 +953,30 @@ function SetupRulesForm({
       const result = await updateFilingPromptAction(emailAccountId, data);
 
       if (result?.serverError) {
+        analytics.captureAction("auto_file_prompt_save_failed", {
+          reason: "server_error",
+        });
         toastError({
           title: "Error saving rules",
           description: result.serverError,
         });
       } else {
+        analytics.captureAction("auto_file_prompt_saved", {
+          has_existing_prompt: Boolean(initialPrompt),
+        });
         mutateEmail();
         // Trigger preview after successful save
         onPreviewClick();
       }
     },
-    [canPreview, emailAccountId, mutateEmail, onPreviewClick],
+    [
+      analytics,
+      canPreview,
+      emailAccountId,
+      initialPrompt,
+      mutateEmail,
+      onPreviewClick,
+    ],
   );
 
   return (

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   ensureConversationRuleContinuity,
+  ensureConversationRuleForAiCalendarMatch,
   CONVERSATION_TRACKING_META_RULE_ID,
   limitDraftEmailActions,
   runRules,
@@ -22,12 +23,13 @@ import {
 } from "@/__tests__/helpers";
 import { findMatchingRules } from "@/utils/ai/choose-rule/match-rules";
 import { getActionItemsWithAiArgs } from "@/utils/ai/choose-rule/choose-args";
+import { executeAct } from "@/utils/ai/choose-rule/execute";
+import { determineConversationStatus } from "@/utils/reply-tracker/handle-conversation-status";
+import { isDraftReplyActionType } from "@/utils/actions/draft-reply";
 
 const logger = createTestLogger();
 
 vi.mock("@/utils/prisma");
-vi.mock("server-only", () => ({}));
-vi.mock("next/server", () => ({ after: vi.fn((fn) => fn()) }));
 vi.mock("@/utils/ai/choose-rule/match-rules", () => ({
   findMatchingRules: vi.fn(),
 }));
@@ -255,6 +257,144 @@ describe("ensureConversationRuleContinuity", () => {
   });
 });
 
+describe("ensureConversationRuleForAiCalendarMatch", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("adds the conversation meta rule for AI-selected calendar matches", () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR);
+    const matches = [
+      {
+        rule: calendarRule,
+        matchReasons: [{ type: ConditionType.AI }],
+      },
+    ];
+
+    const result = ensureConversationRuleForAiCalendarMatch({
+      conversationRules: [toReplyRule],
+      regularRules: [calendarRule, conversationMetaRule],
+      matches,
+      logger,
+    });
+
+    expect(result).toHaveLength(2);
+    expect(result[0]).toEqual(matches[0]);
+    expect(result[1]).toEqual({
+      rule: conversationMetaRule,
+      matchReasons: [{ type: ConditionType.STATIC }],
+    });
+  });
+
+  it("does not add the conversation meta rule for preset calendar matches", () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR);
+    const matches = [
+      {
+        rule: calendarRule,
+        matchReasons: [
+          { type: ConditionType.PRESET, systemType: SystemType.CALENDAR },
+        ],
+      },
+    ];
+
+    const result = ensureConversationRuleForAiCalendarMatch({
+      conversationRules: [toReplyRule],
+      regularRules: [calendarRule, conversationMetaRule],
+      matches,
+      logger,
+    });
+
+    expect(result).toEqual(matches);
+  });
+
+  it("does not add the conversation meta rule when a preset calendar match also has an AI reason", () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR);
+    const matches = [
+      {
+        rule: calendarRule,
+        matchReasons: [
+          { type: ConditionType.PRESET, systemType: SystemType.CALENDAR },
+          { type: ConditionType.AI },
+        ],
+      },
+    ];
+
+    const result = ensureConversationRuleForAiCalendarMatch({
+      conversationRules: [toReplyRule],
+      regularRules: [calendarRule, conversationMetaRule],
+      matches,
+      logger,
+    });
+
+    expect(result).toEqual(matches);
+  });
+
+  it("does not add the conversation meta rule when conversation rules are disabled", () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR);
+    const disabledToReplyRule = {
+      ...toReplyRule,
+      enabled: false,
+    };
+    const matches = [
+      {
+        rule: calendarRule,
+        matchReasons: [{ type: ConditionType.AI }],
+      },
+    ];
+
+    const result = ensureConversationRuleForAiCalendarMatch({
+      conversationRules: [disabledToReplyRule],
+      regularRules: [calendarRule, conversationMetaRule],
+      matches,
+      logger,
+    });
+
+    expect(result).toEqual(matches);
+  });
+
+  it("does not add a duplicate conversation meta rule", () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR);
+    const matches = [
+      {
+        rule: calendarRule,
+        matchReasons: [{ type: ConditionType.AI }],
+      },
+      {
+        rule: conversationMetaRule,
+        matchReasons: [{ type: ConditionType.STATIC }],
+      },
+    ];
+
+    const result = ensureConversationRuleForAiCalendarMatch({
+      conversationRules: [toReplyRule],
+      regularRules: [calendarRule, conversationMetaRule],
+      matches,
+      logger,
+    });
+
+    expect(result).toEqual(matches);
+  });
+
+  it("does not add the conversation meta rule for non-calendar AI matches", () => {
+    const marketingRule = createRule("marketing-rule", SystemType.MARKETING);
+    const matches = [
+      {
+        rule: marketingRule,
+        matchReasons: [{ type: ConditionType.AI }],
+      },
+    ];
+
+    const result = ensureConversationRuleForAiCalendarMatch({
+      conversationRules: [toReplyRule],
+      regularRules: [marketingRule, conversationMetaRule],
+      matches,
+      logger,
+    });
+
+    expect(result).toEqual(matches);
+  });
+});
+
 describe("runRules draft attribution persistence", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -268,10 +408,7 @@ describe("runRules draft attribution persistence", () => {
       }),
     ]);
 
-    vi.mocked(findMatchingRules).mockResolvedValue({
-      matches: [{ rule: draftRule, matchReasons: [] }],
-      reasoning: "Matched draft rule",
-    } as any);
+    mockMatchingRules([{ rule: draftRule, matchReasons: [] }]);
     prisma.executedRule.findFirst.mockResolvedValue(null);
     vi.mocked(getActionItemsWithAiArgs).mockResolvedValue([
       {
@@ -283,46 +420,23 @@ describe("runRules draft attribution persistence", () => {
         draftModelProvider: "openai",
         draftModelName: "gpt-5.1",
         draftPipelineVersion: 1,
+        selectedAttachments: [
+          {
+            driveConnectionId: "drive-1",
+            fileId: "file-1",
+            filename: "attachment.pdf",
+            mimeType: "application/pdf",
+          },
+        ],
       } as any,
     ]);
 
-    const createSpy = prisma.executedRule.create.mockResolvedValue({
-      id: "exec-1",
-      status: ExecutedRuleStatus.APPLYING,
-      ruleId: draftRule.id,
-      threadId,
-      messageId: "message-1",
-      actionItems: [],
-    } as any);
+    const createSpy = mockExecutedRuleCreate({ rule: draftRule });
 
-    await runRules({
-      provider: {} as any,
-      message: {
-        ...getEmail(),
-        id: "message-1",
-        threadId,
-        snippet: "",
-        historyId: "history-1",
-        inline: [],
-        attachments: [],
-        headers: {
-          from: "sender@example.com",
-          to: "user@example.com",
-          subject: "Subject",
-          date: "Mon, 1 Jan 2026 12:00:00 +0000",
-          "message-id": "<message-1>",
-        },
-      } as any,
-      rules: [draftRule],
-      emailAccount: getEmailAccount(),
-      isTest: false,
-      modelType: "default" as any,
-      logger,
-    });
+    await runRulesWithDefaults({ rules: [draftRule] });
 
     expect(createSpy).toHaveBeenCalledTimes(1);
-    const createdActions =
-      createSpy.mock.calls[0]?.[0]?.data?.actionItems?.createMany?.data;
+    const createdActions = getCreatedActionItems(createSpy);
     expect(createdActions).toEqual([
       expect.objectContaining({
         type: ActionType.DRAFT_EMAIL,
@@ -330,6 +444,12 @@ describe("runRules draft attribution persistence", () => {
         draftModelProvider: "openai",
         draftModelName: "gpt-5.1",
         draftPipelineVersion: 1,
+        selectedAttachments: [
+          expect.objectContaining({
+            driveConnectionId: "drive-1",
+            fileId: "file-1",
+          }),
+        ],
       }),
     ]);
   });
@@ -342,10 +462,7 @@ describe("runRules draft attribution persistence", () => {
       }),
     ]);
 
-    vi.mocked(findMatchingRules).mockResolvedValue({
-      matches: [{ rule: draftRule, matchReasons: [] }],
-      reasoning: "Matched draft rule",
-    } as any);
+    mockMatchingRules([{ rule: draftRule, matchReasons: [] }]);
     prisma.executedRule.findFirst.mockResolvedValue(null);
     vi.mocked(getActionItemsWithAiArgs).mockResolvedValue([
       {
@@ -360,43 +477,12 @@ describe("runRules draft attribution persistence", () => {
       } as any,
     ]);
 
-    const createSpy = prisma.executedRule.create.mockResolvedValue({
-      id: "exec-1",
-      status: ExecutedRuleStatus.APPLYING,
-      ruleId: draftRule.id,
-      threadId,
-      messageId: "message-1",
-      actionItems: [],
-    } as any);
+    const createSpy = mockExecutedRuleCreate({ rule: draftRule });
 
-    await runRules({
-      provider: {} as any,
-      message: {
-        ...getEmail(),
-        id: "message-1",
-        threadId,
-        snippet: "",
-        historyId: "history-1",
-        inline: [],
-        attachments: [],
-        headers: {
-          from: "sender@example.com",
-          to: "user@example.com",
-          subject: "Subject",
-          date: "Mon, 1 Jan 2026 12:00:00 +0000",
-          "message-id": "<message-1>",
-        },
-      } as any,
-      rules: [draftRule],
-      emailAccount: getEmailAccount(),
-      isTest: false,
-      modelType: "default" as any,
-      logger,
-    });
+    await runRulesWithDefaults({ rules: [draftRule] });
 
     expect(createSpy).toHaveBeenCalledTimes(1);
-    const createdActions =
-      createSpy.mock.calls[0]?.[0]?.data?.actionItems?.createMany?.data;
+    const createdActions = getCreatedActionItems(createSpy);
     expect(createdActions).toHaveLength(1);
     expect(createdActions?.[0]).toEqual(
       expect.objectContaining({
@@ -407,6 +493,190 @@ describe("runRules draft attribution persistence", () => {
         draftPipelineVersion: null,
       }),
     );
+  });
+
+  it("skips draft messaging channel actions without a channel", async () => {
+    const draftRule = createRule("draft-rule", SystemType.TO_REPLY, [
+      getAction({
+        id: "draft-action-1",
+        type: ActionType.DRAFT_EMAIL,
+      }),
+      getAction({
+        id: "stale-channel-action",
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingChannelId: null,
+      }),
+      getAction({
+        id: "channel-action-1",
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingChannelId: "channel-1",
+      }),
+    ]);
+
+    mockMatchingRules([{ rule: draftRule, matchReasons: [] }]);
+    prisma.executedRule.findFirst.mockResolvedValue(null);
+    vi.mocked(getActionItemsWithAiArgs).mockResolvedValue([
+      getAction({
+        id: "draft-action-1",
+        type: ActionType.DRAFT_EMAIL,
+        content: "Generated draft content",
+      }),
+      getAction({
+        id: "stale-channel-action",
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingChannelId: null,
+        content: "Generated draft content",
+      }),
+      getAction({
+        id: "channel-action-1",
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingChannelId: "channel-1",
+        content: "Generated draft content",
+      }),
+    ] as any);
+
+    const createSpy = mockExecutedRuleCreate({ rule: draftRule });
+
+    await runRulesWithDefaults({ rules: [draftRule] });
+
+    const createdActions = getCreatedActionItems(createSpy);
+    expect(createdActions).toEqual([
+      expect.objectContaining({
+        type: ActionType.DRAFT_EMAIL,
+      }),
+      expect.objectContaining({
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingChannelId: "channel-1",
+      }),
+    ]);
+  });
+
+  it("keeps a configured draft messaging channel when another matched rule has no channel", async () => {
+    const emailOnlyRule = createRule("email-only-rule", null, [
+      getAction({
+        id: "email-draft-action",
+        type: ActionType.DRAFT_EMAIL,
+        content: null,
+        ruleId: "email-only-rule",
+      }),
+    ]);
+    const channelRule = createRule("channel-rule", null, [
+      getAction({
+        id: "channel-draft-action",
+        type: ActionType.DRAFT_EMAIL,
+        content: null,
+        ruleId: "channel-rule",
+      }),
+      getAction({
+        id: "channel-delivery-action",
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        content: null,
+        messagingChannelId: "channel-1",
+        ruleId: "channel-rule",
+      }),
+    ]);
+
+    mockMatchingRules([
+      {
+        rule: emailOnlyRule,
+        matchReasons: [{ type: ConditionType.STATIC }],
+      },
+      {
+        rule: channelRule,
+        matchReasons: [{ type: ConditionType.STATIC }],
+      },
+    ]);
+    prisma.executedRule.findFirst.mockResolvedValue(null);
+    vi.mocked(getActionItemsWithAiArgs).mockImplementation(
+      async ({ selectedRule }) =>
+        selectedRule.actions.map((action) => ({
+          ...action,
+          content: isDraftReplyActionType(action.type)
+            ? "Generated draft content"
+            : action.content,
+        })),
+    );
+
+    const createdActionsByRule = new Map<string | null, ActionType[]>();
+    const createdMessagingChannelsByRule = new Map<
+      string | null,
+      Array<string | null | undefined>
+    >();
+    (prisma.executedRule.create as any).mockImplementation(
+      async (args: any) => {
+        const actionItems = args.data.actionItems?.createMany?.data || [];
+        const ruleId = args.data.rule?.connect?.id ?? null;
+        createdActionsByRule.set(
+          ruleId,
+          actionItems.map((action: any) => action.type),
+        );
+        createdMessagingChannelsByRule.set(
+          ruleId,
+          actionItems.map((action: any) => action.messagingChannelId),
+        );
+
+        return {
+          id: `exec-${createdActionsByRule.size}`,
+          status: ExecutedRuleStatus.APPLYING,
+          ruleId,
+          threadId,
+          messageId: "message-1",
+          actionItems: actionItems.map((action: any, index: number) => ({
+            ...action,
+            id: action.id || `action-${createdActionsByRule.size}-${index}`,
+            executedRuleId: `exec-${createdActionsByRule.size}`,
+          })),
+        };
+      },
+    );
+
+    await runRulesWithDefaults({
+      rules: [emailOnlyRule, channelRule],
+    });
+
+    expect(createdActionsByRule.get("email-only-rule")).toEqual([
+      ActionType.DRAFT_EMAIL,
+      ActionType.DRAFT_MESSAGING_CHANNEL,
+    ]);
+    expect(createdMessagingChannelsByRule.get("email-only-rule")).toEqual([
+      null,
+      "channel-1",
+    ]);
+    expect(createdActionsByRule.get("channel-rule")).toEqual([]);
+  });
+
+  it("returns the final status after immediate actions execute", async () => {
+    const draftRule = createRule("draft-rule", SystemType.TO_REPLY, [
+      getAction({
+        id: "draft-action-1",
+        type: ActionType.DRAFT_EMAIL,
+      }),
+    ]);
+
+    mockMatchingRules([{ rule: draftRule, matchReasons: [] }]);
+    prisma.executedRule.findFirst.mockResolvedValue(null);
+    vi.mocked(getActionItemsWithAiArgs).mockResolvedValue([
+      getAction({
+        id: "draft-action-1",
+        type: ActionType.DRAFT_EMAIL,
+        content: "Generated draft content",
+      }),
+    ] as any);
+    vi.mocked(executeAct).mockResolvedValue(ExecutedRuleStatus.APPLIED);
+    mockExecutedRuleCreate({
+      rule: draftRule,
+      actionItems: [
+        getAction({
+          id: "draft-action-1",
+          type: ActionType.DRAFT_EMAIL,
+          content: "Generated draft content",
+        }),
+      ],
+    });
+
+    const results = await runRulesWithDefaults({ rules: [draftRule] });
+
+    expect(results[0]?.status).toBe(ExecutedRuleStatus.APPLIED);
   });
 });
 
@@ -434,25 +704,14 @@ describe("runRules outbound guardrails", () => {
       reasoning: "Matched forward rule",
     } as any);
 
-    const createSpy = prisma.executedRule.create.mockResolvedValue({
+    const createSpy = mockExecutedRuleCreate({
       id: "exec-guard-1",
       status: ExecutedRuleStatus.SKIPPED,
-      ruleId: forwardRule.id,
-      threadId,
-      messageId: "message-1",
-      actionItems: [],
-    } as any);
+      rule: forwardRule,
+    });
 
-    const result = await runRules({
-      provider: {} as any,
-      message: {
-        ...getEmail(),
-        id: "message-1",
-        threadId,
-        snippet: "",
-        historyId: "history-1",
-        inline: [],
-        attachments: [],
+    const result = await runRulesWithDefaults({
+      message: getRunRulesMessage({
         headers: {
           from: "Team Billing <billing@example.com>",
           to: "user@example.com",
@@ -460,12 +719,8 @@ describe("runRules outbound guardrails", () => {
           date: "Mon, 1 Jan 2026 12:00:00 +0000",
           "message-id": "<message-1>",
         },
-      } as any,
+      }),
       rules: [forwardRule],
-      emailAccount: getEmailAccount(),
-      isTest: false,
-      modelType: "default" as any,
-      logger,
     });
 
     expect(getActionItemsWithAiArgs).not.toHaveBeenCalled();
@@ -503,16 +758,8 @@ describe("runRules selection metadata", () => {
       },
     } as any);
 
-    const result = await runRules({
-      provider: {} as any,
-      message: {
-        ...getEmail(),
-        id: "message-1",
-        threadId,
-        snippet: "",
-        historyId: "history-1",
-        inline: [],
-        attachments: [],
+    const result = await runRulesWithDefaults({
+      message: getRunRulesMessage({
         headers: {
           from: "alerts@example.com",
           to: "user@example.com",
@@ -520,12 +767,9 @@ describe("runRules selection metadata", () => {
           date: "Mon, 1 Jan 2026 12:00:00 +0000",
           "message-id": "<message-1>",
         },
-      } as any,
+      }),
       rules: [regularRule],
-      emailAccount: getEmailAccount(),
       isTest: true,
-      modelType: "default" as any,
-      logger,
     });
 
     expect(result).toHaveLength(1);
@@ -884,6 +1128,49 @@ describe("limitDraftEmailActions", () => {
     expect(result[0].rule.actions[0].id).toBe("draft-guest");
     expect(result[1].rule.actions).toEqual([]);
   });
+
+  it("moves configured draft messaging delivery to the selected draft rule", () => {
+    const emailOnlyRule = createRule("email-only-rule", null, [
+      getAction({
+        id: "email-draft-action",
+        type: ActionType.DRAFT_EMAIL,
+        content: null,
+        ruleId: "email-only-rule",
+      }),
+    ]);
+    const channelRule = createRule("channel-rule", null, [
+      getAction({
+        id: "channel-draft-action",
+        type: ActionType.DRAFT_EMAIL,
+        content: null,
+        ruleId: "channel-rule",
+      }),
+      getAction({
+        id: "channel-delivery-action",
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        content: null,
+        messagingChannelId: "channel-1",
+        ruleId: "channel-rule",
+      }),
+    ]);
+
+    const result = limitDraftEmailActions(
+      [{ rule: emailOnlyRule }, { rule: channelRule }],
+      logger,
+    );
+
+    expect(result[0].rule.actions.map((action) => action.type)).toEqual([
+      ActionType.DRAFT_EMAIL,
+      ActionType.DRAFT_MESSAGING_CHANNEL,
+    ]);
+    expect(result[0].rule.actions[1]).toEqual(
+      expect.objectContaining({
+        type: ActionType.DRAFT_MESSAGING_CHANNEL,
+        messagingChannelId: "channel-1",
+      }),
+    );
+    expect(result[1].rule.actions).toEqual([]);
+  });
 });
 
 describe("runRules - double draft prevention", () => {
@@ -891,18 +1178,173 @@ describe("runRules - double draft prevention", () => {
     vi.clearAllMocks();
   });
 
-  it("executes only one DRAFT_EMAIL when custom rule and TO_REPLY both have drafts", async () => {
-    const { findMatchingRules } = await import(
-      "@/utils/ai/choose-rule/match-rules"
-    );
-    const { determineConversationStatus } = await import(
-      "@/utils/reply-tracker/handle-conversation-status"
-    );
-    const { getActionItemsWithAiArgs } = await import(
-      "@/utils/ai/choose-rule/choose-args"
-    );
-    const { executeAct } = await import("@/utils/ai/choose-rule/execute");
+  it("keeps a reply draft when an AI-selected calendar message needs a response", async () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR, [
+      getAction({
+        id: "label-calendar",
+        type: ActionType.LABEL,
+        label: "Calendar",
+        ruleId: "calendar-rule",
+      }),
+    ]);
+    const toReplyWithDraft = createRule("to-reply-rule", SystemType.TO_REPLY, [
+      getAction({
+        id: "label-to-reply",
+        type: ActionType.LABEL,
+        label: "To Reply",
+        ruleId: "to-reply-rule",
+      }),
+      getAction({
+        id: "draft-to-reply",
+        type: ActionType.DRAFT_EMAIL,
+        content: null,
+        ruleId: "to-reply-rule",
+      }),
+    ]);
 
+    vi.mocked(findMatchingRules).mockResolvedValue({
+      matches: [
+        {
+          rule: calendarRule,
+          matchReasons: [{ type: ConditionType.AI }],
+        },
+      ],
+      reasoning: "Scheduling conversation",
+    });
+
+    vi.mocked(determineConversationStatus).mockResolvedValue({
+      rule: toReplyWithDraft,
+      reason: "Email needs a reply",
+    });
+
+    vi.mocked(getActionItemsWithAiArgs).mockImplementation(
+      async ({ selectedRule }) =>
+        selectedRule.actions.map((action) => ({
+          ...action,
+          type: action.type as ActionType,
+        })),
+    );
+
+    prisma.executedRule.findFirst.mockResolvedValue(null);
+
+    const createdActionTypes: ActionType[][] = [];
+    (prisma.executedRule.create as any).mockImplementation(
+      async (args: any) => {
+        const actionItems = args.data.actionItems?.createMany?.data || [];
+        createdActionTypes.push(actionItems.map((action: any) => action.type));
+        return {
+          id: `exec-${createdActionTypes.length}`,
+          status: ExecutedRuleStatus.APPLYING,
+          ruleId: args.data.rule?.connect?.id ?? null,
+          threadId: args.data.threadId,
+          messageId: args.data.messageId,
+          actionItems: actionItems.map((action: any, index: number) => ({
+            ...action,
+            id: action.id || `action-${createdActionTypes.length}-${index}`,
+            executedRuleId: `exec-${createdActionTypes.length}`,
+          })),
+        };
+      },
+    );
+
+    await runRulesWithDefaults({
+      message: getRunRulesMessage({
+        headers: {
+          from: "sender@example.com",
+          to: "user@example.com",
+          subject: "Lunch next week?",
+          date: "Mon, 1 Jan 2026 12:00:00 +0000",
+          "message-id": "<message-1>",
+        },
+      }),
+      rules: [calendarRule, toReplyWithDraft],
+    });
+
+    expect(createdActionTypes).toEqual([
+      [ActionType.LABEL],
+      [ActionType.LABEL, ActionType.DRAFT_EMAIL],
+    ]);
+  });
+
+  it("does not resolve conversation status for calendar invite preset matches", async () => {
+    const calendarRule = createRule("calendar-rule", SystemType.CALENDAR, [
+      getAction({
+        id: "label-calendar",
+        type: ActionType.LABEL,
+        label: "Calendar",
+        ruleId: "calendar-rule",
+      }),
+    ]);
+    const toReplyWithDraft = createRule("to-reply-rule", SystemType.TO_REPLY, [
+      getAction({
+        id: "draft-to-reply",
+        type: ActionType.DRAFT_EMAIL,
+        content: null,
+        ruleId: "to-reply-rule",
+      }),
+    ]);
+
+    vi.mocked(findMatchingRules).mockResolvedValue({
+      matches: [
+        {
+          rule: calendarRule,
+          matchReasons: [
+            { type: ConditionType.PRESET, systemType: SystemType.CALENDAR },
+            { type: ConditionType.AI },
+          ],
+        },
+      ],
+      reasoning: "Calendar invite",
+    });
+
+    vi.mocked(getActionItemsWithAiArgs).mockImplementation(
+      async ({ selectedRule }) =>
+        selectedRule.actions.map((action) => ({
+          ...action,
+          type: action.type as ActionType,
+        })),
+    );
+
+    prisma.executedRule.findFirst.mockResolvedValue(null);
+
+    const createdActionTypes: ActionType[][] = [];
+    (prisma.executedRule.create as any).mockImplementation(
+      async (args: any) => {
+        const actionItems = args.data.actionItems?.createMany?.data || [];
+        createdActionTypes.push(actionItems.map((action: any) => action.type));
+        return {
+          id: `exec-${createdActionTypes.length}`,
+          status: ExecutedRuleStatus.APPLYING,
+          ruleId: args.data.rule?.connect?.id ?? null,
+          threadId: args.data.threadId,
+          messageId: args.data.messageId,
+          actionItems: actionItems.map((action: any, index: number) => ({
+            ...action,
+            id: action.id || `action-${createdActionTypes.length}-${index}`,
+            executedRuleId: `exec-${createdActionTypes.length}`,
+          })),
+        };
+      },
+    );
+
+    await runRulesWithDefaults({
+      message: getRunRulesMessage({
+        headers: {
+          from: "sender@example.com",
+          to: "user@example.com",
+          subject: "Calendar invite",
+          date: "Mon, 1 Jan 2026 12:00:00 +0000",
+          "message-id": "<message-1>",
+        },
+      }),
+      rules: [calendarRule, toReplyWithDraft],
+    });
+
+    expect(determineConversationStatus).not.toHaveBeenCalled();
+    expect(createdActionTypes).toEqual([[ActionType.LABEL]]);
+  });
+
+  it("executes only one DRAFT_EMAIL when custom rule and TO_REPLY both have drafts", async () => {
     const guestsRule = createRule("guests-rule", null, [
       getAction({
         id: "label-guest",
@@ -991,14 +1433,10 @@ describe("runRules - double draft prevention", () => {
       attachments: [],
     } as any;
 
-    await runRules({
-      provider: {} as any,
+    await runRulesWithDefaults({
       message,
       rules: [guestsRule, toReplyWithDraft],
-      emailAccount: getEmailAccount(),
-      isTest: false,
-      modelType: "actionable" as any,
-      logger,
+      modelType: "actionable",
     });
 
     expect(executedDraftContents).toHaveLength(1);
@@ -1007,3 +1445,85 @@ describe("runRules - double draft prevention", () => {
     );
   });
 });
+
+function mockMatchingRules(
+  matches: {
+    rule: RuleWithActions;
+    matchReasons?: { type: ConditionType }[];
+  }[],
+  reasoning = "Matched draft rule",
+) {
+  vi.mocked(findMatchingRules).mockResolvedValue({
+    matches,
+    reasoning,
+  } as any);
+}
+
+function mockExecutedRuleCreate({
+  id = "exec-1",
+  rule,
+  status = ExecutedRuleStatus.APPLYING,
+  actionItems = [],
+}: {
+  id?: string;
+  rule: RuleWithActions;
+  status?: ExecutedRuleStatus;
+  actionItems?: Action[];
+}) {
+  return prisma.executedRule.create.mockResolvedValue({
+    id,
+    status,
+    ruleId: rule.id,
+    threadId,
+    messageId: "message-1",
+    actionItems,
+  } as any);
+}
+
+function getCreatedActionItems(
+  createSpy: ReturnType<typeof mockExecutedRuleCreate>,
+) {
+  return createSpy.mock.calls[0]?.[0]?.data?.actionItems?.createMany?.data;
+}
+
+function runRulesWithDefaults(
+  overrides: Partial<Parameters<typeof runRules>[0]> & { modelType?: string },
+) {
+  return runRules({
+    provider: {} as any,
+    message: getRunRulesMessage(),
+    rules: [],
+    emailAccount: getEmailAccount(),
+    isTest: false,
+    modelType: "default",
+    logger,
+    ...overrides,
+  } as Parameters<typeof runRules>[0]);
+}
+
+function getRunRulesMessage(
+  overrides: Record<string, unknown> & {
+    headers?: Record<string, string>;
+  } = {},
+) {
+  const { headers, ...messageOverrides } = overrides;
+
+  return {
+    ...getEmail(),
+    id: "message-1",
+    threadId,
+    snippet: "",
+    historyId: "history-1",
+    inline: [],
+    attachments: [],
+    headers: {
+      from: "sender@example.com",
+      to: "user@example.com",
+      subject: "Subject",
+      date: "Mon, 1 Jan 2026 12:00:00 +0000",
+      "message-id": "<message-1>",
+      ...headers,
+    },
+    ...messageOverrides,
+  } as any;
+}

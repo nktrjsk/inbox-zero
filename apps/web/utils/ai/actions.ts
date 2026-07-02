@@ -1,9 +1,13 @@
 import { after } from "next/server";
 import { ActionType, MessagingMessageStatus } from "@/generated/prisma/enums";
-import type { ExecutedRule } from "@/generated/prisma/client";
 import type { Logger } from "@/utils/logger";
 import { callWebhook } from "@/utils/webhook";
-import type { ActionItem, EmailForAction } from "@/utils/ai/types";
+import type {
+  ActionExecutionEmailAccount,
+  ActionItem,
+  EmailForAction,
+  ExecutedRuleForAction,
+} from "@/utils/ai/types";
 import type { EmailProvider } from "@/utils/email/types";
 import { enqueueDigestItem } from "@/utils/digest/index";
 import { filterNullProperties } from "@/utils";
@@ -21,40 +25,38 @@ import {
   sendMessagingRuleNotification,
 } from "@/utils/messaging/rule-notifications";
 import { isMessagingDraftActionType } from "@/utils/actions/draft-reply";
+import { checkHasAccess } from "@/utils/premium/server";
+import { handlePreviousDraftDeletion } from "@/utils/ai/choose-rule/draft-management";
 
 const MODULE = "ai-actions";
-
-type ExecutedRuleForAction = ExecutedRule & {
-  actionItems?: Pick<ActionItem, "type">[];
-};
 
 type ActionFunction<T extends Partial<Omit<ActionItem, "type">>> = (options: {
   client: EmailProvider;
   email: EmailForAction;
   args: T & Pick<ActionItem, "id">;
-  userEmail: string;
-  userId: string;
-  emailAccountId: string;
+  emailAccount: ActionExecutionEmailAccount;
   executedRule: ExecutedRuleForAction;
   logger: Logger;
 }) => Promise<unknown>;
+
+type MessagingNotificationActionType =
+  | typeof ActionType.DRAFT_MESSAGING_CHANNEL
+  | typeof ActionType.NOTIFY_MESSAGING_CHANNEL;
 
 export const runActionFunction = async (options: {
   client: EmailProvider;
   email: EmailForAction;
   action: ActionItem;
-  userEmail: string;
-  userId: string;
-  emailAccountId: string;
+  emailAccount: ActionExecutionEmailAccount;
   executedRule: ExecutedRuleForAction;
   logger: Logger;
 }) => {
-  const { action, userEmail, logger } = options;
+  const { action, emailAccount, logger } = options;
   const log = logger.with({ module: MODULE });
 
   log.info("Running action", {
     actionType: action.type,
-    userEmail,
+    userEmail: emailAccount.email,
     id: action.id,
   });
   log.trace("Running action", () => filterNullProperties(action));
@@ -91,6 +93,8 @@ export const runActionFunction = async (options: {
       return call_webhook(opts);
     case ActionType.MARK_READ:
       return mark_read(opts);
+    case ActionType.STAR:
+      return star(opts);
     case ActionType.DIGEST:
       return digest(opts);
     case ActionType.MOVE_FOLDER:
@@ -105,15 +109,15 @@ export const runActionFunction = async (options: {
 const archive: ActionFunction<Record<string, unknown>> = async ({
   client,
   email,
-  userEmail,
+  emailAccount,
 }) => {
-  await client.archiveThread(email.threadId, userEmail);
+  await client.archiveThread(email.threadId, emailAccount.email);
 };
 
 const label: ActionFunction<{
   label?: string | null;
   labelId?: string | null;
-}> = async ({ client, email, args, emailAccountId, logger }) => {
+}> = async ({ client, email, args, emailAccount, logger }) => {
   logger.info("Label action started", {
     label: args.label,
     labelId: args.labelId,
@@ -151,7 +155,7 @@ const label: ActionFunction<{
     messageId: email.id,
     labelId: labelIdToUse,
     labelName: args.label || null,
-    emailAccountId,
+    emailAccountId: emailAccount.id,
     logger,
   });
 
@@ -160,7 +164,7 @@ const label: ActionFunction<{
       lazyUpdateActionLabelId({
         labelName: args.label!,
         labelId: labelIdToUse!,
-        emailAccountId,
+        emailAccountId: emailAccount.id,
         logger,
       }),
     );
@@ -175,16 +179,8 @@ const draft: ActionFunction<{
   cc?: string | null;
   bcc?: string | null;
   staticAttachments?: ActionItem["staticAttachments"];
-}> = async ({
-  client,
-  email,
-  args,
-  userEmail,
-  userId,
-  emailAccountId,
-  executedRule,
-  logger,
-}) => {
+  selectedAttachments?: ActionItem["selectedAttachments"];
+}> = async ({ client, email, args, emailAccount, executedRule, logger }) => {
   if (env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED) return;
 
   if (
@@ -218,13 +214,27 @@ const draft: ActionFunction<{
     }
   }
 
+  const previousDraftHandling = await handlePreviousDraftDeletion({
+    client,
+    executedRule,
+    logger,
+  });
+
+  if (!previousDraftHandling.shouldCreateDraft) {
+    logger.info("Skipping draft creation", {
+      existingDraftId: previousDraftHandling.existingDraftId,
+      reason: previousDraftHandling.reason,
+    });
+    return { draftId: "" };
+  }
+
   const attachments = await resolveActionAttachments({
     email,
-    emailAccountId,
+    emailAccount,
     executedRule,
-    userId,
     logger,
     staticAttachments: args.staticAttachments,
+    selectedAttachments: args.selectedAttachments,
     includeAiSelectedAttachments: true,
   });
 
@@ -254,93 +264,45 @@ const draft: ActionFunction<{
       attachments: email.attachments,
     },
     draftArgs,
-    userEmail,
-    executedRule,
+    emailAccount.email,
   );
   return { draftId: result.draftId };
 };
 
 const draft_messaging_channel: ActionFunction<{
   messagingChannelId?: string | null;
-}> = async ({ email, args, logger }) => {
-  if (!args.id) {
-    throw new Error("Missing action id for DRAFT_MESSAGING_CHANNEL");
-  }
-
-  if (!args.messagingChannelId) {
-    await failMessagingAction({
-      actionId: args.id,
-      logger,
-      reason: "Missing messaging channel for DRAFT_MESSAGING_CHANNEL",
-    });
-  }
-
-  const delivered = await sendMessagingRuleNotification({
-    executedActionId: args.id,
+}> = async ({ email, args, logger }) =>
+  runMessagingNotificationAction({
+    actionId: args.id,
+    actionType: ActionType.DRAFT_MESSAGING_CHANNEL,
+    messagingChannelId: args.messagingChannelId,
     email,
     logger,
   });
-
-  if (delivered) return;
-
-  await failMessagingAction({
-    actionId: args.id,
-    logger,
-    reason: "Failed to deliver DRAFT_MESSAGING_CHANNEL notification",
-  });
-};
 
 const notify_messaging_channel: ActionFunction<{
   messagingChannelId?: string | null;
-}> = async ({ email, args, logger }) => {
-  if (!args.id) {
-    throw new Error("Missing action id for NOTIFY_MESSAGING_CHANNEL");
-  }
-
-  if (!args.messagingChannelId) {
-    await failMessagingAction({
-      actionId: args.id,
-      logger,
-      reason: "Missing messaging channel for NOTIFY_MESSAGING_CHANNEL",
-    });
-  }
-
-  const delivered = await sendMessagingRuleNotification({
-    executedActionId: args.id,
+}> = async ({ email, args, logger }) =>
+  runMessagingNotificationAction({
+    actionId: args.id,
+    actionType: ActionType.NOTIFY_MESSAGING_CHANNEL,
+    messagingChannelId: args.messagingChannelId,
     email,
     logger,
   });
-
-  if (delivered) return;
-
-  await failMessagingAction({
-    actionId: args.id,
-    logger,
-    reason: "Failed to deliver NOTIFY_MESSAGING_CHANNEL notification",
-  });
-};
 
 const reply: ActionFunction<{
   content?: string | null;
   cc?: string | null;
   bcc?: string | null;
   staticAttachments?: ActionItem["staticAttachments"];
-}> = async ({
-  client,
-  email,
-  args,
-  userId,
-  emailAccountId,
-  executedRule,
-  logger,
-}) => {
+}> = async ({ client, email, args, emailAccount, executedRule, logger }) => {
   if (!args.content) return;
 
   const attachments = await resolveActionAttachments({
     email,
-    emailAccountId,
+    emailAccount,
     executedRule,
-    userId,
     logger,
     staticAttachments: args.staticAttachments,
     includeAiSelectedAttachments: false,
@@ -372,22 +334,13 @@ const send_email: ActionFunction<{
   cc?: string | null;
   bcc?: string | null;
   staticAttachments?: ActionItem["staticAttachments"];
-}> = async ({
-  client,
-  args,
-  email,
-  userId,
-  emailAccountId,
-  executedRule,
-  logger,
-}) => {
+}> = async ({ client, args, email, emailAccount, executedRule, logger }) => {
   if (!args.to || !args.subject || !args.content) return;
 
   const attachments = await resolveActionAttachments({
     email,
-    emailAccountId,
+    emailAccount,
     executedRule,
-    userId,
     logger,
     staticAttachments: args.staticAttachments,
     includeAiSelectedAttachments: false,
@@ -447,7 +400,7 @@ const mark_spam: ActionFunction<Record<string, unknown>> = async ({
 const call_webhook: ActionFunction<{ url?: string | null }> = async ({
   email,
   args,
-  userId,
+  emailAccount,
   executedRule,
 }) => {
   if (!args.url) return;
@@ -471,7 +424,7 @@ const call_webhook: ActionFunction<{ url?: string | null }> = async ({
     },
   };
 
-  await callWebhook(userId, args.url, payload);
+  await callWebhook(emailAccount.userId, args.url, payload);
 };
 
 const mark_read: ActionFunction<Record<string, unknown>> = async ({
@@ -481,21 +434,42 @@ const mark_read: ActionFunction<Record<string, unknown>> = async ({
   await client.markRead(email.threadId);
 };
 
+const star: ActionFunction<Record<string, unknown>> = async ({
+  client,
+  email,
+}) => {
+  await client.starMessage(email.id);
+};
+
 const digest: ActionFunction<{ id?: string }> = async ({
   email,
-  emailAccountId,
+  emailAccount,
   args,
   logger,
 }) => {
   if (!args.id) return;
+  const hasDigestAccess = await checkHasAccess({
+    userId: emailAccount.userId,
+    minimumTier: "PLUS_MONTHLY",
+  });
+  if (!hasDigestAccess) {
+    logger.info("Skipping digest action because plan does not include it");
+    return;
+  }
+
   const actionId = args.id;
-  await enqueueDigestItem({ email, emailAccountId, actionId, logger });
+  await enqueueDigestItem({
+    email,
+    emailAccountId: emailAccount.id,
+    actionId,
+    logger,
+  });
 };
 
 const move_folder: ActionFunction<{
   folderId?: string | null;
   folderName?: string | null;
-}> = async ({ client, email, userEmail, emailAccountId, args, logger }) => {
+}> = async ({ client, email, emailAccount, args, logger }) => {
   const originalFolderId = args.folderId;
   let folderIdToUse = originalFolderId;
 
@@ -519,7 +493,11 @@ const move_folder: ActionFunction<{
 
   if (!folderIdToUse) return;
 
-  await client.moveThreadToFolder(email.threadId, userEmail, folderIdToUse);
+  await client.moveThreadToFolder(
+    email.threadId,
+    emailAccount.email,
+    folderIdToUse,
+  );
 
   // lazy-update the folderId in the database for future runs
   if (!originalFolderId && folderIdToUse && args.folderName) {
@@ -527,7 +505,7 @@ const move_folder: ActionFunction<{
       lazyUpdateActionFolderId({
         folderName: args.folderName!,
         folderId: folderIdToUse!,
-        emailAccountId,
+        emailAccountId: emailAccount.id,
         logger,
       }),
     );
@@ -536,8 +514,7 @@ const move_folder: ActionFunction<{
 
 const notify_sender: ActionFunction<Record<string, unknown>> = async ({
   email,
-  emailAccountId,
-  userEmail,
+  emailAccount,
   logger,
 }) => {
   const senderEmail = extractEmailAddress(email.headers.from);
@@ -548,7 +525,7 @@ const notify_sender: ActionFunction<Record<string, unknown>> = async ({
 
   const result = await sendColdEmailNotification({
     senderEmail,
-    recipientEmail: userEmail,
+    recipientEmail: emailAccount.email,
     originalSubject: email.headers.subject,
     originalMessageId: email.headers["message-id"],
     logger,
@@ -570,7 +547,7 @@ const notify_sender: ActionFunction<Record<string, unknown>> = async ({
     captureException(
       new Error(result.error ?? "Cold email notification failed"),
       {
-        emailAccountId,
+        emailAccountId: emailAccount.id,
         extra: { actionType: ActionType.NOTIFY_SENDER },
         sampleRate: 0.01,
       },
@@ -651,7 +628,7 @@ async function lazyUpdateActionFolderId({
   }
 }
 
-async function failMessagingAction({
+async function markMessagingActionFailed({
   actionId,
   logger,
   reason,
@@ -659,7 +636,7 @@ async function failMessagingAction({
   actionId: string;
   logger: Logger;
   reason: string;
-}): Promise<never> {
+}) {
   try {
     await prisma.executedAction.update({
       where: { id: actionId },
@@ -673,8 +650,49 @@ async function failMessagingAction({
       error,
     });
   }
+  logger.warn(reason, { actionId });
+}
 
-  throw new Error(reason);
+async function runMessagingNotificationAction({
+  actionId,
+  actionType,
+  messagingChannelId,
+  email,
+  logger,
+}: {
+  actionId?: string | null;
+  actionType: MessagingNotificationActionType;
+  messagingChannelId?: string | null;
+  email: EmailForAction;
+  logger: Logger;
+}) {
+  if (!actionId) {
+    throw new Error(`Missing action id for ${actionType}`);
+  }
+
+  if (!messagingChannelId) {
+    await markMessagingActionFailed({
+      actionId,
+      logger,
+      reason: `Missing messaging channel for ${actionType}`,
+    });
+    return { success: false, errorCode: "MISSING_MESSAGING_CHANNEL" };
+  }
+
+  const delivered = await sendMessagingRuleNotification({
+    executedActionId: actionId,
+    email,
+    logger,
+  });
+
+  if (delivered) return { success: true };
+
+  await markMessagingActionFailed({
+    actionId,
+    logger,
+    reason: `Failed to deliver ${actionType} notification`,
+  });
+  return { success: false, errorCode: "MESSAGING_DELIVERY_FAILED" };
 }
 
 function isLegacyMessagingDraft({

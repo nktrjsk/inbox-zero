@@ -8,12 +8,14 @@ import { createDriveProviderWithRefresh } from "@/utils/drive/provider";
 import { createAndSaveFilingFolder } from "@/utils/drive/folder-utils";
 import { extractTextFromDocument } from "@/utils/drive/document-extraction";
 import { analyzeDocument } from "@/utils/ai/document-filing/analyze-document";
+import { isDuplicateError } from "@/utils/prisma-helpers";
 import {
   sendFiledNotification,
   sendAskNotification,
 } from "@/utils/drive/filing-notifications";
 import { sendFilingMessagingNotifications } from "@/utils/drive/filing-messaging-notifications";
 import { extractEmailAddress } from "@/utils/email";
+import { isCalendarInviteAttachment } from "@/utils/parse/calender-event";
 
 // ============================================================================
 // Types
@@ -50,6 +52,9 @@ export interface ProcessAttachmentOptions {
   sendNotification?: boolean;
 }
 
+const DUPLICATE_FILING_FIELDS = ["emailAccountId", "messageId", "attachmentId"];
+const PROCESSING_FILING_STALE_MS = 30 * 60 * 1000;
+
 // ============================================================================
 // Main Filing Engine
 // ============================================================================
@@ -76,6 +81,7 @@ export async function processAttachment({
     messageId: message.id,
     filename: attachment.filename,
   });
+  let claimedFilingId: string | null = null;
 
   try {
     // Validate filing is enabled with a prompt
@@ -84,18 +90,43 @@ export async function processAttachment({
       return { success: false, error: "Filing not enabled" };
     }
 
-    // Get all connected drives
-    const driveConnections = await prisma.driveConnection.findMany({
-      where: {
-        emailAccountId: emailAccount.id,
-        isConnected: true,
-      },
-    });
+    const attachmentLookup = {
+      emailAccountId: emailAccount.id,
+      messageId: message.id,
+      attachmentId: attachment.attachmentId,
+    };
 
+    const [existingFiling, driveConnections] = await Promise.all([
+      findAttachmentFiling(attachmentLookup),
+      prisma.driveConnection.findMany({
+        where: {
+          emailAccountId: emailAccount.id,
+          isConnected: true,
+        },
+      }),
+    ]);
+
+    if (existingFiling && !isClaimableFiling(existingFiling)) {
+      return getExistingFilingResult(existingFiling, log);
+    }
+
+    // ERROR and stale PROCESSING claim the row, so wait until drives are
+    // available; otherwise an early "no drives" return would leave the row
+    // stuck in PROCESSING.
     if (driveConnections.length === 0) {
       log.info("No connected drives");
       return { success: false, error: "No connected drives" };
     }
+
+    const claim = await claimAttachmentFiling({
+      existingFiling,
+      attachmentLookup,
+      attachment,
+      driveConnectionId: driveConnections[0].id,
+      logger: log,
+    });
+    if (claim.type === "return") return claim.result;
+    claimedFilingId = claim.filingId;
 
     // Step 1: Download attachment
     log.info("Downloading attachment");
@@ -168,19 +199,20 @@ export async function processAttachment({
     if (analysis.action === "skip") {
       log.info("AI decided to skip this document");
 
-      // Create a DocumentFiling record for skipped items (for audit trail and feedback)
-      const skipFiling = await prisma.documentFiling.create({
-        data: {
-          messageId: message.id,
-          attachmentId: attachment.attachmentId,
-          filename: attachment.filename,
-          folderPath: "",
-          status: "PREVIEW", // PREVIEW = AI decided to skip (not user rejection)
-          reasoning: analysis.reasoning,
-          confidence: analysis.confidence,
-          driveConnectionId: driveConnections[0].id,
-          emailAccountId: emailAccount.id,
-        },
+      const skipFilingData = {
+        messageId: message.id,
+        attachmentId: attachment.attachmentId,
+        filename: attachment.filename,
+        folderPath: "",
+        status: "PREVIEW" as const, // PREVIEW = AI decided to skip (not user rejection)
+        reasoning: analysis.reasoning,
+        confidence: analysis.confidence,
+        driveConnectionId: driveConnections[0].id,
+        emailAccountId: emailAccount.id,
+      };
+      const skipFiling = await prisma.documentFiling.update({
+        where: { id: claimedFilingId },
+        data: skipFilingData,
       });
 
       log.info("Skip record created", { filingId: skipFiling.id });
@@ -237,22 +269,24 @@ export async function processAttachment({
       fileId = uploadedFile.id;
     }
 
-    // Step 9: Create DocumentFiling record
-    const filing = await prisma.documentFiling.create({
-      data: {
-        messageId: message.id,
-        attachmentId: attachment.attachmentId,
-        filename: attachment.filename,
-        folderId: targetFolderId,
-        folderPath: targetFolderPath,
-        fileId,
-        reasoning: analysis.reasoning,
-        confidence: analysis.confidence,
-        status: shouldAsk ? "PENDING" : "FILED",
-        wasAsked: shouldAsk,
-        driveConnectionId: driveConnection.id,
-        emailAccountId: emailAccount.id,
-      },
+    // Step 9: Create or replace DocumentFiling record
+    const filingData = {
+      messageId: message.id,
+      attachmentId: attachment.attachmentId,
+      filename: attachment.filename,
+      folderId: targetFolderId,
+      folderPath: targetFolderPath,
+      fileId,
+      reasoning: analysis.reasoning,
+      confidence: analysis.confidence,
+      status: shouldAsk ? ("PENDING" as const) : ("FILED" as const),
+      wasAsked: shouldAsk,
+      driveConnectionId: driveConnection.id,
+      emailAccountId: emailAccount.id,
+    };
+    const filing = await prisma.documentFiling.update({
+      where: { id: claimedFilingId },
+      data: filingData,
     });
 
     log.info("Filing record created", {
@@ -273,6 +307,7 @@ export async function processAttachment({
         threadId: message.threadId,
         headerMessageId: message.headers["message-id"] || "",
         references: message.headers.references,
+        messageId: message.id,
       };
 
       try {
@@ -325,6 +360,20 @@ export async function processAttachment({
       },
     };
   } catch (error) {
+    if (claimedFilingId) {
+      try {
+        await prisma.documentFiling.update({
+          where: { id: claimedFilingId },
+          data: {
+            status: "ERROR",
+            reasoning: error instanceof Error ? error.message : "Unknown error",
+          },
+        });
+      } catch (cleanupError) {
+        log.error("Failed to mark filing as errored", { error: cleanupError });
+      }
+    }
+
     log.error("Error processing attachment", { error });
     return {
       success: false,
@@ -337,10 +386,13 @@ export async function processAttachment({
  * Get all filable attachments from a message.
  * All attachment types are supported - text-extractable files (PDF, DOCX, TXT)
  * get full content analysis, while other types (images, spreadsheets, etc.)
- * are filed based on filename and email metadata.
+ * are filed based on filename and email metadata. Calendar invite artifacts are
+ * excluded because they describe the email event rather than a user document.
  */
 export function getFilableAttachments(message: ParsedMessage): Attachment[] {
-  return message.attachments || [];
+  return (message.attachments || []).filter(
+    (attachment) => !isCalendarInviteAttachment(attachment),
+  );
 }
 
 // ============================================================================
@@ -360,6 +412,210 @@ interface FolderTarget {
   folderId: string;
   folderPath: string;
   needsToCreateFolder: boolean;
+}
+
+type AttachmentFiling = NonNullable<
+  Awaited<ReturnType<typeof findAttachmentFiling>>
+>;
+
+type ExistingFilingDecision =
+  | { type: "retry"; filingId: string }
+  | { type: "return"; result: FilingResult };
+
+type AttachmentLookup = {
+  emailAccountId: string;
+  messageId: string;
+  attachmentId: string;
+};
+
+function findAttachmentFiling({
+  emailAccountId,
+  messageId,
+  attachmentId,
+}: AttachmentLookup) {
+  return prisma.documentFiling.findFirst({
+    where: {
+      emailAccountId,
+      messageId,
+      attachmentId,
+    },
+    select: {
+      id: true,
+      filename: true,
+      folderPath: true,
+      fileId: true,
+      status: true,
+      updatedAt: true,
+      wasAsked: true,
+      confidence: true,
+      reasoning: true,
+      driveConnection: {
+        select: {
+          provider: true,
+        },
+      },
+    },
+  });
+}
+
+async function claimAttachmentFiling({
+  existingFiling,
+  attachmentLookup,
+  attachment,
+  driveConnectionId,
+  logger,
+}: {
+  existingFiling: AttachmentFiling | null;
+  attachmentLookup: AttachmentLookup;
+  attachment: Attachment;
+  driveConnectionId: string;
+  logger: Logger;
+}): Promise<ExistingFilingDecision> {
+  if (existingFiling) {
+    return claimOrResolveExistingFiling(existingFiling, logger);
+  }
+
+  try {
+    const processingFiling = await prisma.documentFiling.create({
+      data: {
+        ...attachmentLookup,
+        filename: attachment.filename,
+        folderPath: "",
+        status: "PROCESSING",
+        driveConnectionId,
+      },
+    });
+    return { type: "retry", filingId: processingFiling.id };
+  } catch (claimError) {
+    if (!isDuplicateError(claimError, DUPLICATE_FILING_FIELDS)) {
+      throw claimError;
+    }
+
+    const claimedFiling = await findAttachmentFiling(attachmentLookup);
+    if (!claimedFiling) throw claimError;
+
+    logger.info("Attachment was claimed by another filing process", {
+      filingId: claimedFiling.id,
+      status: claimedFiling.status,
+    });
+
+    return claimOrResolveExistingFiling(claimedFiling, logger);
+  }
+}
+
+async function claimOrResolveExistingFiling(
+  filing: AttachmentFiling,
+  logger: Logger,
+): Promise<ExistingFilingDecision> {
+  logger.info("Attachment already has a filing record", {
+    filingId: filing.id,
+    status: filing.status,
+  });
+
+  if (filing.status === "ERROR") {
+    const claim = await prisma.documentFiling.updateMany({
+      where: {
+        id: filing.id,
+        status: "ERROR",
+      },
+      data: {
+        status: "PROCESSING",
+        reasoning: null,
+        updatedAt: new Date(),
+      },
+    });
+
+    if (claim.count === 1) {
+      logger.info("Retrying attachment after previous filing error", {
+        filingId: filing.id,
+      });
+      return { type: "retry", filingId: filing.id };
+    }
+
+    return alreadyProcessing(filing.id);
+  }
+
+  if (filing.status === "PREVIEW") {
+    return { type: "return", result: getExistingFilingResult(filing) };
+  }
+
+  if (filing.status === "PROCESSING") {
+    const staleCutoff = new Date(Date.now() - PROCESSING_FILING_STALE_MS);
+
+    if (filing.updatedAt <= staleCutoff) {
+      const claim = await prisma.documentFiling.updateMany({
+        where: {
+          id: filing.id,
+          status: "PROCESSING",
+          updatedAt: { lte: staleCutoff },
+        },
+        data: {
+          reasoning: null,
+          updatedAt: new Date(),
+        },
+      });
+
+      if (claim.count === 1) {
+        logger.info("Retrying stale attachment filing claim", {
+          filingId: filing.id,
+        });
+        return { type: "retry", filingId: filing.id };
+      }
+    }
+
+    return alreadyProcessing(filing.id);
+  }
+
+  return { type: "return", result: getExistingFilingResult(filing) };
+}
+
+function alreadyProcessing(filingId: string): ExistingFilingDecision {
+  return {
+    type: "return",
+    result: {
+      success: false,
+      error: "Attachment is already being filed",
+      filingId,
+    },
+  };
+}
+
+function isClaimableFiling(filing: AttachmentFiling) {
+  return filing.status === "ERROR" || filing.status === "PROCESSING";
+}
+
+function getExistingFilingResult(
+  filing: AttachmentFiling,
+  logger?: Logger,
+): FilingResult {
+  logger?.info("Attachment already has a filing record", {
+    filingId: filing.id,
+    status: filing.status,
+  });
+
+  if (filing.status === "PREVIEW") {
+    return {
+      success: false,
+      skipped: true,
+      skipReason:
+        filing.reasoning || "Document doesn't match filing preferences",
+      filingId: filing.id,
+    };
+  }
+
+  return {
+    success: true,
+    filing: {
+      id: filing.id,
+      filename: filing.filename,
+      folderPath: filing.folderPath,
+      fileId: filing.fileId,
+      wasAsked: filing.wasAsked,
+      confidence: filing.confidence,
+      provider: filing.driveConnection.provider,
+    },
+    filingId: filing.id,
+  };
 }
 
 function resolveFolderTarget(

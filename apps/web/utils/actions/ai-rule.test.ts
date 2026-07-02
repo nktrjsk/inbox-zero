@@ -13,7 +13,6 @@ const {
   runRulesMock: vi.fn(),
 }));
 
-vi.mock("server-only", () => ({}));
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/auth", () => ({
   auth: vi.fn(async () => ({
@@ -33,7 +32,10 @@ vi.mock("@/utils/ai/choose-rule/run-rules", () => ({
   runRules: runRulesMock,
 }));
 
-import { runRulesAction } from "@/utils/actions/ai-rule";
+import {
+  runRulesAction,
+  testAiCustomContentAction,
+} from "@/utils/actions/ai-rule";
 
 describe("runRulesAction", () => {
   beforeEach(() => {
@@ -161,6 +163,112 @@ describe("runRulesAction", () => {
       expect.objectContaining({
         action: "runRules",
         flushReason: "test-mode",
+      }),
+    );
+  });
+
+  it("flushes logs when a test-mode run fails before returning", async () => {
+    createEmailProviderMock.mockRejectedValueOnce(
+      new Error("provider unavailable"),
+    );
+
+    const result = await runRulesAction("account-1", {
+      messageId: "message-1",
+      threadId: "thread-1",
+      isTest: true,
+    });
+
+    expect(result?.serverError).toBe("An unknown error occurred.");
+    expect(flushLoggerSafelyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "runRules",
+        flushReason: "test-mode-error",
+        stage: "create-email-provider",
+      }),
+    );
+  });
+});
+
+describe("testAiCustomContentAction", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      email: "user@example.com",
+      account: {
+        userId: "user-1",
+        provider: "google",
+      },
+    } as any);
+
+    prisma.rule.findMany.mockResolvedValue([] as any);
+
+    getEmailAccountForRuleExecutionMock.mockResolvedValue({
+      id: "account-1",
+      email: "user@example.com",
+      user: {},
+      account: { provider: "google" },
+    });
+
+    createEmailProviderMock.mockResolvedValue({});
+
+    runRulesMock.mockResolvedValue([
+      {
+        rule: null,
+        reason: "No rules matched",
+        status: "SKIPPED",
+        createdAt: new Date("2026-03-27T00:00:00.000Z"),
+      },
+    ]);
+
+    flushLoggerSafelyMock.mockResolvedValue(undefined);
+  });
+
+  it("passes a synthetic message whose id matches threadId so Gmail reply detection treats it as thread root", async () => {
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+
+    await testAiCustomContentAction("account-1", { content: "custom body" });
+
+    expect(runRulesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        isTest: true,
+        message: expect.objectContaining({
+          id: "testMessageId-1700000000000",
+          threadId: "testMessageId-1700000000000",
+          textPlain: "custom body",
+        }),
+      }),
+    );
+
+    nowSpy.mockRestore();
+  });
+
+  it("flushes logs after a custom content test run", async () => {
+    await testAiCustomContentAction("account-1", { content: "x" });
+
+    expect(flushLoggerSafelyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "testAiCustomContent",
+        flushReason: "test-mode",
+      }),
+    );
+  });
+
+  it("flushes logs when a custom content test run fails", async () => {
+    runRulesMock.mockRejectedValueOnce(new Error("rule execution failed"));
+
+    const result = await testAiCustomContentAction("account-1", {
+      content: "x",
+    });
+
+    expect(result?.serverError).toBe("An unknown error occurred.");
+    expect(flushLoggerSafelyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "testAiCustomContent",
+        flushReason: "test-mode-error",
       }),
     );
   });

@@ -2,7 +2,12 @@
 
 import { env } from "@/env";
 import { useUser } from "@/hooks/useUser";
-import { hasAiAccess, hasUnsubscribeAccess, isPremium } from "@/utils/premium";
+import {
+  getUserTier,
+  hasAiAccess,
+  hasUnsubscribeAccess,
+  isPremiumRecord,
+} from "@/utils/premium";
 
 export function usePremium() {
   const swrResponse = useUser();
@@ -23,14 +28,11 @@ export function usePremium() {
     };
   }
 
-  const isUserPremium = !!(
-    premium &&
-    isPremium(premium.lemonSqueezyRenewsAt, premium.stripeSubscriptionStatus)
-  );
+  const isUserPremium = isPremiumRecord(premium);
+  const tier = getUserTier(premium);
 
   const isProPlanWithoutApiKey =
-    (premium?.tier === "PRO_MONTHLY" || premium?.tier === "PRO_ANNUALLY") &&
-    !hasAiApiKey;
+    (tier === "PRO_MONTHLY" || tier === "PRO_ANNUALLY") && !hasAiApiKey;
 
   return {
     ...swrResponse,
@@ -38,9 +40,9 @@ export function usePremium() {
     isPremium: isUserPremium,
     hasUnsubscribeAccess:
       isUserPremium ||
-      hasUnsubscribeAccess(premium?.tier || null, premium?.unsubscribeCredits),
-    hasAiAccess: hasAiAccess(premium?.tier || null, hasAiApiKey),
+      hasUnsubscribeAccess(tier || null, premium?.unsubscribeCredits),
+    hasAiAccess: isUserPremium && hasAiAccess(tier || null, hasAiApiKey),
     isProPlanWithoutApiKey,
-    tier: premium?.tier,
+    tier,
   };
 }

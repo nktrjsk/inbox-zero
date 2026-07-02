@@ -2,8 +2,13 @@ import { NextResponse } from "next/server";
 import prisma from "@/utils/prisma";
 import { hasCronSecret, hasPostCronSecret } from "@/utils/cron";
 import { withError } from "@/utils/middleware";
-import { captureException } from "@/utils/error";
-import { hasAiAccess, getPremiumUserFilter } from "@/utils/premium";
+import { captureException, isInvalidGrantError } from "@/utils/error";
+import {
+  getPremiumUserFilter,
+  getUserTier,
+  hasAiAccess,
+  premiumEntitlementSelect,
+} from "@/utils/premium";
 import { createManagedOutlookSubscription } from "@/utils/outlook/subscription-manager";
 import type { Logger } from "@/utils/logger";
 
@@ -53,7 +58,9 @@ async function watchAllEmails(logger: Logger) {
       user: {
         select: {
           aiApiKey: true,
-          premium: { select: { tier: true } },
+          premium: {
+            select: premiumEntitlementSelect,
+          },
         },
       },
     },
@@ -72,7 +79,7 @@ async function watchAllEmails(logger: Logger) {
       });
 
       const userHasAiAccess = hasAiAccess(
-        emailAccount.user.premium?.tier || null,
+        getUserTier(emailAccount.user.premium),
         !!emailAccount.user.aiApiKey,
       );
 
@@ -112,13 +119,12 @@ async function watchAllEmails(logger: Logger) {
       });
     } catch (error) {
       if (error instanceof Error) {
-        const warn = [
-          "invalid_grant",
-          "Mail service not enabled",
-          "Insufficient Permission",
-        ];
+        const warn = ["Mail service not enabled", "Insufficient Permission"];
 
-        if (warn.some((w) => error.message.includes(w))) {
+        if (
+          isInvalidGrantError(error) ||
+          warn.some((w) => error.message.includes(w))
+        ) {
           logger.warn("Not watching emails for user", {
             email: emailAccount.email,
             error,

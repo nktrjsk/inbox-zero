@@ -1,16 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { MeetingBriefingData } from "@/utils/meeting-briefs/gather-context";
 
-vi.mock("server-only", () => ({}));
 vi.mock("@/env", () => ({
   env: {
     PERPLEXITY_API_KEY: "test-key",
-    DEFAULT_LLM_PROVIDER: "openai",
+    DEFAULT_LLMS: "openai:gpt-5.4-mini",
     EMAIL_ENCRYPT_SECRET: "test-encrypt-secret-for-testing",
     EMAIL_ENCRYPT_SALT: "test-encrypt-salt-for-testing",
   },
 }));
-vi.mock("@/utils/llms/model", () => ({ getModel: vi.fn() }));
+vi.mock("@/utils/llms/model", () => ({
+  getResolvedDeploymentRolePrimaryModelEntry: vi.fn(() => ({
+    provider: "openai",
+    modelName: "gpt-5.4-mini",
+  })),
+  getModel: vi.fn(),
+}));
 vi.mock("@/utils/llms", () => ({ createGenerateObject: vi.fn() }));
 vi.mock("@/utils/ai/helpers", () => ({
   getUserInfoPrompt: vi.fn(
@@ -40,9 +45,14 @@ vi.doUnmock("@/utils/date");
 
 import { buildPrompt } from "./generate-briefing";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
+import { getResolvedDeploymentRolePrimaryModelEntry } from "@/utils/llms/model";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(getResolvedDeploymentRolePrimaryModelEntry).mockReturnValue({
+    provider: "openai",
+    modelName: "gpt-5.4-mini",
+  });
 });
 
 describe("buildPrompt timezone handling", () => {
@@ -180,5 +190,48 @@ describe("buildPrompt timezone handling", () => {
       2. Use search tools to find their professional background
       3. Once you have all information, call finalizeBriefing with the complete briefing"
     `);
+  });
+
+  it("uses the meeting web search role to decide web search availability", () => {
+    vi.mocked(getResolvedDeploymentRolePrimaryModelEntry).mockImplementation(
+      (modelType) => {
+        if (modelType === "economy") {
+          return {
+            provider: "anthropic",
+            modelName: "claude-haiku-4-5-20251001",
+          };
+        }
+
+        return {
+          provider: "openai",
+          modelName: "gpt-5.4-mini",
+        };
+      },
+    );
+
+    const briefingData: MeetingBriefingData = {
+      event: {
+        id: "upcoming",
+        title: "Intro Meeting",
+        startTime: new Date("2024-12-31T21:00:00Z"),
+        endTime: new Date("2024-12-31T22:00:00Z"),
+        attendees: [
+          { email: "user@company.com" },
+          { email: "newcontact@other.com", name: "New Person" },
+        ],
+      },
+      externalGuests: [{ email: "newcontact@other.com", name: "New Person" }],
+      internalTeamMembers: [],
+      emailThreads: [],
+      pastMeetings: [],
+    };
+
+    const prompt = buildPrompt(briefingData, mockEmailAccount);
+
+    expect(getResolvedDeploymentRolePrimaryModelEntry).toHaveBeenCalledWith(
+      "economy",
+    );
+    expect(prompt).toContain("Available search tools: perplexitySearch");
+    expect(prompt).not.toContain("webSearch");
   });
 });

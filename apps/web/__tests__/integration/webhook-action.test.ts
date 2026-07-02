@@ -16,8 +16,6 @@ import { executeAct } from "@/utils/ai/choose-rule/execute";
 import { ActionType, ExecutedRuleStatus } from "@/generated/prisma/enums";
 import { createTestLogger } from "@/__tests__/helpers";
 
-vi.mock("server-only", () => ({}));
-
 // Mock Prisma — executeAct updates status, callWebhook reads user secret
 const mockExecutedRuleUpdate = vi.fn().mockResolvedValue({});
 vi.mock("@/utils/prisma", () => ({
@@ -34,10 +32,6 @@ vi.mock("@/utils/prisma", () => ({
 }));
 
 const TEST_WEBHOOK_SECRET = "test-secret-abc123";
-
-vi.mock("next/server", () => ({
-  after: vi.fn((fn: () => void) => fn()),
-}));
 
 vi.mock("@inboxzero/tinybird", () => ({
   publishArchive: vi.fn().mockResolvedValue(undefined),
@@ -222,9 +216,11 @@ describe.skipIf(!RUN_INTEGRATION_TESTS)(
         client: harness.provider,
         executedRule,
         message,
-        userEmail: TEST_EMAIL,
-        userId: "test-user-id",
-        emailAccountId: "test-account-id",
+        emailAccount: {
+          email: TEST_EMAIL,
+          id: "test-account-id",
+          userId: "test-user-id",
+        },
         logger: createTestLogger(),
       });
 
@@ -340,9 +336,11 @@ describe.skipIf(!RUN_INTEGRATION_TESTS)(
         client: harness.provider,
         executedRule,
         message,
-        userEmail: TEST_EMAIL,
-        userId: "test-user-id",
-        emailAccountId: "test-account-id",
+        emailAccount: {
+          email: TEST_EMAIL,
+          id: "test-account-id",
+          userId: "test-user-id",
+        },
         logger: createTestLogger(),
       });
 

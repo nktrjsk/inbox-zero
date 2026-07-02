@@ -16,6 +16,7 @@ import { renderEmailTextWithSafeLinks } from "@/utils/email/render-safe-links";
 import { aiCollectReplyContext } from "@/utils/ai/reply/reply-context-collector";
 import { getOrCreateReferralCode } from "@/utils/referral/referral-code";
 import { generateReferralLink } from "@/utils/referral/referral-link";
+import { renderReferralSignatureHtml } from "@/utils/referral/signature";
 import { aiGetCalendarAvailability } from "@/utils/ai/calendar/availability";
 import { env } from "@/env";
 import { mcpAgent } from "@/utils/ai/mcp/mcp-agent";
@@ -30,6 +31,7 @@ import { selectDraftAttachmentsForRule } from "@/utils/attachments/draft-attachm
 import type { SelectedAttachment } from "@/utils/attachments/source-schema";
 import { getReplyMemoriesForPrompt } from "@/utils/ai/reply/reply-memory";
 import type { DraftContextMetadata } from "@/utils/ai/reply/draft-context-metadata";
+import { collectSenderReplyExamples } from "@/utils/reply-tracker/sender-reply-examples";
 
 export type DraftGenerationResult = {
   attachments?: SelectedAttachment[];
@@ -117,6 +119,10 @@ export async function fetchMessagesAndGenerateDraftWithConfidenceThreshold(
       emailAccountWithSignatures?.allowHiddenAiDraftLinks ?? false,
   });
 
+  if (emailAccountWithSignatures?.signature) {
+    finalResult = `${finalResult}\n\n${emailAccountWithSignatures.signature}`;
+  }
+
   if (
     !env.NEXT_PUBLIC_DISABLE_REFERRAL_SIGNATURE &&
     emailAccountWithSignatures?.includeReferralSignature
@@ -125,12 +131,8 @@ export async function fetchMessagesAndGenerateDraftWithConfidenceThreshold(
       emailAccount.userId,
     );
     const referralLink = generateReferralLink(referralSignature.code);
-    const htmlSignature = `Drafted by <a href="${referralLink}">Inbox Zero</a>.`;
+    const htmlSignature = renderReferralSignatureHtml(referralLink);
     finalResult = `${finalResult}\n\n${htmlSignature}`;
-  }
-
-  if (emailAccountWithSignatures?.signature) {
-    finalResult = `${finalResult}\n\n${emailAccountWithSignatures.signature}`;
   }
 
   return {
@@ -213,11 +215,14 @@ async function generateDraftContent(
 
   const messages = threadMessages.map((msg, index) => ({
     date: internalDateToDate(msg.internalDate),
+    threadId: msg.threadId,
     ...getEmailForLLM(msg, {
       // give more context for the message we're processing
       maxLength: index === threadMessages.length - 1 ? 2000 : 500,
       extractReply: true,
       removeForwarded: false,
+      includeLinkUrls: true,
+      includeImageAltText: true,
     }),
   }));
 
@@ -233,13 +238,19 @@ async function generateDraftContent(
     messages[messages.length - 1],
     10_000,
   );
-  const historicalMessagesForLLM = previousConversationMessages?.map((msg) =>
-    getEmailForLLM(msg, {
-      maxLength: 1000,
-      extractReply: true,
-      removeForwarded: false,
-    }),
-  );
+  const currentMessageIds = new Set(threadMessages.map((msg) => msg.id));
+  const historicalMessagesForLLM = previousConversationMessages
+    ?.filter((msg) => !currentMessageIds.has(msg.id))
+    .map((msg) =>
+      getEmailForLLM(msg, {
+        maxLength: 1000,
+        extractReply: true,
+        removeForwarded: false,
+        includeLinkUrls: true,
+        includeImageAltText: true,
+      }),
+    );
+  const senderEmail = extractEmailAddress(lastMessage.headers.from);
 
   if (historicalMessagesForLLM?.length) {
     logger.info("Fetching historical messages from sender");
@@ -267,17 +278,35 @@ async function generateDraftContent(
         selectedAttachments: [],
         attachmentContext: null,
       });
+  const activeBookingLinksPromise = prisma.bookingLink.findMany({
+    where: { emailAccountId: emailAccount.id, isActive: true },
+    orderBy: { createdAt: "desc" },
+    take: 1,
+    select: { slug: true },
+  });
+  const calendarAvailabilityPromise = activeBookingLinksPromise.then(
+    (activeBookingLinks) =>
+      aiGetCalendarAvailability({
+        emailAccount,
+        messages,
+        logger,
+        bookingLinkAvailable:
+          activeBookingLinks.length > 0 || !!emailAccount.calendarBookingLink,
+      }),
+  );
   const [
     knowledgeResult,
     replyMemorySelection,
     emailHistoryContext,
     calendarAvailability,
     writingStyle,
-    learnedWritingStyle,
+    emailAccountSettings,
     mcpResult,
     upcomingMeetings,
     emailHistorySummary,
     attachmentSelection,
+    activeBookingLinks,
+    senderReplyExamples,
   ] = await Promise.all([
     aiExtractRelevantKnowledge({
       knowledgeBase,
@@ -287,7 +316,7 @@ async function generateDraftContent(
     }),
     getReplyMemoriesForPrompt({
       emailAccountId: emailAccount.id,
-      senderEmail: extractEmailAddress(lastMessage.headers.from),
+      senderEmail,
       emailContent: lastMessageContent,
       logger,
     }),
@@ -296,16 +325,16 @@ async function generateDraftContent(
       emailAccount,
       emailProvider,
     }),
-    aiGetCalendarAvailability({ emailAccount, messages, logger }),
+    calendarAvailabilityPromise,
     getWritingStyle({ emailAccountId: emailAccount.id }),
     prisma.emailAccount.findUnique({
       where: { id: emailAccount.id },
-      select: { learnedWritingStyle: true },
+      select: { learnedWritingStyle: true, signature: true },
     }),
     mcpAgent({ emailAccount, messages }),
     getMeetingContext({
       emailAccountId: emailAccount.id,
-      recipientEmail: extractEmailAddress(lastMessage.headers.from),
+      recipientEmail: senderEmail,
       // extract all other recipients (To, CC) for privacy filtering
       // only meetings where ALL recipients were attendees will be included
       additionalRecipients: [
@@ -325,6 +354,14 @@ async function generateDraftContent(
         })
       : Promise.resolve(null),
     attachmentSelectionPromise,
+    activeBookingLinksPromise,
+    collectSenderReplyExamples({
+      emailAccount,
+      emailProvider,
+      senderEmail,
+      currentMessageIds,
+      logger,
+    }),
   ]);
   const {
     content: replyMemoryContent,
@@ -351,6 +388,8 @@ async function generateDraftContent(
       summarySourceMessageCount: historicalMessagesForLLM?.length ?? 0,
       precedentThreadsInjected: precedentThreadCount > 0,
       precedentThreadCount,
+      sameSenderReplyExamplesInjected: !!senderReplyExamples?.content,
+      sameSenderReplyExampleCount: senderReplyExamples?.count ?? 0,
     },
     calendar: {
       injected: !!calendarAvailability,
@@ -382,14 +421,16 @@ async function generateDraftContent(
   // 3. Draft reply
   const { reply, confidence, attribution } = await aiDraftReplyWithConfidence({
     messages,
-    emailAccount,
+    emailAccount: { ...emailAccount, bookingLinks: activeBookingLinks },
     knowledgeBaseContent: knowledgeResult?.relevantContent || null,
     replyMemoryContent,
     emailHistorySummary,
     emailHistoryContext,
+    senderReplyExamples: senderReplyExamples?.content ?? null,
     calendarAvailability,
     writingStyle,
-    learnedWritingStyle: learnedWritingStyle?.learnedWritingStyle ?? null,
+    learnedWritingStyle: emailAccountSettings?.learnedWritingStyle ?? null,
+    hasConfiguredSignature: !!emailAccountSettings?.signature?.trim(),
     mcpContext: mcpResult?.response || null,
     meetingContext,
     attachmentContext: attachmentSelection.attachmentContext,

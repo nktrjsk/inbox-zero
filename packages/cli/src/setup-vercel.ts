@@ -416,7 +416,7 @@ async function resolveBaseUrl(
       if (!value) return "Base URL is required";
       try {
         new URL(value);
-        return undefined;
+        return;
       } catch {
         return "Enter a full URL like https://your-app.vercel.app";
       }
@@ -566,7 +566,6 @@ async function promptVercelLlmConfig(
   const llmEnv: EnvConfig = {};
 
   if (options.yes) {
-    llmEnv.DEFAULT_LLM_PROVIDER = "openai";
     seedLlmPlaceholderCredentials("openai", llmEnv);
     return llmEnv;
   }
@@ -579,7 +578,6 @@ async function promptVercelLlmConfig(
   if (p.isCancel(llmProvider)) cancelSetup();
   const selectedLlmProvider = String(llmProvider);
 
-  llmEnv.DEFAULT_LLM_PROVIDER = selectedLlmProvider;
   const configureRealKey = await p.confirm({
     message: "Add real AI credentials now?",
     initialValue: true,
@@ -720,7 +718,7 @@ function getDefaultProjectName(projectDir: string) {
 
 function readLinkedProjectName(projectDir: string) {
   const projectFile = resolve(projectDir, ".vercel/project.json");
-  if (!existsSync(projectFile)) return undefined;
+  if (!existsSync(projectFile)) return;
 
   try {
     const parsed = JSON.parse(readFileSync(projectFile, "utf8")) as {
@@ -728,7 +726,7 @@ function readLinkedProjectName(projectDir: string) {
     };
     return parsed.projectName?.trim() || undefined;
   } catch {
-    return undefined;
+    return;
   }
 }
 

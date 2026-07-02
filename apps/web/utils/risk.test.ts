@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   getRiskLevel,
   getActionRiskLevel,
@@ -7,11 +7,6 @@ import {
 } from "./risk";
 import { ActionType } from "@/generated/prisma/enums";
 import type { RulesResponse } from "@/app/api/user/rules/route";
-
-// Run with:
-// pnpm test risk.test.ts
-
-vi.mock("server-only", () => ({}));
 
 describe("getActionRiskLevel", () => {
   const testCases = [

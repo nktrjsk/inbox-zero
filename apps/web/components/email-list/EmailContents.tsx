@@ -15,6 +15,7 @@ const IMAGE_PROXY_ORIGIN = IMAGE_PROXY_BASE_URL
   : null;
 const IMAGE_PROXY_ENABLED = Boolean(IMAGE_PROXY_BASE_URL);
 const IMAGE_PROXY_RENDER_ROUTE = "/api/email/render-html";
+const SANS_FONT_STACK = `ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`;
 
 export function HtmlEmail({ html }: { html: string }) {
   const sanitizedHtml = useMemo(() => sanitize(html), [html]);
@@ -159,6 +160,7 @@ function getIframeHtml(
       }
       body {
         background-color: white;
+        font-family: ${SANS_FONT_STACK};
       }
       table { max-width: 100% !important; overflow-x: auto; }
       img { max-width: 100% !important; height: auto; }
@@ -184,9 +186,11 @@ function getIframeHtml(
       table { max-width: 100% !important; overflow-x: auto; }
       img { max-width: 100% !important; height: auto; }
 
-      /* Base styles with low specificity - only apply to completely unstyled content */
+      /* Base styles - apply our font as a baseline; inline styles on inner elements still win */
+      body {
+        font-family: ${SANS_FONT_STACK};
+      }
       body:not([style]):not([bgcolor]) {
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         margin: 0;
         color: hsl(var(--foreground));
         background-color: hsl(var(--background));

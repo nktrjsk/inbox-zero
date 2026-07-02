@@ -59,20 +59,20 @@ export type RuleSelectionMetadata = {
 /**
  * Serializable version of MatchReason for database storage
  */
-type SerializedMatchReason =
+export type SerializedMatchReason =
   | { type: "STATIC" }
   | {
       type: "LEARNED_PATTERN";
       group: { id: string; name: string };
       groupItem: {
         id: string;
-        type: string;
+        type: GroupItemType;
         value: string;
         exclude: boolean;
       };
     }
   | { type: "AI" }
-  | { type: "PRESET"; systemType: string };
+  | { type: "PRESET"; systemType: SystemType };
 
 /**
  * Serializes match reasons to a JSON-safe format for database storage
@@ -80,7 +80,7 @@ type SerializedMatchReason =
 export function serializeMatchReasons(
   matchReasons?: MatchReason[],
 ): SerializedMatchReason[] | undefined {
-  if (!matchReasons || matchReasons.length === 0) return undefined;
+  if (!matchReasons || matchReasons.length === 0) return;
 
   return matchReasons.map((reason): SerializedMatchReason => {
     switch (reason.type) {

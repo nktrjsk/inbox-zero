@@ -1,12 +1,12 @@
 import { sso } from "@better-auth/sso";
-import { expo } from "@better-auth/expo";
+import { scim } from "@better-auth/scim";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import type { GenericOAuthConfig } from "better-auth/plugins/generic-oauth";
 import { oAuthProxy } from "better-auth/plugins";
 import { createContact as createLoopsContact } from "@inboxzero/loops";
 import { createContact as createResendContact } from "@inboxzero/resend";
 import type { Account, AuthContext } from "better-auth";
-import { betterAuth } from "better-auth";
+import { APIError, betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { nextCookies } from "better-auth/next-js";
 import { cookies, headers } from "next/headers";
@@ -41,44 +41,100 @@ import {
   claimPendingPremiumInvite,
   updateAccountSeats,
 } from "@/utils/premium/seats";
-import { clearSpecificErrorMessages, ErrorType } from "@/utils/error-messages";
+import { safeExpo } from "@/utils/mobile-auth/expo";
+import { clearAccountDisconnectedErrorIfResolved } from "@/utils/error-messages";
+import { getEnabledLoginProviders } from "@/utils/oauth/login-providers";
+import { getAppleClientSecret } from "@/utils/auth/apple-client-secret";
+import { assertCanGenerateScimToken } from "@/utils/auth/scim";
 import prisma from "@/utils/prisma";
 
 const logger = createScopedLogger("auth");
+const EMAIL_ALREADY_LINKED_ERROR = "email_already_linked";
 const useGoogleOauthEmulator = isGoogleOauthEmulationEnabled();
 const useMicrosoftOauthEmulator = isMicrosoftEmulationEnabled();
+
+// Register only configured OAuth providers so clients can't start disabled
+// providers by posting directly to `/api/auth/sign-in/social`.
+const enabledLoginProviders = getEnabledLoginProviders();
+const googleLoginEnabled = enabledLoginProviders.has("google");
+const microsoftLoginEnabled = enabledLoginProviders.has("microsoft");
+const appleLoginEnabled = enabledLoginProviders.has("apple");
+
+type AppleProfile = {
+  email?: string;
+  sub: string;
+};
 
 const mobileAuthOrigins = env.MOBILE_AUTH_ORIGIN
   ? [env.MOBILE_AUTH_ORIGIN]
   : [];
-const googleSocialProvider = !useGoogleOauthEmulator
+const googleSocialProvider =
+  googleLoginEnabled && !useGoogleOauthEmulator
+    ? {
+        clientId: env.GOOGLE_CLIENT_ID,
+        clientSecret: env.GOOGLE_CLIENT_SECRET,
+        scope: [...GMAIL_SCOPES],
+        accessType: "offline" as const,
+        prompt: "select_account consent" as const,
+        disableIdTokenSignIn: true,
+        // For preview deployments, redirect through staging (which proxies back to preview URL)
+        ...(env.OAUTH_PROXY_URL && {
+          redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/google`,
+        }),
+      }
+    : null;
+const microsoftSocialProvider =
+  microsoftLoginEnabled && !useMicrosoftOauthEmulator
+    ? {
+        clientId: env.MICROSOFT_CLIENT_ID!,
+        clientSecret: env.MICROSOFT_CLIENT_SECRET!,
+        scope: [...OUTLOOK_SCOPES],
+        tenantId: env.MICROSOFT_TENANT_ID,
+        disableIdTokenSignIn: true,
+        ...(env.OAUTH_PROXY_URL && {
+          redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/microsoft`,
+        }),
+      }
+    : null;
+const appleSocialProvider = appleLoginEnabled
   ? {
-      clientId: env.GOOGLE_CLIENT_ID,
-      clientSecret: env.GOOGLE_CLIENT_SECRET,
-      scope: [...GMAIL_SCOPES],
-      accessType: "offline" as const,
-      prompt: "select_account consent" as const,
-      disableIdTokenSignIn: true,
-      // For preview deployments, redirect through staging (which proxies back to preview URL)
+      clientId: env.APPLE_CLIENT_ID!,
+      get clientSecret() {
+        const clientSecret = getAppleClientSecret();
+        if (!clientSecret) throw new Error("Apple OAuth is not configured");
+        return clientSecret;
+      },
+      appBundleIdentifier: env.APPLE_APP_BUNDLE_IDENTIFIER,
+      mapProfileToUser: async (profile: AppleProfile) => {
+        if (profile.email) return {};
+
+        const existingAppleAccount = await prisma.account.findUnique({
+          where: {
+            provider_providerAccountId: {
+              provider: "apple",
+              providerAccountId: profile.sub,
+            },
+          },
+          select: {
+            user: {
+              select: {
+                email: true,
+              },
+            },
+          },
+        });
+
+        return existingAppleAccount?.user.email
+          ? { email: existingAppleAccount.user.email }
+          : {};
+      },
       ...(env.OAUTH_PROXY_URL && {
-        redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/google`,
-      }),
-    }
-  : null;
-const microsoftSocialProvider = !useMicrosoftOauthEmulator
-  ? {
-      clientId: env.MICROSOFT_CLIENT_ID || "",
-      clientSecret: env.MICROSOFT_CLIENT_SECRET || "",
-      scope: [...OUTLOOK_SCOPES],
-      tenantId: env.MICROSOFT_TENANT_ID,
-      disableIdTokenSignIn: true,
-      ...(env.OAUTH_PROXY_URL && {
-        redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/microsoft`,
+        redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/apple`,
       }),
     }
   : null;
 const genericOauthConfig: GenericOAuthConfig[] = [
-  ...(useGoogleOauthEmulator
+  ...(googleLoginEnabled && useGoogleOauthEmulator
     ? [
         {
           providerId: "google",
@@ -96,14 +152,14 @@ const genericOauthConfig: GenericOAuthConfig[] = [
         },
       ]
     : []),
-  ...(useMicrosoftOauthEmulator
+  ...(microsoftLoginEnabled && useMicrosoftOauthEmulator
     ? [
         {
           providerId: "microsoft",
           discoveryUrl: getMicrosoftOauthDiscoveryUrl(),
           issuer: getMicrosoftOauthIssuer(),
-          clientId: env.MICROSOFT_CLIENT_ID || "",
-          clientSecret: env.MICROSOFT_CLIENT_SECRET || "",
+          clientId: env.MICROSOFT_CLIENT_ID!,
+          clientSecret: env.MICROSOFT_CLIENT_SECRET!,
           scopes: [...OUTLOOK_SCOPES],
           pkce: true,
           prompt: "consent" as const,
@@ -124,6 +180,7 @@ const genericOauthPlugin =
 const socialProviders = {
   ...(googleSocialProvider ? { google: googleSocialProvider } : {}),
   ...(microsoftSocialProvider ? { microsoft: microsoftSocialProvider } : {}),
+  ...(appleSocialProvider ? { apple: appleSocialProvider } : {}),
 };
 
 export const betterAuthConfig = betterAuth({
@@ -148,6 +205,7 @@ export const betterAuthConfig = betterAuth({
   baseURL: env.NEXT_PUBLIC_BASE_URL,
   trustedOrigins: [
     env.NEXT_PUBLIC_BASE_URL,
+    "https://appleid.apple.com",
     ...(env.OAUTH_PROXY_URL ? [env.OAUTH_PROXY_URL] : []),
     ...(env.ADDITIONAL_TRUSTED_ORIGINS ?? []),
     ...mobileAuthOrigins,
@@ -164,8 +222,18 @@ export const betterAuthConfig = betterAuth({
       disableImplicitSignUp: false,
       organizationProvisioning: { disabled: true },
     }),
+    scim({
+      providerOwnership: { enabled: true },
+      storeSCIMToken: "hashed",
+      beforeSCIMTokenGenerated: async ({ user, scimToken }) => {
+        await assertCanGenerateScimToken({
+          userEmail: user.email,
+          scimToken,
+        });
+      },
+    }),
     ...(genericOauthPlugin ? [genericOauthPlugin] : []),
-    ...(mobileAuthOrigins.length > 0 ? [expo()] : []),
+    ...(mobileAuthOrigins.length > 0 ? [safeExpo()] : []),
     // OAuth proxy for preview deployments (Google doesn't allow wildcard redirect URIs)
     ...(env.OAUTH_PROXY_URL || env.IS_OAUTH_PROXY_SERVER
       ? [
@@ -204,7 +272,9 @@ export const betterAuthConfig = betterAuth({
     storeStateStrategy: "cookie", // Required for oAuthProxy to encrypt state
     accountLinking: {
       enabled: true,
-      trustedProviders: ["google", "microsoft"],
+      // Microsoft Entra email claims can be mutable/unverified, so Microsoft
+      // must not implicitly link users by email during social sign-in.
+      trustedProviders: ["google", "apple"],
     },
   },
   verification: {
@@ -543,7 +613,10 @@ export async function handleLinkAccount(account: Account) {
         existingUserId: existingEmailAccount.userId,
         newUserId: account.userId,
       });
-      throw new Error("email_already_linked");
+      throw APIError.from("BAD_REQUEST", {
+        message: EMAIL_ALREADY_LINKED_ERROR,
+        code: EMAIL_ALREADY_LINKED_ERROR,
+      });
     }
 
     const crossProviderRelink =
@@ -577,9 +650,8 @@ export async function handleLinkAccount(account: Account) {
         }),
       ]);
 
-      await clearSpecificErrorMessages({
+      await clearAccountDisconnectedErrorIfResolved({
         userId: account.userId,
-        errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
         logger,
       });
 
@@ -620,9 +692,8 @@ export async function handleLinkAccount(account: Account) {
       }),
     ]);
 
-    await clearSpecificErrorMessages({
+    await clearAccountDisconnectedErrorIfResolved({
       userId: account.userId,
-      errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
       logger,
     });
 
@@ -661,8 +732,12 @@ export async function handleLinkAccount(account: Account) {
   }
 }
 
-export const auth = async () =>
-  betterAuthConfig.api.getSession({ headers: await headers() });
+export const auth = async (
+  requestHeaders?: Headers | Awaited<ReturnType<typeof headers>>,
+) =>
+  betterAuthConfig.api.getSession({
+    headers: requestHeaders ?? (await headers()),
+  });
 
 async function autoJoinOrganization(emailAccountId: string) {
   const orgs = await prisma.organization.findMany({

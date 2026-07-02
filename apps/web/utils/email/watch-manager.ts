@@ -1,8 +1,13 @@
 import prisma from "@/utils/prisma";
-import { hasAiAccess, getPremiumUserFilter } from "@/utils/premium";
+import {
+  getPremiumUserFilter,
+  getUserTier,
+  hasAiAccess,
+  premiumEntitlementSelect,
+} from "@/utils/premium";
 import type { Logger } from "@/utils/logger";
 import { createEmailProvider } from "@/utils/email/provider";
-import { captureException } from "@/utils/error";
+import { captureException, isInvalidGrantError } from "@/utils/error";
 import { cleanupInvalidTokens } from "@/utils/auth/cleanup-invalid-tokens";
 import type { EmailProvider } from "@/utils/email/types";
 import { createManagedOutlookSubscription } from "@/utils/outlook/subscription-manager";
@@ -62,11 +67,7 @@ async function getEmailAccountsToWatch(userIds: string[] | null) {
           id: true,
           aiApiKey: true,
           premium: {
-            select: {
-              tier: true,
-              lemonSqueezyRenewsAt: true,
-              stripeSubscriptionStatus: true,
-            },
+            select: premiumEntitlementSelect,
           },
         },
       },
@@ -99,13 +100,15 @@ async function watchEmailAccounts(
     } catch (error) {
       if (error instanceof Error) {
         const warn = [
-          "invalid_grant",
           "Mail service not enabled",
           "Insufficient Permission",
           "AADSTS7000215", // Raw Azure AD error for invalid client secret (old tokens after secret rotation)
         ];
 
-        if (warn.some((w) => error.message.includes(w))) {
+        if (
+          isInvalidGrantError(error) ||
+          warn.some((w) => error.message.includes(w))
+        ) {
           logger.warn("Not watching emails for user", {
             email: emailAccount.email,
             error,
@@ -135,7 +138,7 @@ async function watchEmailAccount(
   const { account, user, watchEmailsExpirationDate } = emailAccount;
 
   const userHasAiAccess = hasAiAccess(
-    user.premium?.tier || null,
+    getUserTier(user.premium),
     !!user.aiApiKey,
   );
 
@@ -240,7 +243,8 @@ async function watchEmails({
         logger,
       });
 
-      if (result) return { success: true, expirationDate: result };
+      if (result)
+        return { success: true, expirationDate: result.expirationDate };
     } else {
       const result = await provider.watchEmails();
 
@@ -258,10 +262,10 @@ async function watchEmails({
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
 
-    // Minimal centralized handling of permanent auth failures (exact checks only)
-    const isInsufficientPermissions =
-      errorMessage === "Request had insufficient authentication scopes.";
-    const isInvalidGrant = errorMessage === "invalid_grant";
+    const isInsufficientPermissions = errorMessage.includes(
+      "Request had insufficient authentication scopes.",
+    );
+    const isInvalidGrant = isInvalidGrantError(error);
 
     if (isInsufficientPermissions || isInvalidGrant) {
       logger.warn("Auth failure while watching inbox - cleaning up tokens", {
@@ -296,7 +300,7 @@ export async function unwatchEmails({
 
     await provider.unwatchEmails(subscriptionId || undefined);
   } catch (error) {
-    if (error instanceof Error && error.message.includes("invalid_grant")) {
+    if (isInvalidGrantError(error)) {
       logger.warn("Error unwatching emails, invalid grant");
     } else {
       logger.error("Error unwatching emails", { error });

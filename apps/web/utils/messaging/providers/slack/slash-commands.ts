@@ -3,6 +3,8 @@ import {
   readUIMessageStream,
   type UIMessage,
 } from "ai";
+import { createHmac } from "node:crypto";
+import { env } from "@/env";
 import type { Prisma } from "@/generated/prisma/client";
 import { MessagingProvider } from "@/generated/prisma/enums";
 import { aiProcessAssistantChat } from "@/utils/ai/assistant/chat";
@@ -15,6 +17,7 @@ import {
 import type { Logger } from "@/utils/logger";
 import { normalizeMessagingAssistantText } from "@/utils/messaging/chat-sdk/bot";
 import { PROMPT_COMMANDS } from "@/utils/messaging/prompt-commands";
+import { disableSlackLinkUnfurls } from "@/utils/messaging/providers/slack/send";
 import prisma from "@/utils/prisma";
 import { getEmailAccountWithAi } from "@/utils/user/get";
 
@@ -126,7 +129,7 @@ async function runSlackSlashCommandAi({
   teamId: string;
   logger: Logger;
 }): Promise<string> {
-  const chatId = `slack-cmd-${userId}-${teamId}-${emailAccountId}`;
+  const chatId = getSlackSlashCommandChatId({ userId, teamId, emailAccountId });
 
   const chat = await prisma.chat.upsert({
     where: { id: chatId },
@@ -134,6 +137,7 @@ async function runSlackSlashCommandAi({
     update: {},
     select: {
       id: true,
+      emailAccountId: true,
       lastSeenRulesRevision: true,
       messages: {
         orderBy: { createdAt: "desc" },
@@ -146,6 +150,15 @@ async function runSlackSlashCommandAi({
       },
     },
   });
+
+  if (chat.emailAccountId !== emailAccountId) {
+    logger.error("Slack slash command chat ownership mismatch", {
+      chatId: chat.id,
+      expectedEmailAccountId: emailAccountId,
+      actualEmailAccountId: chat.emailAccountId,
+    });
+    throw new Error("Slack slash command chat ownership mismatch");
+  }
 
   const existingMessages: UIMessage[] = [...chat.messages]
     .reverse()
@@ -251,6 +264,23 @@ async function runSlackSlashCommandAi({
   return normalizeMessagingAssistantText({ text: fullText || "Done." });
 }
 
+function getSlackSlashCommandChatId({
+  userId,
+  teamId,
+  emailAccountId,
+}: {
+  userId: string;
+  teamId: string;
+  emailAccountId: string;
+}): string {
+  const digest = createHmac("sha256", env.EMAIL_ENCRYPT_SALT)
+    .update(`${userId}:${teamId}:${emailAccountId}`)
+    .digest("hex")
+    .slice(0, 32);
+
+  return `slack-cmd-${digest}`;
+}
+
 async function postToSlackResponseUrl(
   responseUrl: string,
   body: { response_type: "in_channel" | "ephemeral"; text: string },
@@ -263,7 +293,7 @@ async function postToSlackResponseUrl(
   const response = await fetch(responseUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(disableSlackLinkUnfurls(body)),
   });
 
   if (!response.ok) {

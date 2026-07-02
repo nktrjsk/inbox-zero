@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { messageContextSchema } from "@/app/api/chat/validation";
+import { messageContextSchema } from "@/utils/ai/assistant/chat-context-validation";
 import { inlineEmailActionSchema } from "@/utils/ai/assistant/inline-email-actions";
 
 export const assistantPendingEmailActionTypeSchema = z.enum([
@@ -102,7 +102,7 @@ export type AssistantPendingEmailToolOutput =
 
 const confirmAssistantActionBaseBody = z.object({
   chatId: z.string().trim().min(1),
-  chatMessageId: z.string().trim().min(1),
+  chatMessageId: z.string().trim().min(1).optional(),
   toolCallId: z.string().trim().min(1),
 });
 
@@ -137,6 +137,31 @@ export type PendingCreateRuleToolOutput = z.infer<
 export const confirmAssistantCreateRuleBody = confirmAssistantActionBaseBody;
 export type ConfirmAssistantCreateRuleBody = z.infer<
   typeof confirmAssistantCreateRuleBody
+>;
+
+export const pendingSaveMemoryToolOutputSchema = z.object({
+  success: z.literal(true),
+  actionType: z.literal("save_memory"),
+  requiresConfirmation: z.literal(true),
+  confirmationState: z.enum(["pending", "processing", "confirmed"]),
+  confirmationProcessingAt: z.string().optional(),
+  content: z.string().trim().min(1),
+  reason: z.string().trim().min(1).optional(),
+  confirmationResult: z
+    .object({
+      content: z.string().trim().min(1),
+      confirmedAt: z.string().min(1),
+      deduplicated: z.boolean().optional(),
+    })
+    .optional(),
+});
+export type PendingSaveMemoryToolOutput = z.infer<
+  typeof pendingSaveMemoryToolOutputSchema
+>;
+
+export const confirmAssistantSaveMemoryBody = confirmAssistantActionBaseBody;
+export type ConfirmAssistantSaveMemoryBody = z.infer<
+  typeof confirmAssistantSaveMemoryBody
 >;
 
 const assistantChatTextPartSchema = z.object({

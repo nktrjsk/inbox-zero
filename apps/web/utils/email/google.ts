@@ -24,15 +24,18 @@ import {
 } from "@/utils/gmail/label";
 import { labelVisibility, messageVisibility } from "@/utils/gmail/constants";
 import type { InboxZeroLabel } from "@/utils/label";
-import type { ThreadsQuery } from "@/app/api/threads/validation";
+import type { ThreadsQuery } from "@/utils/threads/validation";
 import { getMessageByRfc822Id } from "@/utils/gmail/message";
 import {
+  createMail,
   draftEmail,
   forwardEmail,
   replyToEmail,
   sendEmailWithPlainText,
   sendEmailWithHtml,
 } from "@/utils/gmail/mail";
+import { convertEmailHtmlToText } from "@/utils/mail";
+import { buildThreadingHeaders } from "@/utils/email/threading";
 import {
   archiveThread,
   labelMessage,
@@ -72,29 +75,20 @@ import type {
   EmailLabel,
   EmailFilter,
   EmailSignature,
+  SentMessagePage,
 } from "@/utils/email/types";
 import { createScopedLogger, type Logger } from "@/utils/logger";
 import { getGmailSignatures } from "@/utils/gmail/signature-settings";
 import { withRateLimitRecording } from "@/utils/email/rate-limit";
 import { shouldSkipAutoDraft } from "@/utils/auto-draft";
-
-/**
- * Build a raw RFC 2822 message and encode it as base64url for Gmail API
- */
-function buildRawMessageBase64(headers: string[], body: string): string {
-  const rawMessage = `${headers.join("\r\n")}\r\n\r\n${body}`;
-  return Buffer.from(rawMessage)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
+import { extractUniqueEmailAddresses } from "@/utils/email";
 
 export class GmailProvider implements EmailProvider {
   readonly name = "google";
   private readonly client: gmail_v1.Gmail;
   private readonly logger: Logger;
   private readonly emailAccountId?: string;
+  private sendAsEmailAddressesPromise?: Promise<string[]>;
 
   constructor(
     client: gmail_v1.Gmail,
@@ -209,19 +203,24 @@ export class GmailProvider implements EmailProvider {
   async getMessageByRfc822MessageId(
     rfc822MessageId: string,
   ): Promise<ParsedMessage | null> {
-    const message = await getMessageByRfc822Id(rfc822MessageId, this.client);
+    const message = await getMessageByRfc822Id(
+      rfc822MessageId,
+      this.client,
+      this.logger,
+    );
     if (!message) return null;
     return parseMessage(message);
   }
 
   async getSentMessages(maxResults = 20): Promise<ParsedMessage[]> {
-    return getSentMessages(this.client, maxResults);
+    return getSentMessages(this.client, this.logger, maxResults);
   }
 
   async getInboxMessages(maxResults = 20): Promise<ParsedMessage[]> {
     const messages = await queryBatchMessages(this.client, {
       query: "in:inbox",
       maxResults,
+      logger: this.logger,
     });
     return messages.messages;
   }
@@ -230,24 +229,32 @@ export class GmailProvider implements EmailProvider {
     maxResults: number;
     after?: Date;
     before?: Date;
-  }): Promise<{ id: string; threadId: string }[]> {
-    const { maxResults, after, before } = options;
+    pageToken?: string;
+  }): Promise<SentMessagePage> {
+    const { maxResults, after, before, pageToken } = options;
 
-    let query = `label:${GmailLabel.SENT}`;
+    const queryParts: string[] = [];
     if (after) {
-      query += ` after:${Math.floor(after.getTime() / 1000) - 1}`;
+      queryParts.push(`after:${Math.floor(after.getTime() / 1000) - 1}`);
     }
     if (before) {
-      query += ` before:${Math.floor(before.getTime() / 1000) + 1}`;
+      queryParts.push(`before:${Math.floor(before.getTime() / 1000) + 1}`);
     }
 
-    const response = await getMessages(this.client, { query, maxResults });
+    const response = await getMessages(this.client, {
+      query: queryParts.join(" ") || undefined,
+      maxResults,
+      pageToken,
+      labelIds: [GmailLabel.SENT],
+    });
 
-    return (
-      response.messages
-        ?.filter((m) => m.id && m.threadId)
-        .map((m) => ({ id: m.id!, threadId: m.threadId! })) || []
-    );
+    return {
+      messages: response.messages.map((m) => ({
+        id: m.id,
+        threadId: m.threadId,
+      })),
+      nextPageToken: response.nextPageToken,
+    };
   }
 
   async getSentThreadsExcluding(options: {
@@ -576,14 +583,16 @@ export class GmailProvider implements EmailProvider {
     ownerEmail: string,
     emailAccountId: string,
   ): Promise<number> {
-    return this.withRateLimitTracking("bulk-archive-sender", async () => {
-      return await this.archiveMessagesFromSenders(
-        [fromEmail],
-        ownerEmail,
-        emailAccountId,
-        { continueOnError: false },
-      );
-    });
+    return this.withRateLimitTracking(
+      "bulk-archive-sender",
+      async () =>
+        await this.archiveMessagesFromSenders(
+          [fromEmail],
+          ownerEmail,
+          emailAccountId,
+          { continueOnError: false },
+        ),
+    );
   }
 
   async bulkTrashFromSenders(
@@ -676,6 +685,14 @@ export class GmailProvider implements EmailProvider {
     }
   }
 
+  async starMessage(messageId: string): Promise<void> {
+    await labelMessage({
+      gmail: this.client,
+      messageId,
+      addLabelIds: [GmailLabel.STARRED],
+    });
+  }
+
   async getDraft(draftId: string): Promise<ParsedMessage | null> {
     return getDraft(draftId, this.client);
   }
@@ -700,28 +717,32 @@ export class GmailProvider implements EmailProvider {
       replyToMessageId: params.replyToMessageId,
     });
 
-    // Build the raw email message
-    const headers = [
-      `To: ${params.to}`,
-      `Subject: ${params.subject}`,
-      "Content-Type: text/html; charset=utf-8",
-    ];
+    let threadId: string | undefined;
+    let headerMessageId = "";
+    let parentReferences: string | undefined;
 
-    // Add threading headers if replying
     if (params.replyToMessageId) {
       try {
         const originalMessage = await this.getMessage(params.replyToMessageId);
-        const messageIdHeader = originalMessage.headers?.["message-id"];
-        if (messageIdHeader) {
-          headers.push(`In-Reply-To: ${messageIdHeader}`);
-          headers.push(`References: ${messageIdHeader}`);
-        }
+        threadId = originalMessage.threadId;
+        headerMessageId = originalMessage.headers?.["message-id"] || "";
+        parentReferences = originalMessage.headers?.references;
       } catch {
         this.logger.warn("Could not get original message for threading");
       }
     }
 
-    const encodedMessage = buildRawMessageBase64(headers, params.messageHtml);
+    const encodedMessage = await createMail({
+      to: params.to,
+      subject: params.subject,
+      text: convertEmailHtmlToText({ htmlText: params.messageHtml }),
+      html: params.messageHtml,
+      ...buildThreadingHeaders({
+        headerMessageId,
+        references: parentReferences,
+      }),
+      headers: { "X-Mailer": "Inbox Zero Web" },
+    });
 
     const result = await withGmailRetry(() =>
       this.client.users.drafts.create({
@@ -729,7 +750,7 @@ export class GmailProvider implements EmailProvider {
         requestBody: {
           message: {
             raw: encodedMessage,
-            // Threading is handled by In-Reply-To/References headers, not threadId
+            threadId,
           },
         },
       }),
@@ -754,26 +775,21 @@ export class GmailProvider implements EmailProvider {
       throw new Error(`Draft ${draftId} not found`);
     }
 
-    // Build updated message
     const subject = params.subject || currentDraft.subject || "";
     const content = params.messageHtml || currentDraft.textHtml || "";
 
-    // Get the To address from the current draft headers
-    const toAddress = currentDraft.headers?.to || "";
-
-    const headers = [
-      `To: ${toAddress}`,
-      `Subject: ${subject}`,
-      "Content-Type: text/html; charset=utf-8",
-    ];
-
-    // Preserve threading headers for reply drafts
-    const inReplyTo = currentDraft.headers?.["in-reply-to"];
-    const references = currentDraft.headers?.references;
-    if (inReplyTo) headers.push(`In-Reply-To: ${inReplyTo}`);
-    if (references) headers.push(`References: ${references}`);
-
-    const encodedMessage = buildRawMessageBase64(headers, content);
+    const encodedMessage = await createMail({
+      to: currentDraft.headers?.to || "",
+      cc: currentDraft.headers?.cc,
+      bcc: currentDraft.headers?.bcc,
+      replyTo: currentDraft.headers?.["reply-to"],
+      subject,
+      text: convertEmailHtmlToText({ htmlText: content }),
+      html: content,
+      inReplyTo: currentDraft.headers?.["in-reply-to"],
+      references: currentDraft.headers?.references,
+      headers: { "X-Mailer": "Inbox Zero Web" },
+    });
 
     await withGmailRetry(() =>
       this.client.users.drafts.update({
@@ -781,6 +797,7 @@ export class GmailProvider implements EmailProvider {
         id: draftId,
         requestBody: {
           message: {
+            threadId: currentDraft.threadId,
             raw: encodedMessage,
           },
         },
@@ -812,35 +829,30 @@ export class GmailProvider implements EmailProvider {
       contentLength: args.content?.length,
     });
 
+    const userEmails = await this.getSelfEmailAddresses(userEmail);
+    const draftPromise = draftEmail(this.client, email, args, userEmails);
+    let result: Awaited<typeof draftPromise>;
+
     if (executedRule) {
-      // Run draft creation and previous draft deletion in parallel
-      const [result] = await Promise.all([
-        draftEmail(this.client, email, args, userEmail),
+      [result] = await Promise.all([
+        draftPromise,
         handlePreviousDraftDeletion({
           client: this,
           executedRule,
           logger: this.logger,
         }),
       ]);
-
-      const draftId = result.data.id || "";
-      this.logger.info("Gmail draft created successfully", {
-        draftId,
-        gmailMessageId: result.data.message?.id,
-      });
-
-      return { draftId };
     } else {
-      const result = await draftEmail(this.client, email, args, userEmail);
-
-      const draftId = result.data.id || "";
-      this.logger.info("Gmail draft created successfully", {
-        draftId,
-        gmailMessageId: result.data.message?.id,
-      });
-
-      return { draftId };
+      result = await draftPromise;
     }
+
+    const draftId = result.data.id || "";
+    this.logger.info("Gmail draft created successfully", {
+      draftId,
+      gmailMessageId: result.data.message?.id,
+    });
+
+    return { draftId };
   }
 
   async replyToEmail(
@@ -894,7 +906,13 @@ export class GmailProvider implements EmailProvider {
 
   async forwardEmail(
     email: ParsedMessage,
-    args: { to: string; cc?: string; bcc?: string; content?: string },
+    args: {
+      to: string;
+      cc?: string;
+      bcc?: string;
+      content?: string;
+      from?: string;
+    },
   ): Promise<void> {
     const parsedMessage = await this.getMessage(email.id);
 
@@ -951,6 +969,7 @@ export class GmailProvider implements EmailProvider {
     return getMessagesBatch({
       messageIds,
       accessToken: getAccessTokenFromClient(this.client),
+      logger: this.logger,
     });
   }
 
@@ -1013,6 +1032,7 @@ export class GmailProvider implements EmailProvider {
     const originalMessage = await getMessageByRfc822Id(
       originalMessageId,
       this.client,
+      this.logger,
     );
     if (!originalMessage) return null;
     return parseMessage(originalMessage);
@@ -1187,6 +1207,7 @@ export class GmailProvider implements EmailProvider {
     const threads = await getThreadsBatch(
       threadIds,
       getAccessTokenFromClient(this.client),
+      this.logger,
     );
 
     return threads
@@ -1256,6 +1277,7 @@ export class GmailProvider implements EmailProvider {
     return getMessagesBatch({
       messageIds,
       accessToken: getAccessTokenFromClient(this.client),
+      logger: this.logger,
     });
   }
 
@@ -1415,9 +1437,9 @@ export class GmailProvider implements EmailProvider {
           case "unread":
             return [GmailLabel.UNREAD];
           case "archive":
-            return undefined;
+            return;
           case "all":
-            return undefined;
+            return;
           default:
             if (!type || type === "undefined" || type === "null")
               return [GmailLabel.INBOX];
@@ -1440,6 +1462,7 @@ export class GmailProvider implements EmailProvider {
       const threads = await getThreadsBatch(
         threadIds,
         getAccessTokenFromClient(this.client),
+        this.logger,
       );
 
       const emailThreads: EmailThread[] = threads
@@ -1484,6 +1507,7 @@ export class GmailProvider implements EmailProvider {
       this.getAccessToken(),
       sender,
       limit,
+      this.logger,
     );
   }
 
@@ -1562,5 +1586,26 @@ export class GmailProvider implements EmailProvider {
       },
       operation,
     );
+  }
+
+  private async getSelfEmailAddresses(userEmail: string): Promise<string[]> {
+    try {
+      const sendAsEmailAddresses = await this.getSendAsEmailAddresses();
+      return extractUniqueEmailAddresses([userEmail, ...sendAsEmailAddresses]);
+    } catch (error) {
+      this.logger.warn("Failed to fetch Gmail send-as addresses", { error });
+      return extractUniqueEmailAddresses([userEmail]);
+    }
+  }
+
+  private getSendAsEmailAddresses(): Promise<string[]> {
+    this.sendAsEmailAddressesPromise ??= getGmailSignatures(this.client)
+      .then((signatures) => signatures.map((signature) => signature.email))
+      .catch((error) => {
+        this.sendAsEmailAddressesPromise = undefined;
+        throw error;
+      });
+
+    return this.sendAsEmailAddressesPromise;
   }
 }

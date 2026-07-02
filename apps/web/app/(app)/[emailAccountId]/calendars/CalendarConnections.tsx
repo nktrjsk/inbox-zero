@@ -6,10 +6,11 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { LoadingContent } from "@/components/LoadingContent";
 import { useCalendars } from "@/hooks/useCalendars";
 import { CalendarConnectionCard } from "./CalendarConnectionCard";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { ConnectCalendar } from "@/app/(app)/[emailAccountId]/calendars/ConnectCalendar";
 import { TypographyP } from "@/components/Typography";
 import { toastError } from "@/components/Toast";
+import { useProductAnalytics } from "@/hooks/useProductAnalytics";
 
 export function CalendarConnections() {
   useCalendarNotifications();
@@ -21,11 +22,7 @@ export function CalendarConnections() {
       <div className="space-y-6">
         {connections.length === 0 ? (
           <Card>
-            <CardHeader className="pb-2">
-              <CardTitle>Connected calendars</CardTitle>
-            </CardHeader>
-
-            <CardContent>
+            <CardContent className="pt-6">
               <div className="space-y-2">
                 <TypographyP className="text-sm">
                   Connect your calendar to unlock:
@@ -72,6 +69,7 @@ function useCalendarNotifications() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
+  const analytics = useProductAnalytics("calendars");
 
   useEffect(() => {
     const errorParam = searchParams.get("error");
@@ -135,7 +133,10 @@ function useCalendarNotifications() {
       title: errorMessage.title,
       description: errorMessage.description,
     });
+    analytics.captureAction("calendar_connect_failed", {
+      error_code: errorParam,
+    });
 
     router.replace(pathname);
-  }, [pathname, router, searchParams]);
+  }, [analytics, pathname, router, searchParams]);
 }

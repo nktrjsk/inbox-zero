@@ -1,4 +1,5 @@
 import type { CreateOrUpdateRuleSchema } from "@/utils/ai/rule/create-rule-schema";
+import { after } from "next/server";
 import prisma from "@/utils/prisma";
 import type { Logger } from "@/utils/logger";
 import { ActionType } from "@/generated/prisma/enums";
@@ -6,7 +7,11 @@ import type { SystemType } from "@/generated/prisma/enums";
 import type { Prisma, Rule } from "@/generated/prisma/client";
 import { getActionRiskLevel, type RiskAction } from "@/utils/risk";
 import { hasExampleParams } from "@/app/(app)/[emailAccountId]/assistant/examples";
-import { createRuleHistory } from "@/utils/rule/rule-history";
+import {
+  createRuleHistory,
+  ruleHistoryRuleInclude,
+  type RuleHistoryTrigger,
+} from "@/utils/rule/rule-history";
 import { isMicrosoftProvider } from "@/utils/email/provider-types";
 import { createEmailProvider } from "@/utils/email/provider";
 import { resolveLabelNameAndId } from "@/utils/label/resolve-label";
@@ -25,6 +30,7 @@ import {
   ensureWebhookActionEnabled,
   hasWebhookAction,
 } from "@/utils/webhook-action";
+import { assertNoSenderOnlyOverlap } from "@/utils/rule/sender-scope-overlap";
 
 type CreateRuleEnablement =
   | { source: "default" }
@@ -117,7 +123,29 @@ type RuleRecordData = {
   groupId?: string | null;
 };
 
-export function partialUpdateRule({
+async function updateRuleAndQueueHistory({
+  ruleId,
+  emailAccountId,
+  data,
+  triggerType,
+}: {
+  ruleId: string;
+  emailAccountId: string;
+  data: Prisma.RuleUpdateInput;
+  triggerType: RuleHistoryTrigger;
+}) {
+  const rule = await prisma.rule.update({
+    where: { id: ruleId, emailAccountId },
+    data,
+    include: ruleHistoryRuleInclude,
+  });
+
+  queueRuleHistory({ rule, triggerType });
+
+  return rule;
+}
+
+export async function partialUpdateRule({
   ruleId,
   emailAccountId,
   data,
@@ -126,10 +154,26 @@ export function partialUpdateRule({
   emailAccountId: string;
   data: Partial<Rule>;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  if (hasRuleScopeUpdate(data)) {
+    const existingRule = await prisma.rule.findUnique({
+      where: { id: ruleId, emailAccountId },
+      select: RULE_SCOPE_SELECT,
+    });
+
+    if (!existingRule) throw new Error("Rule not found");
+
+    await assertNoSenderOnlyOverlap({
+      emailAccountId,
+      excludeRuleId: ruleId,
+      rule: mergeRuleScope(data, existingRule),
+    });
+  }
+
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data,
-    include: { actions: true, group: true },
+    triggerType: "conditions_updated",
   });
 }
 
@@ -142,9 +186,11 @@ export function updateRuleInstructions({
   emailAccountId: string;
   instructions: string;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data: { instructions },
+    triggerType: "instructions_updated",
   });
 }
 
@@ -157,9 +203,11 @@ export function setRuleRunOnThreads({
   emailAccountId: string;
   runOnThreads: boolean;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data: { runOnThreads },
+    triggerType: "run_on_threads_updated",
   });
 }
 
@@ -172,10 +220,11 @@ export function setRuleEnabled({
   emailAccountId: string;
   enabled: boolean;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data: { enabled },
-    include: { actions: true },
+    triggerType: "enabled_updated",
   });
 }
 
@@ -183,12 +232,18 @@ export async function createRuleWithResolvedActions({
   emailAccountId,
   data,
   actions,
+  skipSenderOnlyOverlapCheck = false,
 }: {
   emailAccountId: string;
   data: RuleRecordData & { name: string };
   actions: RuleActionCreateData[];
+  skipSenderOnlyOverlapCheck?: boolean;
 }): Promise<RuleWithRelations> {
   assertWebhookActionsAllowed(actions);
+
+  if (!skipSenderOnlyOverlapCheck) {
+    await assertNoSenderOnlyOverlap({ emailAccountId, rule: data });
+  }
 
   validateLowTrustStaticFromOutboundActions({
     from: data.from,
@@ -222,7 +277,7 @@ export async function createRuleWithResolvedActions({
     include: { actions: true, group: true },
   });
 
-  return rule as RuleWithRelations;
+  return rule;
 }
 
 export async function replaceRuleWithResolvedActions({
@@ -237,6 +292,17 @@ export async function replaceRuleWithResolvedActions({
   actions: RuleActionCreateData[];
 }): Promise<RuleWithRelations> {
   assertWebhookActionsAllowed(actions);
+
+  const existingRule = await prisma.rule.findUnique({
+    where: { id: ruleId, emailAccountId },
+    select: RULE_SCOPE_SELECT,
+  });
+
+  await assertNoSenderOnlyOverlap({
+    emailAccountId,
+    excludeRuleId: ruleId,
+    rule: existingRule ? mergeRuleScope(data, existingRule) : data,
+  });
 
   validateLowTrustStaticFromOutboundActions({
     from: data.from,
@@ -271,7 +337,13 @@ export async function replaceRuleWithResolvedActions({
     include: { actions: true, group: true },
   });
 
-  return rule as RuleWithRelations;
+  if (existingRule?.groupId && existingRule.groupId !== rule.groupId) {
+    await prisma.group.deleteMany({
+      where: { id: existingRule.groupId, emailAccountId },
+    });
+  }
+
+  return rule;
 }
 
 export async function createRule({
@@ -298,6 +370,16 @@ export async function createRule({
     });
 
     assertWebhookActionsAllowed(result.actions);
+
+    await assertNoSenderOnlyOverlap({
+      emailAccountId,
+      rule: {
+        instructions: result.condition.aiInstructions,
+        from: result.condition.static?.from,
+        to: result.condition.static?.to,
+        subject: result.condition.static?.subject,
+      },
+    });
 
     validateLowTrustStaticFromOutboundActions({
       from: result.condition.static?.from,
@@ -336,9 +418,10 @@ export async function createRule({
         subject: result.condition.static?.subject,
       },
       actions: mappedActions,
+      skipSenderOnlyOverlapCheck: true,
     });
 
-    await createRuleHistory({ rule, triggerType: "created" });
+    queueRuleHistory({ rule, triggerType: "created" });
 
     return rule;
   } catch (error) {
@@ -397,7 +480,7 @@ export async function updateRule({
       actions: mappedActions,
     });
 
-    await createRuleHistory({ rule, triggerType: "updated" });
+    queueRuleHistory({ rule, triggerType: "updated" });
 
     return rule;
   } catch (error) {
@@ -458,7 +541,7 @@ export async function upsertSystemRule({
       actions,
     });
 
-    await createRuleHistory({ rule, triggerType: "updated" });
+    queueRuleHistory({ rule, triggerType: "updated" });
     return rule;
   } else {
     logger.info("Creating new system rule");
@@ -472,7 +555,7 @@ export async function upsertSystemRule({
         actions,
       });
 
-      await createRuleHistory({ rule, triggerType: "created" });
+      queueRuleHistory({ rule, triggerType: "created" });
       return rule;
     } catch (error) {
       if (!isDuplicateError(error, "name")) throw error;
@@ -492,7 +575,7 @@ export async function upsertSystemRule({
         actions,
       });
 
-      await createRuleHistory({ rule, triggerType: "updated" });
+      queueRuleHistory({ rule, triggerType: "updated" });
       return rule;
     }
   }
@@ -535,7 +618,7 @@ export async function updateRuleActions({
   );
   validateWebhookUrlsInActions(mappedActions);
 
-  return prisma.rule.update({
+  const rule = await prisma.rule.update({
     where: { id: ruleId, emailAccountId },
     data: {
       actions: {
@@ -545,7 +628,12 @@ export async function updateRuleActions({
         },
       },
     },
+    include: ruleHistoryRuleInclude,
   });
+
+  queueRuleHistory({ rule, triggerType: "actions_updated" });
+
+  return rule;
 }
 
 export async function deleteRule({
@@ -615,6 +703,50 @@ function shouldEnable(
     (action) => getActionRiskLevel(action, {}).level,
   );
   return riskLevels.every((level) => level === "low");
+}
+
+type RuleScopeKey =
+  | "instructions"
+  | "from"
+  | "to"
+  | "subject"
+  | "body"
+  | "groupId";
+
+const RULE_SCOPE_KEYS = [
+  "instructions",
+  "from",
+  "to",
+  "subject",
+  "body",
+  "groupId",
+] as const satisfies RuleScopeKey[];
+
+const RULE_SCOPE_SELECT = {
+  instructions: true,
+  from: true,
+  to: true,
+  subject: true,
+  body: true,
+  groupId: true,
+} as const;
+
+function hasRuleScopeUpdate(data: Partial<Rule>) {
+  return RULE_SCOPE_KEYS.some((key) => Object.hasOwn(data, key));
+}
+
+function mergeRuleScope<T extends Record<RuleScopeKey, string | null>>(
+  data: Partial<Record<RuleScopeKey, string | null | undefined>>,
+  existingRule: T,
+): Record<RuleScopeKey, string | null> {
+  return Object.fromEntries(
+    RULE_SCOPE_KEYS.map((key) => [
+      key,
+      Object.hasOwn(data, key)
+        ? ((data[key] as string | null | undefined) ?? null)
+        : existingRule[key],
+    ]),
+  ) as Record<RuleScopeKey, string | null>;
 }
 
 function validateLowTrustStaticFromOutboundActions({
@@ -778,6 +910,13 @@ function validateWebhookUrlsInActions(actions: RuleActionCreateData[]) {
       throw new SafeError(`Invalid webhook URL: ${result.error}`, 400);
     }
   }
+}
+
+function queueRuleHistory(params: {
+  rule: RuleWithRelations;
+  triggerType: RuleHistoryTrigger;
+}) {
+  after(() => createRuleHistory(params));
 }
 
 function addNestedActionOwnershipToInputs(

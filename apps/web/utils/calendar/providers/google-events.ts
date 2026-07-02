@@ -1,13 +1,20 @@
 import type { calendar_v3 } from "@googleapis/calendar";
+import { randomUUID } from "node:crypto";
+import { BookingLinkLocationType } from "@/generated/prisma/enums";
 import { getCalendarClientWithRefresh } from "@/utils/calendar/client";
 import type {
   CalendarEvent,
+  CalendarEventCancelInput,
   CalendarEventProvider,
+  CalendarEventUpdateInput,
+  CalendarEventWriteInput,
+  CalendarEventWriteResult,
 } from "@/utils/calendar/event-types";
 import type { Logger } from "@/utils/logger";
 
 export interface GoogleCalendarConnectionParams {
   accessToken: string | null;
+  connectionId: string;
   emailAccountId: string;
   expiresAt: number | null;
   refreshToken: string | null;
@@ -28,6 +35,7 @@ export class GoogleCalendarEventProvider implements CalendarEventProvider {
       refreshToken: this.connection.refreshToken,
       expiresAt: this.connection.expiresAt,
       emailAccountId: this.connection.emailAccountId,
+      connectionId: this.connection.connectionId,
       logger: this.logger,
     });
   }
@@ -90,6 +98,87 @@ export class GoogleCalendarEventProvider implements CalendarEventProvider {
     const events = response.data.items || [];
 
     return events.map((event) => this.parseEvent(event));
+  }
+
+  async createEvent(
+    input: CalendarEventWriteInput,
+  ): Promise<CalendarEventWriteResult> {
+    const client = await this.getClient();
+    const useGoogleMeet =
+      input.locationType === BookingLinkLocationType.GOOGLE_MEET;
+
+    const response = await client.events.insert({
+      calendarId: input.calendarId,
+      conferenceDataVersion: useGoogleMeet ? 1 : undefined,
+      sendUpdates: "all",
+      requestBody: {
+        summary: input.title,
+        description: input.description,
+        location: useGoogleMeet ? undefined : input.locationValue || undefined,
+        start: {
+          dateTime: input.startTime.toISOString(),
+          timeZone: input.timezone,
+        },
+        end: {
+          dateTime: input.endTime.toISOString(),
+          timeZone: input.timezone,
+        },
+        attendees: input.attendees.map((attendee) => ({
+          email: attendee.email,
+          displayName: attendee.name,
+        })),
+        conferenceData: useGoogleMeet
+          ? {
+              createRequest: {
+                requestId: randomUUID(),
+                conferenceSolutionKey: { type: "hangoutsMeet" },
+              },
+            }
+          : undefined,
+      },
+    });
+
+    return {
+      id: response.data.id || "",
+      providerCalendarId: input.calendarId,
+      eventUrl: response.data.htmlLink || undefined,
+      videoConferenceLink:
+        response.data.hangoutLink ||
+        response.data.conferenceData?.entryPoints?.find(
+          (entry) => entry.entryPointType === "video",
+        )?.uri ||
+        undefined,
+    };
+  }
+
+  async cancelEvent(input: CalendarEventCancelInput): Promise<void> {
+    const client = await this.getClient();
+
+    await client.events.delete({
+      calendarId: input.calendarId,
+      eventId: input.eventId,
+      sendUpdates: "all",
+    });
+  }
+
+  async updateEvent(input: CalendarEventUpdateInput): Promise<void> {
+    const client = await this.getClient();
+
+    await client.events.patch({
+      calendarId: input.calendarId,
+      eventId: input.eventId,
+      sendUpdates: "all",
+      requestBody: {
+        start: {
+          dateTime: input.startTime.toISOString(),
+          timeZone: input.timezone,
+        },
+        end: {
+          dateTime: input.endTime.toISOString(),
+          timeZone: input.timezone,
+        },
+      },
+    });
   }
 
   private parseEvent(event: calendar_v3.Schema$Event) {

@@ -65,7 +65,7 @@ export async function handleSlackCallback(
     const { emailAccountId } = slackState;
     callbackLogger = logger.with({ emailAccountId });
 
-    const finalRedirectUrl = buildSettingsRedirectUrl(emailAccountId);
+    const finalRedirectUrl = buildChannelsRedirectUrl(emailAccountId);
     finalRedirectUrl.searchParams.set("slack_email_account_id", emailAccountId);
     const cachedResult = await getOAuthCodeResult(code);
     if (cachedResult) {
@@ -131,6 +131,7 @@ export async function handleSlackCallback(
     await sendSlackOnboardingDirectMessageWithLogging({
       accessToken: tokens.access_token,
       userId: tokens.authed_user.id,
+      botUserId: tokens.bot_user_id,
       teamId: tokens.team.id,
       logger: callbackLogger,
     });
@@ -175,14 +176,14 @@ export async function handleSlackCallback(
     }
 
     // Best-effort: try to extract emailAccountId from the state param for a
-    // proper account-scoped redirect. Fall back to prefix-less /settings which
+    // proper account-scoped redirect. Fall back to prefix-less /channels which
     // the (redirects) page will handle.
-    let errorPath = "/settings";
+    let errorPath = "/channels";
     try {
       const state = request.nextUrl.searchParams.get("state");
       if (state) {
         const parsed = extractEmailAccountIdFromState(state);
-        if (parsed) errorPath = prefixPath(parsed, "/settings");
+        if (parsed) errorPath = prefixPath(parsed, "/channels");
       }
     } catch {
       // Ignore — use fallback path
@@ -213,7 +214,7 @@ function validateOAuthCallback(
   const oauthError = searchParams.get("error");
   const storedState = request.cookies.get(SLACK_STATE_COOKIE_NAME)?.value;
 
-  const redirectUrl = new URL("/settings", env.NEXT_PUBLIC_BASE_URL);
+  const redirectUrl = new URL("/channels", env.NEXT_PUBLIC_BASE_URL);
   const response = NextResponse.redirect(redirectUrl);
 
   response.cookies.delete(SLACK_STATE_COOKIE_NAME);
@@ -279,7 +280,7 @@ function parseAndValidateSlackState(
   const validationResult = slackOAuthStateSchema.safeParse(rawState);
   if (!validationResult.success) {
     logger.error("State validation failed", {
-      errors: validationResult.error.errors,
+      errors: validationResult.error.issues,
     });
     redirectUrl.searchParams.set("error", "invalid_state_format");
     throw new RedirectError(redirectUrl, responseHeaders);
@@ -297,9 +298,9 @@ function extractEmailAccountIdFromState(state: string): string | null {
   }
 }
 
-function buildSettingsRedirectUrl(emailAccountId: string): URL {
+function buildChannelsRedirectUrl(emailAccountId: string): URL {
   const url = new URL(
-    prefixPath(emailAccountId, "/settings"),
+    prefixPath(emailAccountId, "/channels"),
     env.NEXT_PUBLIC_BASE_URL,
   );
   return url;

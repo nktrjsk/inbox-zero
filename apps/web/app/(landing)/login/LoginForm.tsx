@@ -6,44 +6,45 @@ import { useSearchParams } from "next/navigation";
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/Button";
 import { Button as UIButton } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { signIn, signUp, signInWithOauth2 } from "@/utils/auth-client";
 import { WELCOME_PATH } from "@/utils/config";
 import { toastError } from "@/components/Toast";
 import { normalizeInternalPath } from "@/utils/path";
-import { getPossessiveBrandName } from "@/utils/branding";
-import { AlertBasic } from "@/components/Alert";
+import { buildRedirectUrl, redirectToSafeUrl } from "@/utils/redirect";
 import { createClientLogger } from "@/utils/logger-client";
+import type { LoginProvider } from "@/utils/oauth/login-providers";
 
 const logger = createClientLogger("login/LoginForm");
+const CONNECT_MAILBOX_PATH = "/connect-mailbox";
 
 export function LoginForm({
+  enabledProviders,
   useGoogleOauthEmulator,
+  emailLoginEnabled = false,
 }: {
+  enabledProviders: readonly LoginProvider[];
   useGoogleOauthEmulator: boolean;
+  emailLoginEnabled?: boolean;
 }) {
   const searchParams = useSearchParams();
   const next = searchParams?.get("next");
   const { callbackURL, errorCallbackURL } = getAuthCallbackUrls(next);
+  const appleCallbackURL = buildConnectMailboxUrl(callbackURL);
+  const showAppleLogin = enabledProviders.includes("apple");
+  const showGoogleLogin = enabledProviders.includes("google");
+  const showMicrosoftLogin = enabledProviders.includes("microsoft");
+  const showSsoLogin = enabledProviders.includes("sso");
 
+  const [loadingApple, setLoadingApple] = useState(false);
   const [loadingGoogle, setLoadingGoogle] = useState(false);
   const [loadingMicrosoft, setLoadingMicrosoft] = useState(false);
-  const [googleError, setGoogleError] = useState<string | null>(null);
   const [loadingEmail, setLoadingEmail] = useState(false);
   const [emailError, setEmailError] = useState<string | null>(null);
   const [isSignUp, setIsSignUp] = useState(false);
 
   const handleGoogleSignIn = async () => {
     setLoadingGoogle(true);
-    setGoogleError(null);
     try {
       if (useGoogleOauthEmulator) {
         const result = await signInWithOauth2({
@@ -54,7 +55,7 @@ export function LoginForm({
         if (!result.url) {
           throw new Error("Missing Google sign-in redirect URL");
         }
-        window.location.href = result.url;
+        redirectToSafeUrl(result.url, { allowExternal: true });
       } else {
         await signIn.social({
           provider: "google",
@@ -65,7 +66,6 @@ export function LoginForm({
     } catch (error) {
       const description = getSocialSignInErrorMessage(error);
       logger.error("Error signing in with Google", { error });
-      setGoogleError(description);
       toastError({
         title: "Error signing in with Google",
         description,
@@ -131,130 +131,130 @@ export function LoginForm({
 
   return (
     <div className="flex flex-col justify-center gap-2 px-4 sm:px-16">
-      <Dialog>
-        <DialogTrigger asChild>
-          <Button size="2xl">
-            <span className="flex items-center justify-center">
-              <Image
-                src="/images/google.svg"
-                alt="Google"
-                width={24}
-                height={24}
-                unoptimized
-              />
-              <span className="ml-2">Sign in with Google</span>
-            </span>
-          </Button>
-        </DialogTrigger>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Sign in</DialogTitle>
-          </DialogHeader>
-          <DialogDescription className="mt-1 text-sm leading-6 text-slate-700 dark:text-foreground">
-            {getPossessiveBrandName()} use and transfer of information received
-            from Google APIs to any other app will adhere to{" "}
-            <a
-              href="https://developers.google.com/terms/api-services-user-data-policy"
-              className="underline underline-offset-4 hover:text-gray-900"
-            >
-              Google API Services User Data
-            </a>{" "}
-            Policy, including the Limited Use requirements.
-          </DialogDescription>
-          {googleError ? (
-            <AlertBasic
-              variant="destructive"
-              title="Failed to start Google sign-in"
-              description={googleError}
+      {showGoogleLogin ? (
+        <Button size="2xl" loading={loadingGoogle} onClick={handleGoogleSignIn}>
+          <span className="flex items-center justify-center">
+            <Image
+              src="/images/google.svg"
+              alt="Google"
+              width={24}
+              height={24}
+              unoptimized
             />
-          ) : null}
-          <div>
-            <Button loading={loadingGoogle} onClick={handleGoogleSignIn}>
-              I agree
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Button
-        size="2xl"
-        loading={loadingMicrosoft}
-        onClick={handleMicrosoftSignIn}
-      >
-        <span className="flex items-center justify-center">
-          <Image
-            src="/images/microsoft.svg"
-            alt="Microsoft"
-            width={24}
-            height={24}
-            unoptimized
-          />
-          <span className="ml-2">Sign in with Microsoft</span>
-        </span>
-      </Button>
-
-      <UIButton
-        variant="ghost"
-        size="lg"
-        className="w-full hover:scale-105 transition-transform"
-        asChild
-      >
-        <Link href="/login/sso">Sign in with SSO</Link>
-      </UIButton>
-
-      <div className="relative my-2">
-        <div className="absolute inset-0 flex items-center">
-          <span className="w-full border-t" />
-        </div>
-        <div className="relative flex justify-center text-xs uppercase">
-          <span className="bg-background px-2 text-muted-foreground">
-            Or continue with email
+            <span className="ml-2">Sign in with Google</span>
           </span>
-        </div>
-      </div>
-
-      <form onSubmit={handleEmailSubmit} className="flex flex-col gap-2">
-        {isSignUp && (
-          <Input
-            name="name"
-            type="text"
-            placeholder="Name"
-            autoComplete="name"
-          />
-        )}
-        <Input
-          name="email"
-          type="email"
-          placeholder="Email"
-          required
-          autoComplete="email"
-        />
-        <Input
-          name="password"
-          type="password"
-          placeholder="Password"
-          required
-          minLength={8}
-          autoComplete={isSignUp ? "new-password" : "current-password"}
-        />
-        {emailError && <p className="text-sm text-destructive">{emailError}</p>}
-        <Button loading={loadingEmail} type="submit">
-          {isSignUp ? "Sign up" : "Sign in"} with email
         </Button>
-        <UIButton
-          variant="link"
-          type="button"
-          className="text-xs"
-          onClick={() => {
-            setIsSignUp((v) => !v);
-            setEmailError(null);
-          }}
+      ) : null}
+
+      {showMicrosoftLogin ? (
+        <Button
+          size="2xl"
+          loading={loadingMicrosoft}
+          onClick={handleMicrosoftSignIn}
         >
-          {isSignUp
-            ? "Already have an account? Sign in"
-            : "Don't have an account? Sign up"}
+          <span className="flex items-center justify-center">
+            <Image
+              src="/images/microsoft.svg"
+              alt="Microsoft"
+              width={24}
+              height={24}
+              unoptimized
+            />
+            <span className="ml-2">Sign in with Microsoft</span>
+          </span>
+        </Button>
+      ) : null}
+
+      {showAppleLogin ? (
+        <UIButton
+          variant="ghost"
+          size="lg"
+          className="w-full hover:scale-105 transition-transform"
+          loading={loadingApple}
+          onClick={() =>
+            handleSocialSignIn({
+              provider: "apple",
+              providerName: "Apple",
+              callbackURL: appleCallbackURL,
+              errorCallbackURL,
+              setLoading: setLoadingApple,
+            })
+          }
+        >
+          Sign in with Apple
         </UIButton>
-      </form>
+      ) : null}
+
+      {showSsoLogin ? (
+        <UIButton
+          variant="ghost"
+          size="lg"
+          className="w-full hover:scale-105 transition-transform"
+          asChild
+        >
+          <Link href="/login/sso">Sign in with SSO</Link>
+        </UIButton>
+      ) : null}
+
+      {emailLoginEnabled ? (
+        <>
+          <div className="relative my-2">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase">
+              <span className="bg-background px-2 text-muted-foreground">
+                Or continue with email
+              </span>
+            </div>
+          </div>
+
+          <form onSubmit={handleEmailSubmit} className="flex flex-col gap-2">
+            {isSignUp && (
+              <Input
+                name="name"
+                type="text"
+                placeholder="Name"
+                autoComplete="name"
+              />
+            )}
+            <Input
+              name="email"
+              type="email"
+              placeholder="Email"
+              required
+              autoComplete="email"
+            />
+            <Input
+              name="password"
+              type="password"
+              placeholder="Password"
+              required
+              minLength={8}
+              autoComplete={isSignUp ? "new-password" : "current-password"}
+            />
+            {emailError && (
+              <p className="text-sm text-destructive">{emailError}</p>
+            )}
+            <Button loading={loadingEmail} type="submit">
+              {isSignUp ? "Sign up" : "Sign in"} with email
+            </Button>
+            <UIButton
+              variant="link"
+              type="button"
+              className="text-xs"
+              onClick={() => {
+                setIsSignUp((v) => !v);
+                setEmailError(null);
+              }}
+            >
+              {isSignUp
+                ? "Already have an account? Sign in"
+                : "Don't have an account? Sign up"}
+            </UIButton>
+          </form>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -266,6 +266,11 @@ function getAuthCallbackUrls(next: string | null) {
     : "/login/error";
 
   return { callbackURL, errorCallbackURL };
+}
+
+function buildConnectMailboxUrl(nextPath: string) {
+  if (nextPath === CONNECT_MAILBOX_PATH) return CONNECT_MAILBOX_PATH;
+  return buildRedirectUrl(CONNECT_MAILBOX_PATH, { next: nextPath });
 }
 
 function isOrganizationInvitationPath(path: string) {
@@ -280,8 +285,8 @@ async function handleSocialSignIn({
   errorCallbackURL,
   setLoading,
 }: {
-  provider: "google" | "microsoft";
-  providerName: "Google" | "Microsoft";
+  provider: "apple" | "google" | "microsoft";
+  providerName: "Apple" | "Google" | "Microsoft";
   callbackURL: string;
   errorCallbackURL: string;
   setLoading: (loading: boolean) => void;
@@ -307,8 +312,22 @@ async function handleSocialSignIn({
 
 function getSocialSignInErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) {
+    if (isNetworkSignInError(error.message)) {
+      return "Could not start sign-in. Please check that this app is opened from its configured public URL, then try again.";
+    }
+
     return error.message;
   }
 
   return "Please try again or contact support.";
+}
+
+function isNetworkSignInError(message: string) {
+  const normalizedMessage = message.toLowerCase();
+
+  return (
+    normalizedMessage === "load failed" ||
+    normalizedMessage === "failed to fetch" ||
+    normalizedMessage === "networkerror when attempting to fetch resource."
+  );
 }

@@ -1,11 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { cleanThread } from "./route";
+import { NextRequest } from "next/server";
 import { GmailLabel } from "@/utils/gmail/label";
 import type { ParsedMessage } from "@/utils/types";
 import { CleanAction } from "@/generated/prisma/enums";
-import { getMockMessage } from "@/__tests__/helpers";
+import { createTestLogger, getMockMessage } from "@/__tests__/helpers";
 
-vi.mock("server-only", () => ({}));
+const { cleanerEnv } = vi.hoisted(() => ({
+  cleanerEnv: {
+    NEXT_PUBLIC_CLEANER_ENABLED: true,
+  },
+}));
+
+vi.mock("@/env", () => ({
+  env: cleanerEnv,
+}));
+
+vi.mock("@/utils/middleware", async () => {
+  const { createWithErrorTestMiddleware } = await vi.importActual<
+    typeof import("@/__tests__/helpers")
+  >("@/__tests__/helpers");
+
+  return createWithErrorTestMiddleware({ handleSafeErrors: true });
+});
 
 const mockPublishToQstash = vi.fn();
 vi.mock("@/utils/upstash", () => ({
@@ -34,6 +50,10 @@ vi.mock("@/utils/redis/clean", () => ({
   updateThread: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("@/utils/qstash", () => ({
+  withQstashOrInternal: (handler: unknown) => handler,
+}));
+
 const mockAiClean = vi.fn();
 vi.mock("@/utils/ai/clean/ai-clean", () => ({
   aiClean: (...args: unknown[]) => mockAiClean(...args),
@@ -45,9 +65,11 @@ vi.mock("@/utils/ai/group/find-newsletters", () => ({
 
 vi.mock("@/utils/ai/group/find-receipts", () => ({
   isReceipt: vi.fn().mockReturnValue(false),
-  isMaybeReceipt: vi.fn().mockImplementation((message: ParsedMessage) => {
-    return message.headers.subject.toLowerCase().includes("payment");
-  }),
+  isMaybeReceipt: vi
+    .fn()
+    .mockImplementation((message: ParsedMessage) =>
+      message.headers.subject.toLowerCase().includes("payment"),
+    ),
 }));
 
 vi.mock("@/utils/parse/parseHtml.server", () => ({
@@ -58,13 +80,10 @@ vi.mock("@/utils/parse/calender-event", () => ({
   getCalendarEventStatus: vi.fn().mockReturnValue({ isEvent: false }),
 }));
 
-const mockLogger = {
-  info: vi.fn(),
-  error: vi.fn(),
-  warn: vi.fn(),
-  debug: vi.fn(),
-  trace: vi.fn(),
-};
+import { cleanThread } from "./controller";
+import { POST } from "./route";
+
+const logger = createTestLogger();
 
 function getDefaultParams() {
   return {
@@ -82,13 +101,14 @@ function getDefaultParams() {
       attachment: true,
       conversation: true,
     },
-    logger: mockLogger as any,
+    logger,
   };
 }
 
 describe("cleanThread", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    cleanerEnv.NEXT_PUBLIC_CLEANER_ENABLED = true;
 
     mockGetEmailAccountWithAiAndTokens.mockResolvedValue({
       id: "email-account-id",
@@ -238,5 +258,22 @@ describe("cleanThread", () => {
 
       expect(mockAiClean).toHaveBeenCalled();
     });
+  });
+
+  it("returns not found when cleaner is disabled on self-hosted", async () => {
+    cleanerEnv.NEXT_PUBLIC_CLEANER_ENABLED = false;
+
+    const response = await POST(
+      new NextRequest("http://localhost:3000/api/clean", {
+        method: "POST",
+      }) as any,
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: "Cleaner is not enabled",
+      isKnownError: true,
+    });
+    expect(mockGetThreadMessages).not.toHaveBeenCalled();
   });
 });

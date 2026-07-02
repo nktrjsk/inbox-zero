@@ -12,6 +12,12 @@ import {
   type DocumentFiledBlocksParams,
   type DocumentAskBlocksParams,
 } from "./messages/document-filing";
+import { buildDigestBlocks, type DigestBlocksParams } from "./messages/digest";
+import {
+  buildFollowUpReminderBlocks,
+  type FollowUpReminderBlocksParams,
+} from "./messages/follow-up-reminder";
+import { getFollowUpCopy } from "@/utils/follow-up/copy";
 
 export type SlackBriefingParams = MeetingBriefingBlocksParams & {
   accessToken: string;
@@ -39,7 +45,7 @@ export async function sendMeetingBriefingToSlack({
 
   await postMessageWithJoin(client, channelId, {
     blocks,
-    text: `Briefing for ${meetingTitle}, starting at ${formattedTime}`,
+    text: `📅 Briefing for ${meetingTitle}, starting at ${formattedTime}`,
   });
 }
 
@@ -55,23 +61,27 @@ export async function sendChannelConfirmation({
   const client = createSlackClient(accessToken);
 
   await postMessageWithJoin(client, channelId, {
-    text: `Inbox Zero connected! You can ${formatSlackAppMention(botUserId)} here to chat about your emails. If you enable meeting briefs or attachment filing notifications, I can send those in this channel too.`,
+    text: `✅ Inbox Zero connected! You can mention ${formatSlackAppMention(botUserId)} in this channel to chat about your emails. If you enable meeting briefs or attachment filing notifications, I can send those here too.`,
   });
 }
 
 export async function sendConnectionOnboardingDirectMessage({
   accessToken,
   userId,
+  botUserId,
 }: {
   accessToken: string;
   userId: string;
+  botUserId?: string | null;
 }): Promise<void> {
   const client = createSlackClient(accessToken);
 
-  await client.chat.postMessage({
-    channel: userId,
-    text: "Inbox Zero connected. Next, choose a private channel in Inbox Zero Settings for meeting brief and attachment notifications, then invite @InboxZero there. You can also DM me anytime to chat about your emails.",
-  });
+  await client.chat.postMessage(
+    disableSlackLinkUnfurls({
+      channel: userId,
+      text: `✅ Inbox Zero connected. Next, choose a private channel in Inbox Zero Settings for meeting brief and attachment notifications, then invite ${formatSlackAppMention(botUserId)} there. You can also DM me anytime to chat about your emails.`,
+    }),
+  );
 }
 
 export type SlackDocumentFiledParams = DocumentFiledBlocksParams & {
@@ -99,7 +109,7 @@ export async function sendDocumentFiledToSlack({
 
   await postMessageWithJoin(client, channelId, {
     blocks,
-    text: `Filed ${filename} to ${folderPath}`,
+    text: `📨 Filed ${filename} to ${folderPath}`,
   });
 }
 
@@ -120,7 +130,52 @@ export async function sendDocumentAskToSlack({
 
   await postMessageWithJoin(client, channelId, {
     blocks,
-    text: `Where should I file ${filename}?`,
+    text: `📄 Where should I file ${filename}?`,
+  });
+}
+
+export type SlackDigestParams = DigestBlocksParams & {
+  accessToken: string;
+  channelId: string;
+};
+
+export async function sendDigestToSlack({
+  accessToken,
+  channelId,
+  date,
+  ruleNames,
+  itemsByRule,
+}: SlackDigestParams): Promise<void> {
+  const client = createSlackClient(accessToken);
+  const blocks = buildDigestBlocks({
+    date,
+    ruleNames,
+    itemsByRule,
+  });
+
+  await postMessageWithJoin(client, channelId, {
+    blocks,
+    text: "📋 Your Inbox Zero digest",
+  });
+}
+
+export type SlackFollowUpReminderParams = FollowUpReminderBlocksParams & {
+  accessToken: string;
+  channelId: string;
+};
+
+export async function sendFollowUpReminderToSlack({
+  accessToken,
+  channelId,
+  ...blockParams
+}: SlackFollowUpReminderParams): Promise<string | null> {
+  const client = createSlackClient(accessToken);
+  const blocks = buildFollowUpReminderBlocks(blockParams);
+  const { emoji } = getFollowUpCopy(blockParams.trackerType);
+
+  return postMessageWithJoin(client, channelId, {
+    blocks,
+    text: `${emoji} Follow-up: ${blockParams.subject}`,
   });
 }
 
@@ -186,19 +241,30 @@ export function formatSlackAppMention(botUserId: string | null | undefined) {
   return botUserId ? `<@${botUserId}>` : "@Inbox Zero";
 }
 
+export function disableSlackLinkUnfurls<T extends object>(message: T) {
+  return {
+    ...message,
+    unfurl_links: false,
+    unfurl_media: false,
+  };
+}
+
 type Blocks = (KnownBlock | Block)[];
 
 async function postMessageWithJoin(
   client: WebClient,
   channelId: string,
   message: { text: string; blocks?: Blocks },
-): Promise<void> {
-  const args = message.blocks
-    ? { channel: channelId, blocks: message.blocks, text: message.text }
-    : { channel: channelId, text: message.text };
+): Promise<string | null> {
+  const args = disableSlackLinkUnfurls(
+    message.blocks
+      ? { channel: channelId, blocks: message.blocks, text: message.text }
+      : { channel: channelId, text: message.text },
+  );
 
   try {
-    await client.chat.postMessage(args);
+    const response = await client.chat.postMessage(args);
+    return response.ts ?? null;
   } catch (error: unknown) {
     if (isSlackError(error) && error.data?.error === "not_in_channel") {
       try {
@@ -214,8 +280,8 @@ async function postMessageWithJoin(
         }
         throw joinError;
       }
-      await client.chat.postMessage(args);
-      return;
+      const response = await client.chat.postMessage(args);
+      return response.ts ?? null;
     }
     throw error;
   }

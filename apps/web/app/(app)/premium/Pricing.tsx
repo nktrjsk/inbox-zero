@@ -16,14 +16,14 @@ import {
   DiscountBadge,
   type Frequency,
 } from "@/app/(app)/premium/PricingFrequencyToggle";
-import { getUserTier } from "@/utils/premium";
+import { getUserTier, hasActiveAppleSubscription } from "@/utils/premium";
 import {
   getPremiumTierName,
   shouldShowLegacyStripePricingNotice,
   type Tier,
   tiers,
 } from "@/app/(app)/premium/config";
-import { AlertBasic, AlertWithButton } from "@/components/Alert";
+import { AlertBasic } from "@/components/Alert";
 import { TooltipExplanation } from "@/components/TooltipExplanation";
 import { toastError } from "@/components/Toast";
 import {
@@ -35,6 +35,7 @@ import { LoadingMiniSpinner } from "@/components/Loading";
 import { cn } from "@/utils";
 import { ManageSubscription } from "@/app/(app)/premium/ManageSubscription";
 import { captureException } from "@/utils/error";
+import { redirectToSafeUrl } from "@/utils/redirect";
 
 export type PricingProps = {
   header?: React.ReactNode;
@@ -45,7 +46,7 @@ export type PricingProps = {
 
 export default function Pricing(props: PricingProps) {
   const posthog = usePostHog();
-  const { premium, isLoading, error, data } = usePremium();
+  const { premium, isPremium, isLoading, error, data } = usePremium();
   const hasTrackedPricingView = useRef(false);
 
   const isLoggedIn = !!data?.id;
@@ -53,8 +54,16 @@ export default function Pricing(props: PricingProps) {
     ? "welcome_upgrade"
     : "app_premium";
   const displayedTiers = props.displayTiers || tiers;
+  const hasActiveAppleManagedSubscription = hasActiveAppleSubscription(
+    premium?.appleExpiresAt || null,
+    premium?.appleRevokedAt || null,
+    premium?.appleSubscriptionStatus || null,
+  );
   const hasExistingSubscription = Boolean(
-    premium?.stripeSubscriptionId || premium?.lemonSqueezyCustomerId,
+    isPremium ||
+      premium?.stripeSubscriptionId ||
+      premium?.lemonSqueezyCustomerId ||
+      hasActiveAppleManagedSubscription,
   );
   const isLegacyStripePlan = shouldShowLegacyStripePricingNotice(premium);
 
@@ -112,42 +121,27 @@ export default function Pricing(props: PricingProps) {
       >
         {header}
 
-        {!!(
-          premium?.stripeSubscriptionId || premium?.lemonSqueezyCustomerId
-        ) && (
+        {hasExistingSubscription && (
           <div className="mb-8 mt-8 text-center">
-            <ManageSubscription premium={premium} />
+            <ManageSubscription premium={premium ?? null} />
 
             {userPremiumTier && (
-              <>
-                <Button className="ml-2" asChild>
-                  <Link href="/setup">
-                    <SparklesIcon className="mr-2 h-4 w-4" />
-                    Go to app
-                  </Link>
-                </Button>
-                <div className="mx-auto mt-4 max-w-md">
-                  {userPremiumTier === "STARTER_MONTHLY" ||
-                  userPremiumTier === "STARTER_ANNUALLY" ||
-                  userPremiumTier === "PLUS_MONTHLY" ||
-                  userPremiumTier === "PLUS_ANNUALLY" ? (
-                    <AlertWithButton
-                      className="bg-background"
-                      variant="blue"
-                      title="Need multiple accounts?"
-                      description="Individual plans are designed for single users. Contact our support team for custom pricing on multiple accounts."
-                      icon={null}
-                      button={
-                        <div className="ml-4 whitespace-nowrap">
-                          <Button asChild>
-                            <Link href="/support">Contact Support</Link>
-                          </Button>
-                        </div>
-                      }
-                    />
-                  ) : null}
-                </div>
-              </>
+              <Button className="ml-2" asChild>
+                <Link href="/setup">
+                  <SparklesIcon className="mr-2 h-4 w-4" />
+                  Go to app
+                </Link>
+              </Button>
+            )}
+
+            {hasActiveAppleManagedSubscription && (
+              <div className="mx-auto mt-4 max-w-2xl text-left">
+                <AlertBasic
+                  variant="blue"
+                  title="Managed in the App Store"
+                  description="This subscription is billed by Apple. To change or cancel it, use your iPhone or iPad subscription settings."
+                />
+              </div>
             )}
 
             {isLegacyStripePlan && (
@@ -179,22 +173,23 @@ export default function Pricing(props: PricingProps) {
               : "max-w-7xl lg:mx-0 lg:max-w-none lg:grid-cols-3",
           )}
         >
-          {displayedTiers.map((tier) => {
-            return (
-              <PriceTier
-                key={tier.name}
-                tier={tier}
-                userPremiumTier={userPremiumTier}
-                frequency={frequency}
-                stripeSubscriptionId={premium?.stripeSubscriptionId}
-                stripeSubscriptionStatus={premium?.stripeSubscriptionStatus}
-                isLoggedIn={isLoggedIn}
-                router={router}
-                userId={data?.id}
-                pricingSource={pricingSource}
-              />
-            );
-          })}
+          {displayedTiers.map((tier) => (
+            <PriceTier
+              key={tier.name}
+              tier={tier}
+              userPremiumTier={userPremiumTier}
+              frequency={frequency}
+              stripeSubscriptionId={premium?.stripeSubscriptionId}
+              stripeSubscriptionStatus={premium?.stripeSubscriptionStatus}
+              hasActiveAppleManagedSubscription={
+                hasActiveAppleManagedSubscription
+              }
+              isLoggedIn={isLoggedIn}
+              router={router}
+              userId={data?.id}
+              pricingSource={pricingSource}
+            />
+          ))}
         </div>
       </div>
     </LoadingContent>
@@ -207,6 +202,7 @@ function PriceTier({
   frequency,
   stripeSubscriptionId,
   stripeSubscriptionStatus,
+  hasActiveAppleManagedSubscription,
   isLoggedIn,
   router,
   userId,
@@ -217,6 +213,7 @@ function PriceTier({
   frequency: Frequency;
   stripeSubscriptionId: string | null | undefined;
   stripeSubscriptionStatus: string | null | undefined;
+  hasActiveAppleManagedSubscription: boolean;
   isLoggedIn: boolean;
   router: ReturnType<typeof useRouter>;
   userId: string | null | undefined;
@@ -325,7 +322,7 @@ function PriceTier({
 
           // Handle enterprise tier differently - redirect to sales page
           if (tier.ctaLink) {
-            window.location.href = tier.ctaLink;
+            redirectToSafeUrl(tier.ctaLink, { allowExternal: true });
             return;
           }
 
@@ -339,6 +336,13 @@ function PriceTier({
           async function load() {
             if (tier.tiers[frequency.value] === userPremiumTier) {
               toast.info("You are already on this plan");
+              return;
+            }
+
+            if (hasActiveAppleManagedSubscription) {
+              toast.info(
+                "This subscription is managed through the App Store. To change or cancel it, use your iPhone or iPad subscription settings.",
+              );
               return;
             }
 
@@ -378,7 +382,7 @@ function PriceTier({
               return;
             }
 
-            window.location.href = result.data.url;
+            redirectToSafeUrl(result.data.url, { allowExternal: true });
           }
 
           try {

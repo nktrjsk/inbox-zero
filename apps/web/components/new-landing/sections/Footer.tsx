@@ -21,6 +21,7 @@ const selfHostedFooter = {
       href: "https://docs.getinboxzero.com",
       target: "_blank",
     },
+    { name: "Contact us", href: `mailto:${env.NEXT_PUBLIC_SUPPORT_EMAIL}` },
     { name: "GitHub", href: "/github", target: "_blank" },
     { name: "Discord", href: "/discord", target: "_blank" },
   ],
@@ -33,7 +34,7 @@ const selfHostedFooter = {
 export function Footer({ className, variant = "default" }: FooterProps) {
   if (env.NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS) {
     return (
-      <footer className="relative z-50 border-t border-[#E7E7E7A3] bg-cover bg-center bg-no-repeat overflow-hidden">
+      <footer className="border-t border-[#E7E7E7A3] bg-cover bg-center bg-no-repeat overflow-hidden">
         <div className={cn("overflow-hidden px-6 py-12 lg:px-8", className)}>
           <div className="flex flex-wrap justify-center gap-x-6 gap-y-2">
             {selfHostedFooter.resources.map((item) => (
@@ -77,7 +78,12 @@ export function Footer({ className, variant = "default" }: FooterProps) {
   }
 
   return (
-    <footer className="relative z-50 border-t border-[#E7E7E7A3] bg-cover bg-center bg-no-repeat overflow-hidden">
+    <footer
+      className={cn(
+        "border-t border-[#E7E7E7A3] bg-cover bg-center bg-no-repeat overflow-hidden",
+        variant === "default" && "relative z-50",
+      )}
+    >
       {variant === "default" ? <UnicornScene className="opacity-15" /> : null}
       <div
         className={cn("overflow-hidden px-6 py-20 sm:py-24 lg:px-8", className)}
@@ -114,7 +120,7 @@ export function Footer({ className, variant = "default" }: FooterProps) {
           </div>
         </nav>
         <div className="mt-40 flex items-center justify-between">
-          <Logo variant="glass" />
+          <Logo />
           <div className="flex items-center gap-4">
             {footerNavigation.social.map((item) => (
               <Link

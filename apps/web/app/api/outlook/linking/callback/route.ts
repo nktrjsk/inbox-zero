@@ -23,7 +23,10 @@ import {
   parseMicrosoftScopes,
 } from "@/utils/oauth/microsoft-oauth";
 import {
-  getMicrosoftGraphUrl,
+  fetchMicrosoftGraph,
+  fetchMicrosoftOidcUserInfo,
+  fetchMicrosoftUserProfile,
+  MicrosoftUserProfileError,
   requestMicrosoftToken,
 } from "@/utils/microsoft/oauth";
 import {
@@ -37,7 +40,7 @@ import { SCOPES as OUTLOOK_SCOPES } from "@/utils/outlook/scopes";
 import type { Logger } from "@/utils/logger";
 
 export const GET = withError("outlook/linking/callback", async (request) => {
-  const actorUserId = (await auth())?.user.id ?? null;
+  const actorUserId = (await auth(request.headers))?.user.id ?? null;
   let logger = request.logger.with({
     actorUserId,
     auditType: "oauth_linking",
@@ -153,44 +156,47 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       throw new SafeError(errorDescription);
     }
 
-    // Get user profile using the access token
-    const profileResponse = await fetch(getMicrosoftGraphUrl("/me"), {
-      headers: {
-        Authorization: `Bearer ${tokens.access_token}`,
-      },
-    });
+    let profile: Awaited<
+      ReturnType<typeof fetchMicrosoftUserProfile>
+    >["profile"];
+    let providerEmail: string;
+    let providerAccountId: string;
+    let legacyProviderAccountId: string | null = null;
 
-    if (!profileResponse.ok) {
-      logger.error("Failed to fetch Microsoft user profile", {
-        targetUserId,
-        status: profileResponse.status,
-      });
-      throw new SafeError("Failed to fetch user profile");
+    try {
+      const result = await fetchMicrosoftUserProfile(tokens.access_token);
+      profile = result.profile;
+      providerEmail = result.email;
+      legacyProviderAccountId = profile.id || null;
+
+      const oidcUserInfo = await fetchMicrosoftOidcUserInfo(
+        tokens.access_token,
+      );
+      providerAccountId = oidcUserInfo.sub;
+    } catch (error) {
+      if (error instanceof MicrosoftUserProfileError) {
+        if (error.status) {
+          logger.error("Failed to fetch Microsoft user profile", {
+            targetUserId,
+            status: error.status,
+          });
+        }
+        throw new SafeError(error.message);
+      }
+
+      throw error;
     }
 
-    const profile = await profileResponse.json();
-    const providerAccountId = profile.id;
-    const providerEmail = profile.mail || profile.userPrincipalName;
+    let existingAccount =
+      await findMicrosoftAccountByProviderAccountId(providerAccountId);
+    let shouldMigrateProviderAccountId = false;
 
-    if (!providerAccountId || !providerEmail) {
-      throw new SafeError("Profile missing required id or email");
+    if (!existingAccount && legacyProviderAccountId) {
+      existingAccount = await findMicrosoftAccountByProviderAccountId(
+        legacyProviderAccountId,
+      );
+      shouldMigrateProviderAccountId = !!existingAccount;
     }
-
-    const existingAccount = await prisma.account.findUnique({
-      where: {
-        provider_providerAccountId: {
-          provider: "microsoft",
-          providerAccountId,
-        },
-      },
-      select: {
-        id: true,
-        userId: true,
-        refresh_token: true,
-        user: { select: { name: true, email: true } },
-        emailAccount: true,
-      },
-    });
 
     assertMicrosoftLinkingConsent({
       targetUserId,
@@ -224,27 +230,15 @@ export const GET = withError("outlook/linking/callback", async (request) => {
         },
       );
 
-      let expiresAt: Date | null = null;
-      if (tokens.expires_at) {
-        expiresAt = new Date(tokens.expires_at * 1000);
-      } else if (tokens.expires_in) {
-        const expiresInSeconds =
-          typeof tokens.expires_in === "string"
-            ? Number.parseInt(tokens.expires_in, 10)
-            : tokens.expires_in;
-        expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
-      }
+      const expiresAt = parseMicrosoftExpiresAt(tokens);
 
       let profileImage = null;
       try {
-        const photoResponse = await fetch(
-          getMicrosoftGraphUrl("/me/photo/$value"),
-          {
-            headers: {
-              Authorization: `Bearer ${tokens.access_token}`,
-            },
+        const photoResponse = await fetchMicrosoftGraph("/me/photo/$value", {
+          headers: {
+            Authorization: `Bearer ${tokens.access_token}`,
           },
-        );
+        });
 
         if (photoResponse.ok) {
           const photoBuffer = await photoResponse.arrayBuffer();
@@ -347,6 +341,7 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       await updateMicrosoftAccountTokens(
         linkingResult.existingAccountId,
         tokens,
+        shouldMigrateProviderAccountId ? { providerAccountId } : undefined,
       );
 
       logger.info("Successfully updated tokens for Microsoft account", {
@@ -381,6 +376,16 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       name: existingAccount?.user.name || null,
       logger,
     });
+
+    if (shouldMigrateProviderAccountId) {
+      await updateMicrosoftAccountTokens(
+        linkingResult.sourceAccountId,
+        tokens,
+        {
+          providerAccountId,
+        },
+      );
+    }
 
     const successMessage =
       mergeType === "full_merge"
@@ -488,13 +493,35 @@ function parseMicrosoftExpiresAt(tokens: MicrosoftTokens): Date | null {
   return null;
 }
 
+function findMicrosoftAccountByProviderAccountId(providerAccountId: string) {
+  return prisma.account.findUnique({
+    where: {
+      provider_providerAccountId: {
+        provider: "microsoft",
+        providerAccountId,
+      },
+    },
+    select: {
+      id: true,
+      userId: true,
+      refresh_token: true,
+      user: { select: { name: true, email: true } },
+      emailAccount: true,
+    },
+  });
+}
+
 async function updateMicrosoftAccountTokens(
   accountId: string,
   tokens: MicrosoftTokens,
+  options?: { providerAccountId?: string },
 ) {
   await prisma.account.update({
     where: { id: accountId },
     data: {
+      ...(options?.providerAccountId && {
+        providerAccountId: options.providerAccountId,
+      }),
       access_token: tokens.access_token,
       // Only update refresh_token if provider returned one (preserves existing token)
       ...(tokens.refresh_token != null && {

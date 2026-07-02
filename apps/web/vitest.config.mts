@@ -1,9 +1,14 @@
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { config } from "dotenv";
 import { configDefaults, defineConfig } from "vitest/config";
 import tsconfigPaths from "vite-tsconfig-paths";
 
+const require = createRequire(import.meta.url);
+const zodV4CorePath = require.resolve("zod/v4/core");
 const isE2E = process.env.RUN_E2E_FLOW_TESTS === "true";
 const envFile = isE2E ? "./.env.e2e" : "./.env.test";
+const env = existsSync(envFile) ? config({ path: envFile }).parsed : undefined;
 
 export default defineConfig({
   plugins: [tsconfigPaths()],
@@ -12,12 +17,22 @@ export default defineConfig({
   esbuild: {
     jsx: "automatic",
   },
+  resolve: {
+    alias: {
+      "zod/v4/core": zodV4CorePath,
+    },
+  },
   test: {
     environment: "node",
     setupFiles: ["./__tests__/setup.ts"],
     exclude: [...configDefaults.exclude, "__tests__/playwright/**"],
+    server: {
+      deps: {
+        inline: [/@hookform\/resolvers/],
+      },
+    },
     env: {
-      ...config({ path: envFile }).parsed,
+      ...env,
     },
   },
 });
