@@ -2,12 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { FetchMessageObject, ImapFlow } from "imapflow";
 import {
   convertImapMessage,
+  fetchThreadMessagesAcrossFolders,
   findUidInSelectedMailbox,
   isLegacyUidMessageId,
   listMessagesWithFilters,
   locateMessages,
   parseSearchQuery,
 } from "@/utils/imap/message";
+import { buildThreadId } from "@/utils/imap/thread";
 
 function createFetchMessage(overrides: {
   uid?: number;
@@ -65,6 +67,8 @@ type FakeFolderMessage = {
   date?: string;
   from?: string;
   seen?: boolean;
+  inReplyTo?: string;
+  references?: string;
 };
 
 function createFakeClient(options: {
@@ -87,8 +91,11 @@ function createFakeClient(options: {
       return (messageId && options.headerSearchUids?.[messageId]) || [];
     }),
     fetch: vi.fn(async function* () {
+      let seq = 0;
       for (const msg of folderMessages[selectedFolder] ?? []) {
+        seq += 1;
         yield {
+          seq,
           uid: msg.uid,
           flags: new Set(msg.seen ? ["\\Seen"] : []),
           envelope: {
@@ -96,7 +103,11 @@ function createFakeClient(options: {
             date: msg.date ? new Date(msg.date) : undefined,
             from: msg.from ? [{ address: msg.from }] : undefined,
             subject: "Test",
+            inReplyTo: msg.inReplyTo,
           },
+          headers: msg.references
+            ? Buffer.from(`References: ${msg.references}\r\n`)
+            : undefined,
         };
       }
     }),
@@ -205,6 +216,127 @@ describe("locateMessages", () => {
 
     expect(locations.size).toBe(2);
     expect(client.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("fetchThreadMessagesAcrossFolders", () => {
+  const rootThreadId = buildThreadId(
+    undefined,
+    undefined,
+    "<root@example.com>",
+  );
+
+  it("collects thread messages spread across folders, oldest first", async () => {
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          {
+            uid: 10,
+            messageId: "<reply@example.com>",
+            inReplyTo: "<root@example.com>",
+            references: "<root@example.com>",
+            date: "2026-06-02T10:00:00Z",
+          },
+          {
+            uid: 11,
+            messageId: "<unrelated@example.com>",
+            date: "2026-06-03T10:00:00Z",
+          },
+        ],
+        Receipt: [
+          {
+            uid: 3,
+            messageId: "<root@example.com>",
+            date: "2026-06-01T10:00:00Z",
+          },
+        ],
+      },
+    });
+
+    const messages = await fetchThreadMessagesAcrossFolders(
+      client,
+      rootThreadId,
+    );
+
+    expect(messages.map((m) => m.id)).toEqual([
+      "root@example.com",
+      "reply@example.com",
+    ]);
+  });
+
+  it("matches deeper replies via the References header", async () => {
+    // In-Reply-To points at the parent, not the root; only References
+    // identifies the thread
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          {
+            uid: 20,
+            messageId: "<third@example.com>",
+            inReplyTo: "<reply@example.com>",
+            references: "<root@example.com> <reply@example.com>",
+            date: "2026-06-03T10:00:00Z",
+          },
+        ],
+      },
+    });
+
+    const messages = await fetchThreadMessagesAcrossFolders(
+      client,
+      rootThreadId,
+    );
+
+    expect(messages.map((m) => m.id)).toEqual(["third@example.com"]);
+  });
+
+  it("matches the envelope-only thread id variant for deeper replies", async () => {
+    // Thread ids stored without body/References access hash the In-Reply-To
+    // parent instead of the root
+    const envelopeOnlyThreadId = buildThreadId(
+      undefined,
+      "<reply@example.com>",
+      "<third@example.com>",
+    );
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          {
+            uid: 20,
+            messageId: "<third@example.com>",
+            inReplyTo: "<reply@example.com>",
+            references: "<root@example.com> <reply@example.com>",
+            date: "2026-06-03T10:00:00Z",
+          },
+        ],
+      },
+    });
+
+    const messages = await fetchThreadMessagesAcrossFolders(
+      client,
+      envelopeOnlyThreadId,
+    );
+
+    expect(messages.map((m) => m.id)).toEqual(["third@example.com"]);
+  });
+
+  it("dedupes copies of the same message across folders", async () => {
+    const copy = {
+      messageId: "<root@example.com>",
+      date: "2026-06-01T10:00:00Z",
+    };
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [{ uid: 1, ...copy }],
+        Sent: [{ uid: 2, ...copy }],
+      },
+    });
+
+    const messages = await fetchThreadMessagesAcrossFolders(
+      client,
+      rootThreadId,
+    );
+
+    expect(messages).toHaveLength(1);
   });
 });
 

@@ -21,6 +21,7 @@ import {
   fetchMessageByUid,
   fetchMessagesByUids,
   fetchRecentMessages,
+  fetchThreadMessagesAcrossFolders,
   findUidInSelectedMailbox,
   listMessagesWithFilters,
   locateMessages,
@@ -278,17 +279,11 @@ export class ImapProvider implements EmailProvider {
   }
 
   async getThreadMessages(threadId: string): Promise<ParsedMessage[]> {
-    return this.withConnection(async (client) => {
-      const mailbox = await client.mailboxOpen("INBOX", { readOnly: true });
-      // Use sequence range fetch (single IMAP command) instead of
-      // fetching UIDs one-by-one which is slow on WorkMail
-      const messages = await fetchRecentMessages(client, mailbox, 200);
-      return messages
-        .filter((m) => m.threadId === threadId)
-        .sort(
-          (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
-        );
-    });
+    return this.withConnection(async (client) =>
+      // Rules move messages out of INBOX, so the thread has to be collected
+      // across all folders
+      fetchThreadMessagesAcrossFolders(client, threadId),
+    );
   }
 
   async getThreadMessagesInInbox(threadId: string): Promise<ParsedMessage[]> {

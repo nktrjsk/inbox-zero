@@ -71,6 +71,37 @@ function hashToThreadId(messageId: string): string {
 }
 
 /**
+ * All thread ids a message in a thread may be stored under. getRootMessageId
+ * strips angle brackets from References/In-Reply-To ids but keeps them on a
+ * root message's own Message-ID, and ids computed without body access fall
+ * back to In-Reply-To (the parent, not the root) — so messages in the same
+ * thread can disagree on the thread id. Lookups should match any of these.
+ */
+export function getThreadIdCandidates(
+  references: string | undefined,
+  inReplyTo: string | undefined,
+  messageId: string | undefined,
+): Set<string> {
+  const candidates = new Set<string>();
+
+  const addBracketVariants = (id: string | undefined) => {
+    if (!id) return;
+    const bare = id.replace(/^<|>$/g, "").trim();
+    if (!bare) return;
+    candidates.add(hashToThreadId(bare));
+    candidates.add(hashToThreadId(`<${bare}>`));
+  };
+
+  addBracketVariants(
+    references ? parseMessageIdList(references)[0] : undefined,
+  );
+  addBracketVariants(inReplyTo ? parseMessageIdList(inReplyTo)[0] : undefined);
+  addBracketVariants(messageId);
+
+  return candidates;
+}
+
+/**
  * Extract all Message-IDs in a thread's reference chain,
  * useful for searching related messages.
  */

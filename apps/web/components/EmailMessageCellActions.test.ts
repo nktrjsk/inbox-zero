@@ -48,6 +48,20 @@ describe("getEmailMessageCellActions", () => {
     });
   });
 
+  it("does not link to webmail for IMAP accounts", () => {
+    expect(
+      getEmailMessageCellActions({
+        messageId: "abc-123@mail.example.com",
+        provider: "imap",
+        threadId: "thread-1",
+        userEmail: "me@example.com",
+      }),
+    ).toEqual({
+      openUrl: undefined,
+      showViewEmailButton: true,
+    });
+  });
+
   it("hides actions when the email cell requests it", () => {
     expect(
       getEmailMessageCellActions({

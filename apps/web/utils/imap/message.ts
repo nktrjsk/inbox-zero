@@ -1,7 +1,7 @@
 import type { ImapFlow, FetchMessageObject, MailboxObject } from "imapflow";
 import { simpleParser } from "mailparser";
 import type { ParsedMessage, ParsedMessageHeaders } from "@/utils/types";
-import { buildThreadId } from "@/utils/imap/thread";
+import { buildThreadId, getThreadIdCandidates } from "@/utils/imap/thread";
 import { listSearchableFolders } from "@/utils/imap/folder";
 
 /**
@@ -281,6 +281,74 @@ export async function locateMessages(
   return locations;
 }
 
+// Bounds the per-folder envelope scan when collecting a thread; messages
+// older than this per folder won't be found.
+const THREAD_SCAN_LIMIT = 500;
+
+/**
+ * Collect a thread's messages across all folders. Thread ids are one-way
+ * hashes of the root Message-ID, so they can't be searched server-side; scan
+ * recent envelopes per folder and match against every thread id variant a
+ * message may be stored under (see getThreadIdCandidates). Bodies are
+ * downloaded for matches only.
+ */
+export async function fetchThreadMessagesAcrossFolders(
+  client: ImapFlow,
+  threadId: string,
+): Promise<ParsedMessage[]> {
+  const byId = new Map<string, ParsedMessage>();
+
+  for (const folder of await listSearchableFolders(client)) {
+    try {
+      await client.mailboxOpen(folder, { readOnly: true });
+    } catch {
+      continue;
+    }
+
+    const exists =
+      typeof client.mailbox === "object" ? client.mailbox.exists : 0;
+    if (!exists) continue;
+
+    const start = Math.max(1, exists - THREAD_SCAN_LIMIT + 1);
+    const matches: {
+      seq: number;
+      msg: FetchMessageObject;
+      references?: string;
+    }[] = [];
+    for await (const msg of client.fetch(`${start}:*`, {
+      uid: true,
+      envelope: true,
+      flags: true,
+      headers: ["references"],
+    })) {
+      const references = extractReferencesHeader(msg.headers);
+      const inReplyTo = msg.envelope?.inReplyTo || undefined;
+      const envMessageId = msg.envelope?.messageId || undefined;
+      const candidates = getThreadIdCandidates(
+        references,
+        inReplyTo,
+        envMessageId,
+      );
+      if (candidates.has(threadId)) {
+        matches.push({ seq: msg.seq, msg, references });
+      }
+    }
+
+    for (const { seq, msg, references } of matches) {
+      const body = await downloadMessageBody(client, seq);
+      const parsed = await convertImapMessage(msg, {
+        ...body,
+        references: body.references ?? references,
+      });
+      if (parsed && !byId.has(parsed.id)) byId.set(parsed.id, parsed);
+    }
+  }
+
+  return [...byId.values()].sort(
+    (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
+  );
+}
+
 async function searchUidByMessageIdHeader(
   client: ImapFlow,
   messageId: string,
@@ -435,6 +503,12 @@ export async function convertImapMessage(
   } catch {
     return null;
   }
+}
+
+function extractReferencesHeader(headers?: Buffer): string | undefined {
+  if (!headers) return;
+  const unfolded = headers.toString("utf8").replace(/\r?\n[ \t]+/g, " ");
+  return unfolded.match(/^references:[ \t]*(.+)$/im)?.[1]?.trim() || undefined;
 }
 
 function formatAddress(

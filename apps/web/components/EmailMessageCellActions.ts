@@ -1,5 +1,8 @@
 import { getEmailUrlForMessage } from "@/utils/url";
-import { isMicrosoftProvider } from "@/utils/email/provider-types";
+import {
+  isImapProvider,
+  isMicrosoftProvider,
+} from "@/utils/email/provider-types";
 
 type GetEmailMessageCellActionsOptions = {
   externalUrl?: string;
@@ -20,9 +23,10 @@ export function getEmailMessageCellActions({
 }: GetEmailMessageCellActionsOptions) {
   if (hideViewEmailButton) return null;
 
+  // IMAP accounts have no webmail to deep-link into
   const openUrl =
     externalUrl ||
-    (isMicrosoftProvider(provider)
+    (isMicrosoftProvider(provider) || isImapProvider(provider)
       ? undefined
       : getEmailUrlForMessage(messageId, threadId, userEmail, provider));
 
