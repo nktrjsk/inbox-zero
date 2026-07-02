@@ -48,6 +48,16 @@ const nextConfig: NextConfig = {
                 // once. This trades a bit of build time for lower peak RAM.
                 staticGenerationMaxConcurrency: 4,
                 staticGenerationMinPagesPerWorker: 100,
+                // Bound the Turbopack (Rust) process on memory-constrained
+                // self-host builders; NODE_OPTIONS can't cap it.
+                ...(process.env.TURBOPACK_MEMORY_LIMIT_MB
+                  ? {
+                      turbopackMemoryLimit:
+                        Number(process.env.TURBOPACK_MEMORY_LIMIT_MB) *
+                        1024 *
+                        1024,
+                    }
+                  : {}),
               }
             : {}),
         }
