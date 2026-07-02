@@ -4,6 +4,7 @@ import {
   convertImapMessage,
   findUidInSelectedMailbox,
   isLegacyUidMessageId,
+  listMessagesWithFilters,
   locateMessages,
   parseSearchQuery,
 } from "@/utils/imap/message";
@@ -58,11 +59,19 @@ describe("isLegacyUidMessageId", () => {
   });
 });
 
+type FakeFolderMessage = {
+  uid: number;
+  messageId?: string;
+  date?: string;
+  from?: string;
+  seen?: boolean;
+};
+
 function createFakeClient(options: {
   // header-search results keyed by Message-ID; missing key = no hits
   headerSearchUids?: Record<string, number[]>;
   // messages visible to an envelope scan, per folder (INBOX for single-folder tests)
-  folderMessages?: Record<string, { uid: number; messageId?: string }[]>;
+  folderMessages?: Record<string, FakeFolderMessage[]>;
 }) {
   const folderMessages = options.folderMessages ?? {};
   let selectedFolder = "INBOX";
@@ -81,7 +90,13 @@ function createFakeClient(options: {
       for (const msg of folderMessages[selectedFolder] ?? []) {
         yield {
           uid: msg.uid,
-          envelope: { messageId: msg.messageId },
+          flags: new Set(msg.seen ? ["\\Seen"] : []),
+          envelope: {
+            messageId: msg.messageId,
+            date: msg.date ? new Date(msg.date) : undefined,
+            from: msg.from ? [{ address: msg.from }] : undefined,
+            subject: "Test",
+          },
         };
       }
     }),
@@ -190,6 +205,106 @@ describe("locateMessages", () => {
 
     expect(locations.size).toBe(2);
     expect(client.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("listMessagesWithFilters", () => {
+  const inbox: FakeFolderMessage[] = [
+    // oldest-first, as IMAP sequence order
+    {
+      uid: 1,
+      messageId: "<old@example.com>",
+      date: "2026-06-01T10:00:00Z",
+      from: "alice@example.com",
+      seen: true,
+    },
+    {
+      uid: 2,
+      messageId: "<mid@example.com>",
+      date: "2026-06-20T10:00:00Z",
+      from: "bob@example.com",
+      seen: true,
+    },
+    {
+      uid: 3,
+      messageId: "<new-read@example.com>",
+      date: "2026-06-28T10:00:00Z",
+      from: "alice@example.com",
+      seen: true,
+    },
+    {
+      uid: 4,
+      messageId: "<new-unread@example.com>",
+      date: "2026-06-29T10:00:00Z",
+      from: "bob@example.com",
+      seen: false,
+    },
+  ];
+
+  it("returns only messages within the date range", async () => {
+    const client = createFakeClient({ folderMessages: { INBOX: inbox } });
+
+    const { messages } = await listMessagesWithFilters(client, {
+      offset: 0,
+      maxResults: 20,
+      after: new Date("2026-06-25T00:00:00Z"),
+      before: new Date("2026-06-29T00:00:00Z"),
+    });
+
+    expect(messages.map((m) => m.id)).toEqual(["new-read@example.com"]);
+  });
+
+  it("excludes read messages when unreadOnly is set", async () => {
+    const client = createFakeClient({ folderMessages: { INBOX: inbox } });
+
+    const { messages } = await listMessagesWithFilters(client, {
+      offset: 0,
+      maxResults: 20,
+      unreadOnly: true,
+    });
+
+    expect(messages.map((m) => m.id)).toEqual(["new-unread@example.com"]);
+  });
+
+  it("filters by sender email", async () => {
+    const client = createFakeClient({ folderMessages: { INBOX: inbox } });
+
+    const { messages } = await listMessagesWithFilters(client, {
+      offset: 0,
+      maxResults: 20,
+      fromEmail: "alice@example.com",
+    });
+
+    expect(messages.map((m) => m.id)).toEqual([
+      "new-read@example.com",
+      "old@example.com",
+    ]);
+  });
+
+  it("returns newest first and paginates the filtered results", async () => {
+    const client = createFakeClient({ folderMessages: { INBOX: inbox } });
+
+    const page1 = await listMessagesWithFilters(client, {
+      offset: 0,
+      maxResults: 2,
+      after: new Date("2026-05-01T00:00:00Z"),
+    });
+    expect(page1.messages.map((m) => m.id)).toEqual([
+      "new-unread@example.com",
+      "new-read@example.com",
+    ]);
+    expect(page1.nextPageToken).toBe("2");
+
+    const page2 = await listMessagesWithFilters(client, {
+      offset: Number(page1.nextPageToken),
+      maxResults: 2,
+      after: new Date("2026-05-01T00:00:00Z"),
+    });
+    expect(page2.messages.map((m) => m.id)).toEqual([
+      "mid@example.com",
+      "old@example.com",
+    ]);
+    expect(page2.nextPageToken).toBeUndefined();
   });
 });
 

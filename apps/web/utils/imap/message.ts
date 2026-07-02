@@ -82,6 +82,48 @@ export async function fetchRecentMessages(
 }
 
 /**
+ * List messages in the currently selected mailbox, newest first, filtered
+ * client-side by date range, unread state, and sender. Index-backed servers
+ * (e.g. Stalwart) silently under-return SEARCH results for dates and sender,
+ * so only data fetched directly from the messages is trusted here.
+ */
+export async function listMessagesWithFilters(
+  client: ImapFlow,
+  options: {
+    offset: number;
+    maxResults: number;
+    before?: Date;
+    after?: Date;
+    unreadOnly?: boolean;
+    fromEmail?: string;
+  },
+): Promise<{ messages: ParsedMessage[]; nextPageToken?: string }> {
+  const exists = typeof client.mailbox === "object" ? client.mailbox.exists : 0;
+  if (!exists) return { messages: [] };
+
+  const matching: ParsedMessage[] = [];
+  for await (const msg of client.fetch("1:*", {
+    uid: true,
+    envelope: true,
+    flags: true,
+  })) {
+    const parsed = await convertImapMessage(msg);
+    if (parsed && messageMatchesFilters(parsed, options)) matching.push(parsed);
+  }
+  // IMAP sequence order is oldest-first
+  matching.reverse();
+
+  const { offset, maxResults } = options;
+  const messages = matching.slice(offset, offset + maxResults);
+  const nextOffset = offset + maxResults;
+  return {
+    messages,
+    nextPageToken:
+      nextOffset < matching.length ? String(nextOffset) : undefined,
+  };
+}
+
+/**
  * Fetch multiple messages by UIDs - envelope only (no body).
  * Uses UID-based SEARCH to find each message's sequence number,
  * then fetches by sequence range (WorkMail-compatible).
@@ -438,4 +480,28 @@ export function parseSearchQuery(query: string): Record<string, unknown> {
   if (criteria.length === 0) return { all: true };
   if (criteria.length === 1) return criteria[0];
   return { and: criteria };
+}
+
+function messageMatchesFilters(
+  message: ParsedMessage,
+  filters: {
+    before?: Date;
+    after?: Date;
+    unreadOnly?: boolean;
+    fromEmail?: string;
+  },
+): boolean {
+  const date = new Date(message.date);
+  if (filters.after && date < filters.after) return false;
+  if (filters.before && date >= filters.before) return false;
+  if (filters.unreadOnly && message.labelIds?.includes("\\Seen")) return false;
+  if (
+    filters.fromEmail &&
+    !message.headers.from
+      .toLowerCase()
+      .includes(filters.fromEmail.toLowerCase())
+  ) {
+    return false;
+  }
+  return true;
 }

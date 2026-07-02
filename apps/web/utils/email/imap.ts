@@ -22,6 +22,7 @@ import {
   fetchMessagesByUids,
   fetchRecentMessages,
   findUidInSelectedMailbox,
+  listMessagesWithFilters,
   locateMessages,
   parseSearchQuery,
   searchImapMessages,
@@ -141,6 +142,7 @@ export class ImapProvider implements EmailProvider {
     after?: Date;
     inboxOnly?: boolean;
     unreadOnly?: boolean;
+    fromEmail?: string;
   }): Promise<{ messages: ParsedMessage[]; nextPageToken?: string }> {
     return this.withConnection(async (client) => {
       const folder = options.inboxOnly !== false ? "INBOX" : "INBOX";
@@ -155,7 +157,8 @@ export class ImapProvider implements EmailProvider {
         !options.query &&
         !options.before &&
         !options.after &&
-        !options.unreadOnly
+        !options.unreadOnly &&
+        !options.fromEmail
       ) {
         const end = Math.max(1, total - offset);
         const start = Math.max(1, end - maxResults + 1);
@@ -178,13 +181,22 @@ export class ImapProvider implements EmailProvider {
         return { messages, nextPageToken };
       }
 
-      // For queries, use IMAP SEARCH then fetch by UID
-      const criteria: Record<string, unknown> = {};
-      if (options.query) {
-        Object.assign(criteria, parseSearchQuery(options.query));
-      } else {
-        criteria.all = true;
+      // Structured filters (dates/unread/sender) are applied client-side:
+      // index-backed servers (e.g. Stalwart) silently under-return SEARCH
+      // results for dates and sender.
+      if (!options.query) {
+        return listMessagesWithFilters(client, {
+          offset,
+          maxResults,
+          before: options.before,
+          after: options.after,
+          unreadOnly: options.unreadOnly,
+          fromEmail: options.fromEmail,
+        });
       }
+
+      // For free-text queries, use IMAP SEARCH then fetch by UID
+      const criteria: Record<string, unknown> = parseSearchQuery(options.query);
       if (options.before) criteria.before = options.before;
       if (options.after) criteria.since = options.after;
       if (options.unreadOnly) criteria.unseen = true;
@@ -221,7 +233,7 @@ export class ImapProvider implements EmailProvider {
     after?: Date;
   }): Promise<{ messages: ParsedMessage[]; nextPageToken?: string }> {
     return this.getMessagesWithPagination({
-      query: `from:${options.senderEmail}`,
+      fromEmail: options.senderEmail,
       maxResults: options.maxResults,
       pageToken: options.pageToken,
       before: options.before,
@@ -312,16 +324,15 @@ export class ImapProvider implements EmailProvider {
     maxResults?: number;
     pageToken?: string;
   }): Promise<{ threads: EmailThread[]; nextPageToken?: string }> {
-    const queryStr = options.query
-      ? typeof options.query === "string"
-        ? options.query
-        : ""
-      : "";
+    const query = options.query;
 
     const { messages, nextPageToken } = await this.getMessagesWithPagination({
-      query: queryStr,
       maxResults: options.maxResults,
       pageToken: options.pageToken,
+      before: query?.before ?? undefined,
+      after: query?.after ?? undefined,
+      unreadOnly: query?.isUnread ?? undefined,
+      fromEmail: query?.fromEmail ?? undefined,
     });
 
     // Group into threads
