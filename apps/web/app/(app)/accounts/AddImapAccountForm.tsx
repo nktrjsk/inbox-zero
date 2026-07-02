@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { toastError, toastSuccess } from "@/components/Toast";
 import { IMAP_PROVIDER_PRESETS } from "@/utils/imap/types";
 
@@ -43,6 +44,7 @@ export function AddImapAccountForm() {
   const [smtpSecurity, setSmtpSecurity] = useState("starttls");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [folderSortingEnabled, setFolderSortingEnabled] = useState(false);
 
   const applyPreset = (presetName: string) => {
     const preset = IMAP_PROVIDER_PRESETS.find((p) => p.name === presetName);
@@ -112,6 +114,7 @@ export function AddImapAccountForm() {
           smtpSecurity,
           username,
           password,
+          folderSortingEnabled,
         }),
       });
 
@@ -284,6 +287,22 @@ export function AddImapAccountForm() {
                 <SelectItem value="none">None</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 border-t pt-3">
+            <div>
+              <p className="text-sm font-medium">Sort into IMAP folders</p>
+              <p className="text-xs text-muted-foreground">
+                When enabled, label rules move emails into real folders in your
+                mailbox. When disabled, sorting is only tracked inside Inbox
+                Zero and your mailbox is left untouched.
+              </p>
+            </div>
+            <Switch
+              aria-label="Toggle IMAP folder sorting"
+              checked={folderSortingEnabled}
+              onCheckedChange={setFolderSortingEnabled}
+            />
           </div>
 
           {error && <p className="text-sm text-destructive">{error}</p>}

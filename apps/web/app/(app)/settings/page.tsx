@@ -21,6 +21,7 @@ import { AppearanceSection } from "@/app/(app)/settings/AppearanceSection";
 import { TeamSection } from "@/app/(app)/settings/TeamSection";
 import { BillingSection } from "@/app/(app)/[emailAccountId]/settings/BillingSection";
 import { CleanupDraftsSection } from "@/app/(app)/[emailAccountId]/settings/CleanupDraftsSection";
+import { ImapSettingsSection } from "@/app/(app)/[emailAccountId]/settings/ImapSettingsSection";
 import { useSlackNotifications } from "@/app/(app)/[emailAccountId]/settings/ConnectedAppsSection";
 import { DeleteSection } from "@/app/(app)/[emailAccountId]/settings/DeleteSection";
 import { ModelSection } from "@/app/(app)/[emailAccountId]/settings/ModelSection";
@@ -281,6 +282,9 @@ function EmailAccountSettingsCard({
             allAccounts={allAccounts}
           />
           <CleanupDraftsSection emailAccountId={emailAccount.id} />
+          {emailAccount.account?.provider === "imap" && (
+            <ImapSettingsSection emailAccountId={emailAccount.id} />
+          )}
           <ResetAnalyticsSection emailAccountId={emailAccount.id} />
         </>
       )}

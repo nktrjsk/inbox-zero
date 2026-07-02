@@ -52,6 +52,27 @@ function convertMailboxToLabel(mailbox: ListResponse): EmailLabel {
 }
 
 /**
+ * All selectable folders ordered for message lookup: INBOX first (most
+ * likely), then user folders, then special-use folders (Archive, Sent, etc.).
+ */
+export async function listSearchableFolders(
+  client: ImapFlow,
+): Promise<string[]> {
+  const mailboxes = await client.list();
+
+  const rank = (mb: ListResponse): number => {
+    if (mb.path.toUpperCase() === "INBOX") return 0;
+    if (!mb.specialUse) return 1;
+    return 2;
+  };
+
+  return mailboxes
+    .filter((mb) => !mb.flags.has("\\Noselect"))
+    .sort((a, b) => rank(a) - rank(b))
+    .map((mb) => mb.path);
+}
+
+/**
  * Find or create a folder by name.
  */
 export async function getOrCreateFolder(

@@ -50,6 +50,9 @@ model ImapCredential {
   password     String    @db.Text // Encrypted with encryptToken()
   lastPolledAt DateTime?
   lastSeenUid  Int?
+  // When true, LABEL rule actions move messages into real IMAP folders.
+  // When false (default), labels are only recorded in Inbox Zero and the mailbox is left untouched.
+  folderSortingEnabled Boolean @default(false)
   accountId    String    @unique
   account      Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
 }

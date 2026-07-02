@@ -48,5 +48,6 @@ export async function getImapCredentials(
     password,
     email: emailAccount.email,
     emailAccountId: emailAccount.id,
+    folderSortingEnabled: credential.folderSortingEnabled,
   };
 }

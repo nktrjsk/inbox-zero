@@ -1,6 +1,9 @@
 export interface ImapCredentialConfig {
   email: string;
   emailAccountId: string;
+  // Opt-in: when true, LABEL actions move messages into real IMAP folders.
+  // Default (false) keeps sorting inside Inbox Zero only.
+  folderSortingEnabled?: boolean;
   imapHost: string;
   imapPort: number;
   imapSecurity: "tls" | "starttls" | "none";

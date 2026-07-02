@@ -2,6 +2,7 @@ import type { ImapFlow, FetchMessageObject, MailboxObject } from "imapflow";
 import { simpleParser } from "mailparser";
 import type { ParsedMessage, ParsedMessageHeaders } from "@/utils/types";
 import { buildThreadId } from "@/utils/imap/thread";
+import { listSearchableFolders } from "@/utils/imap/folder";
 
 /**
  * Fetch a single message by sequence number with full body content.
@@ -153,6 +154,82 @@ async function downloadMessageBody(
 }
 
 /**
+ * Legacy message ids (and messages without a Message-ID header) are raw INBOX UIDs.
+ * Current ids are bare RFC822 Message-IDs, which always contain non-digits.
+ */
+export function isLegacyUidMessageId(messageId: string): boolean {
+  return /^\d+$/.test(messageId);
+}
+
+/**
+ * Resolve a message id (bare RFC822 Message-ID or legacy numeric UID) to a UID
+ * in the currently selected mailbox. Returns null if the message isn't there.
+ */
+export async function findUidInSelectedMailbox(
+  client: ImapFlow,
+  messageId: string,
+): Promise<number | null> {
+  if (isLegacyUidMessageId(messageId)) return Number(messageId);
+  const uids = await client.search(
+    { header: { "Message-ID": messageId } },
+    { uid: true },
+  );
+  if (!uids || uids.length === 0) return null;
+  return uids[0];
+}
+
+export interface ImapMessageLocation {
+  folder: string;
+  uid: number;
+}
+
+/**
+ * Locate messages by id across mailboxes. Message-IDs are stable when a
+ * message moves between folders (UIDs are not), so we search INBOX first and
+ * continue through the remaining folders until every id is found.
+ */
+export async function locateMessages(
+  client: ImapFlow,
+  messageIds: string[],
+): Promise<Map<string, ImapMessageLocation>> {
+  const locations = new Map<string, ImapMessageLocation>();
+  let unresolved: string[] = [];
+
+  for (const id of messageIds) {
+    if (isLegacyUidMessageId(id)) {
+      // Legacy UIDs were only ever captured in INBOX
+      locations.set(id, { folder: "INBOX", uid: Number(id) });
+    } else {
+      unresolved.push(id);
+    }
+  }
+
+  if (unresolved.length === 0) return locations;
+
+  for (const folder of await listSearchableFolders(client)) {
+    try {
+      await client.mailboxOpen(folder, { readOnly: true });
+    } catch {
+      continue;
+    }
+
+    const stillUnresolved: string[] = [];
+    for (const id of unresolved) {
+      const uid = await findUidInSelectedMailbox(client, id);
+      if (uid) {
+        locations.set(id, { folder, uid });
+      } else {
+        stillUnresolved.push(id);
+      }
+    }
+    unresolved = stillUnresolved;
+    if (unresolved.length === 0) break;
+  }
+
+  return locations;
+}
+
+/**
  * Search messages in the currently selected mailbox.
  */
 export async function searchImapMessages(
@@ -236,8 +313,17 @@ export async function convertImapMessage(
       ? textPlain.slice(0, 200).replace(/\n/g, " ")
       : envelope.subject || "";
 
+    // The Message-ID header survives folder moves; the UID does not. Fall back
+    // to the UID for messages without one (or with a comma, which would break
+    // the comma-separated ids query param).
+    const bareMessageId = messageId?.replace(/^<|>$/g, "").trim();
+    const id =
+      bareMessageId && !bareMessageId.includes(",")
+        ? bareMessageId
+        : String(msg.uid);
+
     return {
-      id: String(msg.uid),
+      id,
       threadId,
       historyId: String(msg.uid),
       date,

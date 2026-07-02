@@ -13,9 +13,14 @@ export const imapCredentialSchema = z.object({
   smtpSecurity: imapSecuritySchema.default("starttls"),
   username: z.string().min(1),
   password: z.string().min(1),
+  folderSortingEnabled: z.boolean().default(false),
 });
 
 export type ImapCredentialInput = z.infer<typeof imapCredentialSchema>;
+
+export const updateImapSettingsBody = z.object({
+  folderSortingEnabled: z.boolean(),
+});
 
 export const testImapConnectionSchema = z.object({
   imapHost: z.string().min(1),

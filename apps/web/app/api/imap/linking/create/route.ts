@@ -64,6 +64,7 @@ export const POST = withAuth("imap/linking/create", async (request) => {
           smtpSecurity: data.smtpSecurity,
           username: data.username,
           password: encryptedPassword,
+          folderSortingEnabled: data.folderSortingEnabled,
         },
       },
       emailAccount: {

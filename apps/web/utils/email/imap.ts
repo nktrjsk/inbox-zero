@@ -21,6 +21,8 @@ import {
   fetchMessageByUid,
   fetchMessagesByUids,
   fetchRecentMessages,
+  findUidInSelectedMailbox,
+  locateMessages,
   parseSearchQuery,
   searchImapMessages,
 } from "@/utils/imap/message";
@@ -69,8 +71,12 @@ export class ImapProvider implements EmailProvider {
 
   async getMessage(messageId: string): Promise<ParsedMessage> {
     return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX", { readOnly: true });
-      const msg = await fetchMessageByUid(client, Number(messageId));
+      const location = (await locateMessages(client, [messageId])).get(
+        messageId,
+      );
+      if (!location) throw new Error(`Message ${messageId} not found`);
+      await client.mailboxOpen(location.folder, { readOnly: true });
+      const msg = await fetchMessageByUid(client, location.uid);
       if (!msg) throw new Error(`Message ${messageId} not found`);
       return msg;
     });
@@ -79,22 +85,33 @@ export class ImapProvider implements EmailProvider {
   async getMessageByRfc822MessageId(
     rfc822MessageId: string,
   ): Promise<ParsedMessage | null> {
-    return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX", { readOnly: true });
-      const uids = await searchImapMessages(
-        client,
-        { header: { "Message-ID": rfc822MessageId } },
-        1,
-      );
-      if (uids.length === 0) return null;
-      return fetchMessageByUid(client, uids[0]);
-    });
+    // Message ids are bare RFC822 Message-IDs, so this is a regular lookup
+    const bareId = rfc822MessageId.replace(/^<|>$/g, "").trim();
+    try {
+      return await this.getMessage(bareId);
+    } catch {
+      return null;
+    }
   }
 
   async getMessagesBatch(messageIds: string[]): Promise<ParsedMessage[]> {
+    if (messageIds.length === 0) return [];
     return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX", { readOnly: true });
-      return fetchMessagesByUids(client, messageIds.map(Number));
+      const locations = await locateMessages(client, messageIds);
+
+      const uidsByFolder = new Map<string, number[]>();
+      for (const { folder, uid } of locations.values()) {
+        const uids = uidsByFolder.get(folder) || [];
+        uids.push(uid);
+        uidsByFolder.set(folder, uids);
+      }
+
+      const messages: ParsedMessage[] = [];
+      for (const [folder, uids] of uidsByFolder) {
+        await client.mailboxOpen(folder, { readOnly: true });
+        messages.push(...(await fetchMessagesByUids(client, uids)));
+      }
+      return messages;
     });
   }
 
@@ -445,6 +462,10 @@ export class ImapProvider implements EmailProvider {
 
   async getOrCreateInboxZeroLabel(_key: InboxZeroLabel): Promise<EmailLabel> {
     const folderName = `InboxZero/${_key}`;
+    // Without folder sorting the label exists only in Inbox Zero's records
+    if (!this.config.folderSortingEnabled) {
+      return { id: folderName, name: folderName, type: "user" };
+    }
     return this.withConnection(async (client) => {
       const path = await getOrCreateFolder(client, folderName);
       return {
@@ -456,6 +477,10 @@ export class ImapProvider implements EmailProvider {
   }
 
   async createLabel(name: string, _description?: string): Promise<EmailLabel> {
+    // Without folder sorting the label exists only in Inbox Zero's records
+    if (!this.config.folderSortingEnabled) {
+      return { id: name, name, type: "user" };
+    }
     return this.withConnection(async (client) => {
       await client.mailboxCreate(name);
       return {
@@ -477,14 +502,25 @@ export class ImapProvider implements EmailProvider {
     labelId: string;
     labelName: string | null;
   }): Promise<{ usedFallback?: boolean; actualLabelId?: string }> {
-    // For IMAP, "labeling" means moving to a folder
+    // Without the folder-sorting opt-in, labels live only in Inbox Zero's
+    // records and the user's mailbox is left untouched
+    if (!this.config.folderSortingEnabled) {
+      return { actualLabelId: options.labelId };
+    }
+
+    // With folder sorting, "labeling" means moving to a folder
     return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX");
-      await moveMessageToFolder(
-        client,
-        Number(options.messageId),
-        options.labelId,
+      const location = (await locateMessages(client, [options.messageId])).get(
+        options.messageId,
       );
+      if (!location) {
+        this.logger.warn("Message to label not found in any folder", {
+          messageId: options.messageId,
+        });
+        return { actualLabelId: options.labelId };
+      }
+      await client.mailboxOpen(location.folder);
+      await moveMessageToFolder(client, location.uid, options.labelId);
       return { actualLabelId: options.labelId };
     });
   }
@@ -517,7 +553,8 @@ export class ImapProvider implements EmailProvider {
       const archiveFolder = await findArchiveFolder(client);
       for (const msg of messages) {
         try {
-          await moveMessageToFolder(client, Number(msg.id), archiveFolder);
+          const uid = await findUidInSelectedMailbox(client, msg.id);
+          if (uid) await moveMessageToFolder(client, uid, archiveFolder);
         } catch {
           // Message might already be in archive or another folder
         }
@@ -530,13 +567,15 @@ export class ImapProvider implements EmailProvider {
     ownerEmail: string,
     _labelId?: string,
   ): Promise<void> {
-    // For IMAP, archive with label = move to the label folder (or archive)
-    if (_labelId) {
+    // With folder sorting opted in, archive with label = move to the label
+    // folder. Otherwise the label is record-only and we just archive.
+    if (_labelId && this.config.folderSortingEnabled) {
       const messages = await this.getThreadMessages(threadId);
       return this.withConnection(async (client) => {
         await client.mailboxOpen("INBOX");
         for (const msg of messages) {
-          await moveMessageToFolder(client, Number(msg.id), _labelId);
+          const uid = await findUidInSelectedMailbox(client, msg.id);
+          if (uid) await moveMessageToFolder(client, uid, _labelId);
         }
       });
     }
@@ -545,9 +584,18 @@ export class ImapProvider implements EmailProvider {
 
   async archiveMessage(messageId: string): Promise<void> {
     return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX");
+      const location = (await locateMessages(client, [messageId])).get(
+        messageId,
+      );
+      if (!location) {
+        this.logger.warn("Message to archive not found in any folder", {
+          messageId,
+        });
+        return;
+      }
       const archiveFolder = await findArchiveFolder(client);
-      await moveMessageToFolder(client, Number(messageId), archiveFolder);
+      await client.mailboxOpen(location.folder);
+      await moveMessageToFolder(client, location.uid, archiveFolder);
     });
   }
 
@@ -564,7 +612,8 @@ export class ImapProvider implements EmailProvider {
       const trashFolder = await findTrashFolder(client);
       for (const msg of messages) {
         try {
-          await moveMessageToFolder(client, Number(msg.id), trashFolder);
+          const uid = await findUidInSelectedMailbox(client, msg.id);
+          if (uid) await moveMessageToFolder(client, uid, trashFolder);
         } catch {
           // Message might already be trashed
         }
@@ -577,12 +626,14 @@ export class ImapProvider implements EmailProvider {
     return this.withConnection(async (client) => {
       await client.mailboxOpen("INBOX");
       for (const msg of messages) {
+        const uid = await findUidInSelectedMailbox(client, msg.id);
+        if (!uid) continue;
         if (read) {
-          await client.messageFlagsAdd(String(msg.id), ["\\Seen"], {
+          await client.messageFlagsAdd(String(uid), ["\\Seen"], {
             uid: true,
           });
         } else {
-          await client.messageFlagsRemove(String(msg.id), ["\\Seen"], {
+          await client.messageFlagsRemove(String(uid), ["\\Seen"], {
             uid: true,
           });
         }
@@ -596,8 +647,19 @@ export class ImapProvider implements EmailProvider {
 
   async starMessage(messageId: string): Promise<void> {
     return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX");
-      await client.messageFlagsAdd(messageId, ["\\Flagged"], { uid: true });
+      const location = (await locateMessages(client, [messageId])).get(
+        messageId,
+      );
+      if (!location) {
+        this.logger.warn("Message to star not found in any folder", {
+          messageId,
+        });
+        return;
+      }
+      await client.mailboxOpen(location.folder);
+      await client.messageFlagsAdd(String(location.uid), ["\\Flagged"], {
+        uid: true,
+      });
     });
   }
 
@@ -616,7 +678,8 @@ export class ImapProvider implements EmailProvider {
       const targetFolder = junkFolder?.path || "Junk";
 
       for (const msg of messages) {
-        await moveMessageToFolder(client, Number(msg.id), targetFolder);
+        const uid = await findUidInSelectedMailbox(client, msg.id);
+        if (uid) await moveMessageToFolder(client, uid, targetFolder);
       }
     });
   }
@@ -634,7 +697,8 @@ export class ImapProvider implements EmailProvider {
     return this.withConnection(async (client) => {
       await client.mailboxOpen("INBOX");
       for (const msg of messages) {
-        await moveMessageToFolder(client, Number(msg.id), folderName);
+        const uid = await findUidInSelectedMailbox(client, msg.id);
+        if (uid) await moveMessageToFolder(client, uid, folderName);
       }
     });
   }
