@@ -35,6 +35,17 @@ export function Messages({
   footer,
 }: MessagesProps) {
   const disableConfirm = status === "streaming" || status === "submitted";
+  const lastMessage = messages[messages.length - 1];
+  // Slow (e.g. local) models can take tens of seconds before the first token,
+  // and the stream's step-start/tool parts can render nothing in the meantime.
+  // Keep the loader up until the message shows visible progress on screen.
+  const showThinking =
+    (status === "submitted" || status === "streaming") &&
+    !!lastMessage &&
+    (lastMessage.role === "user" ||
+      !lastPartShowsProgress(
+        lastMessage.parts?.[lastMessage.parts.length - 1],
+      ));
   const emailLookup = useMemo(() => buildEmailLookup(messages), [messages]);
   const firstAssistantIndex = useMemo(
     () => messages.findIndex((m) => m.role === "assistant"),
@@ -76,18 +87,16 @@ export function Messages({
               </Fragment>
             ))}
 
-            {status === "submitted" &&
-              messages.length > 0 &&
-              messages[messages.length - 1].role === "user" && (
-                <Message from="assistant">
-                  <MessageContent variant="flat">
-                    <div className="flex items-center gap-2 text-muted-foreground">
-                      <Loader />
-                      <span>Thinking...</span>
-                    </div>
-                  </MessageContent>
-                </Message>
-              )}
+            {showThinking && (
+              <Message from="assistant">
+                <MessageContent variant="flat">
+                  <div className="flex items-center gap-2 text-muted-foreground">
+                    <Loader />
+                    <span>Thinking...</span>
+                  </div>
+                </MessageContent>
+              </Message>
+            )}
           </div>
 
           <div className="h-8 shrink-0" />
@@ -102,6 +111,22 @@ export function Messages({
       </Conversation>
     </EmailLookupProvider>
   );
+}
+
+function lastPartShowsProgress(
+  part: ChatMessage["parts"][0] | undefined,
+): boolean {
+  if (!part) return false;
+  if (part.type === "text" || part.type === "reasoning") {
+    return Boolean(part.text);
+  }
+  if (part.type.startsWith("tool-")) {
+    // input-available renders an in-progress chip; a finished tool output means
+    // the model is already generating the next step with nothing new on screen
+    const { state } = part as { state?: string };
+    return state === "input-available";
+  }
+  return false;
 }
 
 function buildEmailLookup(messages: Array<ChatMessage>): EmailLookup {
