@@ -96,15 +96,12 @@ RUN npx prisma generate --schema=apps/web/prisma/schema.prisma
 # memory-constrained self-host builders
 ARG BUILD_NODE_OPTIONS=""
 ARG TURBOPACK_MEMORY_LIMIT_MB=""
-# Persist .next/cache across builds (Turbopack compile cache; see
-# turbopackFileSystemCacheForBuild in next.config.ts). The mount never lands in
-# the image layer, so no cleanup rm is needed.
-RUN --mount=type=cache,target=/app/apps/web/.next/cache \
-    cd /app/apps/web \
+RUN cd /app/apps/web \
  && NODE_OPTIONS="$BUILD_NODE_OPTIONS" TURBOPACK_MEMORY_LIMIT_MB="$TURBOPACK_MEMORY_LIMIT_MB" pnpm exec next build \
  && cd /app \
  && pnpm --filter inbox-zero-ai deploy --legacy --prod /tmp/apps/web \
- && pnpm --filter @inboxzero/worker deploy --legacy --prod /tmp/apps/worker
+ && pnpm --filter @inboxzero/worker deploy --legacy --prod /tmp/apps/worker \
+ && rm -rf apps/web/.next/cache
 
 RUN rm -f /app/apps/web/.env /app/apps/web/.next/standalone/apps/web/.env
 
