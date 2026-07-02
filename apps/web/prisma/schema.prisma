@@ -178,6 +178,7 @@ model EmailAccount {
   draftCleanupDays          Int?                 @default(14)
   allowHiddenAiDraftLinks   Boolean              @default(false)
   rulesRevision             Int                  @default(0)
+  lastLlmActivityAt         DateTime? // heartbeat while an LLM call is in flight; powers the agent-running indicator
 
   meetingBriefingsEnabled       Boolean @default(false)
   meetingBriefingsMinutesBefore Int     @default(240) // 4 hours in minutes

@@ -66,6 +66,7 @@ import {
 } from "@/utils/llms/ollama-guidance";
 import { createScopedLogger } from "@/utils/logger";
 import { getPosthogLlmClient, isPosthogLlmEvalApproved } from "@/utils/posthog";
+import { withLlmActivityTracking } from "@/utils/llms/activity";
 import {
   applyPromptHardeningToMessages,
   applyPromptHardeningToSystem,
@@ -333,7 +334,7 @@ export function createGenerateText({
           ...(bridged.tools ? { tools: bridged.tools } : {}),
           ...commonOptions,
           providerOptions,
-          model: withPosthogTracing({
+          model: instrumentModel({
             model: bridged.model,
             userEmail: emailAccount.email,
             userId: emailAccount.userId,
@@ -527,7 +528,7 @@ export function createGenerateObject({
         ...protectedOptions,
         ...commonOptions,
         providerOptions,
-        model: withPosthogTracing({
+        model: instrumentModel({
           model: candidate.model,
           userEmail: emailAccount.email,
           userId: emailAccount.userId,
@@ -692,7 +693,7 @@ export async function chatCompletionStream(
       model: candidate.model,
       tools: protectedChatTools,
     });
-    const model = withPosthogTracing({
+    const model = instrumentModel({
       model: bridgedChat.model,
       userEmail,
       userId,
@@ -850,7 +851,7 @@ export async function toolCallAgentStream(options: ToolCallAgentStreamOptions) {
       tools: candidateTools,
       activeTools,
     });
-    const model = withPosthogTracing({
+    const model = instrumentModel({
       model: bridgedAgent.model,
       userEmail,
       userId,
@@ -1908,7 +1909,7 @@ function isJsonObject(
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function withPosthogTracing({
+function instrumentModel({
   model,
   userEmail,
   userId,
@@ -1925,11 +1926,15 @@ function withPosthogTracing({
   provider: string;
   modelName: string;
 }) {
+  const tracked = emailAccountId
+    ? withLlmActivityTracking({ model, emailAccountId })
+    : model;
+
   const posthogClient = getPosthogLlmClient();
-  if (!posthogClient) return model;
+  if (!posthogClient) return tracked;
   const llmEvalsEnabled = isPosthogLlmEvalApproved(userEmail);
 
-  return withTracing(model, posthogClient, {
+  return withTracing(tracked, posthogClient, {
     posthogDistinctId: userEmail,
     posthogPrivacyMode: !llmEvalsEnabled,
     posthogProperties: {

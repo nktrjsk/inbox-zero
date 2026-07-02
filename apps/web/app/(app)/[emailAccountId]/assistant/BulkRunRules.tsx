@@ -1,6 +1,7 @@
 "use client";
 
 import { useReducer, useRef, useState } from "react";
+import { useQueryState } from "nuqs";
 import { PauseIcon, PlayIcon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SectionDescription } from "@/components/Typography";
@@ -46,7 +47,10 @@ const TRIAL_BULK_PROCESS_EMAIL_LIMIT = 200;
 export function BulkRunRules() {
   const { emailAccountId } = useAccount();
 
-  const [isOpen, setIsOpen] = useState(false);
+  // URL-driven so the sidebar agent-running indicator can deep-link here
+  const [bulkProgress, setBulkProgress] = useQueryState("bulk-progress");
+  const isOpen = bulkProgress === "open";
+  const setIsOpen = (open: boolean) => setBulkProgress(open ? "open" : null);
   const [state, dispatch] = useReducer(bulkRunReducer, initialBulkRunState);
 
   const queue = useAiQueueState();

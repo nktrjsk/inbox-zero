@@ -38,6 +38,12 @@ vi.mock("@/utils/usage", () => ({
   saveAiUsage: mockSaveAiUsage,
 }));
 
+// Identity stub: activity heartbeat behavior is covered by activity.test.ts,
+// and these tests assert model identity through the fallback chain.
+vi.mock("@/utils/llms/activity", () => ({
+  withLlmActivityTracking: ({ model }: { model: unknown }) => model,
+}));
+
 vi.mock("@/utils/posthog", () => ({
   getPosthogLlmClient: mockGetPosthogLlmClient,
   isPosthogLlmEvalApproved: mockIsPosthogLlmEvalApproved,

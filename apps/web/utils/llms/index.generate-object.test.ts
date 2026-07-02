@@ -12,8 +12,8 @@ const {
   mockAssertTrialAiUsageAllowed: vi.fn(),
   mockAttachLlmRepairMetadata: vi.fn(),
   mockGenerateObject: vi.fn(),
-  mockIsContentFilterRefusal: vi.fn(() => false),
-  mockNoObjectGeneratedErrorIsInstance: vi.fn(() => false),
+  mockIsContentFilterRefusal: vi.fn((_error: unknown) => false),
+  mockNoObjectGeneratedErrorIsInstance: vi.fn((_error: unknown) => false),
   mockSaveAiUsage: vi.fn(),
   mockShouldForceNanoModel: vi.fn(),
 }));
@@ -33,6 +33,11 @@ vi.mock("ai", () => ({
 
 vi.mock("@posthog/ai/vercel", () => ({
   withTracing: vi.fn((model) => model),
+}));
+
+// Identity stub: activity heartbeat behavior is covered by activity.test.ts.
+vi.mock("@/utils/llms/activity", () => ({
+  withLlmActivityTracking: ({ model }: { model: unknown }) => model,
 }));
 
 vi.mock("@/env", () => ({
@@ -252,9 +257,9 @@ describe("createGenerateObject repairText", () => {
     });
 
     const wasMissingJsonWarned = () =>
-      warnSpy.mock.calls.some((args) =>
+      warnSpy.mock.calls.some((args: unknown[]) =>
         args.some(
-          (arg) =>
+          (arg: unknown) =>
             typeof arg === "string" && arg.includes("Missing JSON in prompt"),
         ),
       );

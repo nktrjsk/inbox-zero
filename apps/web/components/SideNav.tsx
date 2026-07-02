@@ -58,6 +58,9 @@ import {
 } from "@/hooks/useFeatureFlags";
 import { AccountSwitcher } from "@/components/AccountSwitcher";
 import { useAccount } from "@/providers/EmailAccountProvider";
+import { useAiQueueState } from "@/store/ai-queue";
+import { useLlmActivity } from "@/hooks/useLlmActivity";
+import { useBeforeUnload } from "@/hooks/useBeforeUnload";
 import { prefixPath } from "@/utils/path";
 import { isGoogleProvider } from "@/utils/email/provider-types";
 import { NavUser } from "@/components/NavUser";
@@ -70,8 +73,10 @@ type NavItem = {
   target?: "_blank";
   count?: number;
   hideInMail?: boolean;
+  active?: boolean;
   beta?: boolean;
   new?: boolean;
+  running?: boolean;
 };
 
 export const useNavigation = () => {
@@ -82,8 +87,14 @@ export const useNavigation = () => {
   const { emailAccount, emailAccountId, provider } = useAccount();
   const currentEmailAccountId = emailAccount?.id || emailAccountId;
 
-  const manageItems: NavItem[] = useMemo(
-    () => [
+  const path = usePathname();
+  const queueCount = useAiQueueState().size;
+  const { serverRunning } = useLlmActivity();
+  const agentRunning = queueCount > 0 || serverRunning;
+
+  const manageItems: NavItem[] = useMemo(() => {
+    const automationPath = prefixPath(currentEmailAccountId, "/automation");
+    return [
       {
         name: "Chat",
         href: prefixPath(currentEmailAccountId, "/assistant"),
@@ -91,17 +102,24 @@ export const useNavigation = () => {
       },
       {
         name: "Assistant",
-        href: prefixPath(currentEmailAccountId, "/automation"),
+        // While the agent is running, clicking jumps straight to the live
+        // activity: the bulk-run progress log for a local run, otherwise the
+        // History tab where automatic runs land.
+        href: agentRunning
+          ? `${automationPath}?${queueCount > 0 ? "bulk-progress=open" : "tab=history"}`
+          : automationPath,
         icon: SparklesIcon,
+        running: agentRunning,
+        count: queueCount > 0 ? queueCount : undefined,
+        active: path.startsWith(automationPath),
       },
       {
         name: "Channels",
         href: prefixPath(currentEmailAccountId, "/channels"),
         icon: MessagesSquareIcon,
       },
-    ],
-    [currentEmailAccountId],
-  );
+    ];
+  }, [currentEmailAccountId, agentRunning, queueCount, path]);
 
   const cleanupItems: NavItem[] = useMemo(
     () => [
@@ -231,6 +249,10 @@ const bottomMailLinks: NavItem[] = [
 export function SideNav({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const navigation = useNavigation();
   const path = usePathname();
+
+  // The bulk-run queue lives in this tab; closing it silently kills the run.
+  const queueCount = useAiQueueState().size;
+  useBeforeUnload(queueCount > 0);
   const showMailNav = path.includes("/mail") || path.includes("/compose");
   const isMoreActive = navigation.moreItems.some(
     (item) => path === item.href || path.startsWith(`${item.href}/`),

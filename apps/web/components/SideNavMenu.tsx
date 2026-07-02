@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import type { ComponentProps } from "react";
-import type { LucideIcon } from "lucide-react";
+import { Loader2Icon, type LucideIcon } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { usePostHog } from "posthog-js/react";
 import {
@@ -30,6 +30,7 @@ type NavItem = {
   active?: boolean;
   beta?: boolean;
   new?: boolean;
+  running?: boolean;
 };
 
 export function SideNavMenu({
@@ -77,6 +78,12 @@ export function SideNavMenu({
             >
               <item.icon />
               <span>{item.name}</span>
+              {item.running && (
+                <span className="ml-auto flex items-center gap-1 text-xs tabular-nums text-muted-foreground">
+                  <Loader2Icon className="size-3.5 animate-spin text-blue-600" />
+                  {item.count !== undefined && item.count}
+                </span>
+              )}
               {item.new && (
                 <Badge variant="green" className="ml-auto text-[10px]">
                   New!
