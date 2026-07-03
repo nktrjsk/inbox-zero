@@ -258,11 +258,7 @@ function selectModel(
       return {
         provider: Provider.OLLAMA,
         modelName,
-        // Thinking models spend the whole completion on hidden reasoning and
-        // can return empty content; harmless for non-thinking models.
-        model: createOllama({ baseURL: env.OLLAMA_BASE_URL })(modelName, {
-          think: false,
-        }),
+        model: createOllama({ baseURL: env.OLLAMA_BASE_URL })(modelName),
       };
     }
     case Provider.OPENAI_COMPATIBLE: {
