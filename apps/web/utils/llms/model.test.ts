@@ -57,7 +57,9 @@ vi.mock("@openrouter/ai-sdk-provider", () => ({
 }));
 
 vi.mock("ollama-ai-provider-v2", () => ({
-  createOllama: vi.fn(() => (model: string) => ({ model })),
+  createOllama: vi.fn(() => ({
+    chat: vi.fn((model: string) => ({ model })),
+  })),
 }));
 
 vi.mock("@ai-sdk/openai-compatible", () => ({
