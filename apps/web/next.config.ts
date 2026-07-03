@@ -48,6 +48,10 @@ const nextConfig: NextConfig = {
                 // once. This trades a bit of build time for lower peak RAM.
                 staticGenerationMaxConcurrency: 4,
                 staticGenerationMinPagesPerWorker: 100,
+                // Persist Turbopack's compile cache in .next/cache so repeat
+                // builds are incremental (Dockerfile.prod mounts that dir as a
+                // BuildKit cache). Experimental for production builds.
+                turbopackFileSystemCacheForBuild: true,
                 // Bound the Turbopack (Rust) process on memory-constrained
                 // self-host builders; NODE_OPTIONS can't cap it.
                 ...(process.env.TURBOPACK_MEMORY_LIMIT_MB
