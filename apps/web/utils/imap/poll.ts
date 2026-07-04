@@ -1,20 +1,33 @@
+import { createEmailProvider } from "@/utils/email/provider";
 import { withImapConnection } from "@/utils/imap/client";
 import { getImapCredentials } from "@/utils/imap/credential";
-import { searchImapMessages } from "@/utils/imap/message";
+import { fetchMessageByUid, searchImapMessages } from "@/utils/imap/message";
 import type { Logger } from "@/utils/logger";
 import { createScopedLogger } from "@/utils/logger";
 import prisma from "@/utils/prisma";
+import type { ParsedMessage } from "@/utils/types";
+import { processHistoryItem } from "@/utils/webhook/process-history-item";
+import {
+  getWebhookEmailAccount,
+  validateWebhookAccount,
+} from "@/utils/webhook/validate-webhook-account";
 
 const defaultLogger = createScopedLogger("imap/poll");
+
+// Rule runs hit the LLM per message, so cap each poll cycle. lastSeenUid only
+// advances past the messages we fetched, so a backlog drains across polls.
+const MAX_MESSAGES_PER_POLL = 25;
 
 interface PollResult {
   emailAccountId: string;
   error?: string;
   newMessages: number;
+  processedMessages: number;
 }
 
 /**
- * Poll a single IMAP account for new messages.
+ * Poll a single IMAP account for new messages and run automation rules on
+ * them, mirroring what the Gmail/Outlook webhooks do for new inbound mail.
  * Compares the current UIDNEXT with the stored lastSeenUid.
  */
 export async function pollImapAccount(
@@ -44,27 +57,53 @@ export async function pollImapAccount(
       const lastSeenUid = credential.lastSeenUid || 0;
       const uidNext = (mailbox.uidNext as number) || 0;
 
-      if (uidNext <= lastSeenUid) {
-        // No new messages
-        return { newMessages: 0 };
+      // First poll for this account: start watching from the current state
+      // instead of running rules over the entire historic inbox.
+      if (!lastSeenUid) {
+        await prisma.imapCredential.update({
+          where: { id: credential.id },
+          data: {
+            lastSeenUid: Math.max(uidNext - 1, 0),
+            lastPolledAt: new Date(),
+          },
+        });
+        return { newMessages: 0, messages: [] };
       }
 
-      // Search for messages with UID > lastSeenUid
-      const newUids = await searchImapMessages(client, {
+      if (uidNext <= lastSeenUid + 1) {
+        // No new messages
+        return { newMessages: 0, messages: [] };
+      }
+
+      // Search for messages with UID > lastSeenUid. An IMAP range `n:*`
+      // always matches the highest-UID message even when n exceeds it, so
+      // filter out anything at or below lastSeenUid.
+      const searchedUids = await searchImapMessages(client, {
         uid: `${lastSeenUid + 1}:*`,
       });
+      const newUids = searchedUids.filter((uid) => uid > lastSeenUid);
 
       if (newUids.length === 0) {
-        return { newMessages: 0 };
+        return { newMessages: 0, messages: [] };
       }
+
+      // Oldest first; leave anything past the cap for the next poll
+      const sortedUids = [...newUids].sort((a, b) => a - b);
+      const uidsToProcess = sortedUids.slice(0, MAX_MESSAGES_PER_POLL);
 
       log.info("Found new IMAP messages", {
         emailAccountId,
         count: newUids.length,
+        processing: uidsToProcess.length,
       });
 
-      // Update lastSeenUid to the highest UID
-      const highestUid = Math.max(...newUids);
+      const messages: ParsedMessage[] = [];
+      for (const uid of uidsToProcess) {
+        const message = await fetchMessageByUid(client, uid);
+        if (message) messages.push(message);
+      }
+
+      const highestUid = uidsToProcess[uidsToProcess.length - 1];
       await prisma.imapCredential.update({
         where: { id: credential.id },
         data: {
@@ -73,12 +112,20 @@ export async function pollImapAccount(
         },
       });
 
-      return { newMessages: newUids.length };
+      return { newMessages: uidsToProcess.length, messages };
+    });
+
+    const processedMessages = await runRulesOnNewMessages({
+      emailAccountId,
+      email: credentials.email,
+      messages: result.messages,
+      log,
     });
 
     return {
       emailAccountId,
-      ...result,
+      newMessages: result.newMessages,
+      processedMessages,
     };
   } catch (error) {
     const errorMessage =
@@ -90,6 +137,7 @@ export async function pollImapAccount(
     return {
       emailAccountId,
       newMessages: 0,
+      processedMessages: 0,
       error: errorMessage,
     };
   }
@@ -122,4 +170,61 @@ export async function pollAllImapAccounts(
   }
 
   return results;
+}
+
+async function runRulesOnNewMessages({
+  emailAccountId,
+  email,
+  messages,
+  log,
+}: {
+  emailAccountId: string;
+  email: string;
+  messages: ParsedMessage[];
+  log: Logger;
+}): Promise<number> {
+  if (messages.length === 0) return 0;
+
+  const accountData = await getWebhookEmailAccount({ email }, log);
+  const validation = await validateWebhookAccount(accountData, log);
+  if (!validation.success) {
+    log.info("Skipping rule run for IMAP account", { emailAccountId });
+    return 0;
+  }
+
+  const { emailAccount, hasAutomationRules, hasAiAccess } = validation.data;
+  const provider = await createEmailProvider({
+    emailAccountId,
+    provider: "imap",
+    logger: log,
+  });
+
+  let processed = 0;
+  for (const message of messages) {
+    try {
+      await processHistoryItem(
+        { messageId: message.id, threadId: message.threadId, message },
+        {
+          provider,
+          emailAccount: {
+            ...emailAccount,
+            account: { provider: "imap" },
+          },
+          hasAutomationRules,
+          hasAiAccess,
+          rules: emailAccount.rules,
+          logger: log,
+        },
+      );
+      processed++;
+    } catch (error) {
+      log.error("Error running rules on new IMAP message", {
+        emailAccountId,
+        messageId: message.id,
+        error: error instanceof Error ? error.message : error,
+      });
+    }
+  }
+
+  return processed;
 }

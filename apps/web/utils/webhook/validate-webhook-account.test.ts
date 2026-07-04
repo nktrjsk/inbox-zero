@@ -311,6 +311,27 @@ describe("validateWebhookAccount", () => {
     });
   });
 
+  describe("when provider is imap", () => {
+    it("succeeds without OAuth tokens", async () => {
+      const emailAccount = createMockEmailAccount({
+        account: {
+          provider: "imap",
+          access_token: null,
+          refresh_token: null,
+          expires_at: null,
+          disconnectedAt: null,
+        },
+      });
+
+      vi.mocked(isPremiumRecord).mockReturnValue(true);
+      vi.mocked(hasAiAccess).mockReturnValue(true);
+
+      const result = await validateWebhookAccount(emailAccount, logger);
+
+      expect(result.success).toBe(true);
+    });
+  });
+
   describe("when account is null", () => {
     it("should return failure with error logged", async () => {
       const emailAccount = {
