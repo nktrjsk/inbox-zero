@@ -34,7 +34,8 @@ export function getRootMessageId(
     if (ids.length > 0) return ids[0];
   }
 
-  return messageId || "unknown";
+  const bare = messageId?.replace(/^<|>$/g, "").trim();
+  return bare || "unknown";
 }
 
 /**
@@ -72,10 +73,14 @@ function hashToThreadId(messageId: string): string {
 
 /**
  * All thread ids a message in a thread may be stored under. getRootMessageId
- * strips angle brackets from References/In-Reply-To ids but keeps them on a
- * root message's own Message-ID, and ids computed without body access fall
- * back to In-Reply-To (the parent, not the root) — so messages in the same
- * thread can disagree on the thread id. Lookups should match any of these.
+ * now normalizes brackets everywhere, so a message's own Message-ID and ids
+ * parsed from References/In-Reply-To hash the same way. But thread ids
+ * computed without body access still fall back to In-Reply-To (the parent,
+ * not the root) — so messages in the same thread can disagree on the thread
+ * id — and older thread ids may have been computed and stored before this
+ * fix (bracketed root) or by a message that lacked References. This
+ * generates both bare and bracketed variants (plus references-root and
+ * in-reply-to-parent) so lookups can still match any of them.
  */
 export function getThreadIdCandidates(
   references: string | undefined,

@@ -31,7 +31,6 @@ import { TestCustomEmailForm } from "@/app/(app)/[emailAccountId]/assistant/Test
 import { ResultsDisplay } from "@/app/(app)/[emailAccountId]/assistant/ResultDisplay";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { FixWithChat } from "@/app/(app)/[emailAccountId]/assistant/FixWithChat";
-import { useChat } from "@/providers/ChatProvider";
 import { MutedText } from "@/components/Typography";
 import { createClientLogger } from "@/utils/logger-client";
 import { isDefined } from "@/utils/types";
@@ -86,11 +85,12 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
     [messages],
   );
 
-  const { data: existingRules } = useSWR<BatchExecutedRulesResponse>(
-    messageIdsToFetch.length > 0
-      ? `/api/user/executed-rules/batch?messageIds=${messageIdsToFetch.join(",")}`
-      : null,
-  );
+  const { data: existingRules, mutate: mutateExistingRules } =
+    useSWR<BatchExecutedRulesResponse>(
+      messageIdsToFetch.length > 0
+        ? `/api/user/executed-rules/batch?messageIds=${messageIdsToFetch.join(",")}`
+        : null,
+    );
 
   // only show test rules form if we have an AI rule. this form won't match group/static rules which will confuse users
   const hasAiRules = rules?.some(
@@ -127,7 +127,11 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
   }, [resultsMap, existingRules]);
 
   const onRun = useCallback(
-    async (message: Message, rerun?: boolean) => {
+    async (
+      message: Message,
+      rerun?: boolean,
+      options?: { revalidate?: boolean },
+    ) => {
       setIsRunning((prev) => ({ ...prev, [message.id]: true }));
 
       const result = await runRulesAction(emailAccountId, {
@@ -169,8 +173,15 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
         logger.warn("runRulesAction returned empty response", logContext);
       }
       setIsRunning((prev) => ({ ...prev, [message.id]: false }));
+
+      // Refresh the persisted executed-rules snapshot so the "Previous" state
+      // (and any rows processed in the background) stays live without a reload.
+      // Skipped during "Run on All" — the caller revalidates once at the end.
+      if (options?.revalidate !== false) {
+        mutateExistingRules().catch(() => {});
+      }
     },
-    [testMode, emailAccountId],
+    [testMode, emailAccountId, mutateExistingRules],
   );
 
   const handleRunAll = async () => {
@@ -207,7 +218,7 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
           if (!isRunningAllRef.current) return;
 
           try {
-            await onRun(message);
+            await onRun(message, false, { revalidate: false });
             handledThreadsRef.current.add(message.threadId);
           } catch (error) {
             console.error(`Failed to process message ${message.id}:`, error);
@@ -227,6 +238,8 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
     // Wait for all queued tasks to complete
     await processQueue.onIdle();
 
+    await mutateExistingRules().catch(() => {});
+
     handleStop();
   };
 
@@ -239,8 +252,6 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
     isRunningAllRef.current = false;
     setIsRunningAll(false);
   };
-
-  const { setInput } = useChat();
 
   return (
     <div>
@@ -311,7 +322,6 @@ export function ProcessRulesContent({ testMode }: { testMode: boolean }) {
                     results={allResults[message.id]}
                     onRun={(rerun) => onRun(message, rerun)}
                     testMode={testMode}
-                    setInput={setInput}
                   />
                 ))}
               </TableBody>
@@ -388,7 +398,6 @@ function ProcessRulesRow({
   results,
   onRun,
   testMode,
-  setInput,
 }: {
   message: Message;
   userEmail: string;
@@ -396,7 +405,6 @@ function ProcessRulesRow({
   results: RunRulesResult[];
   onRun: (rerun?: boolean) => void;
   testMode: boolean;
-  setInput: (input: string) => void;
 }) {
   return (
     <TableRow

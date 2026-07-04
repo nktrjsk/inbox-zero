@@ -54,7 +54,12 @@ describe("getRootMessageId", () => {
 
   it("falls back to messageId when no threading headers", () => {
     const result = getRootMessageId(undefined, undefined, "<only@ex.com>");
-    expect(result).toBe("<only@ex.com>");
+    expect(result).toBe("only@ex.com");
+  });
+
+  it("returns a bare messageId unchanged", () => {
+    const result = getRootMessageId(undefined, undefined, "only@ex.com");
+    expect(result).toBe("only@ex.com");
   });
 
   it("returns 'unknown' when all headers are missing", () => {
@@ -88,5 +93,21 @@ describe("buildThreadId", () => {
   it("returns a 24-character hex string", () => {
     const id = buildThreadId("<msg@ex.com>", undefined, undefined);
     expect(id).toMatch(/^[0-9a-f]{24}$/);
+  });
+
+  it("gives a root message and its reply the same thread id (bracket normalization)", () => {
+    const rootId = buildThreadId(undefined, undefined, "<root@x.com>");
+    const replyId = buildThreadId(undefined, "<root@x.com>", "<reply@x.com>");
+    expect(rootId).toBe(replyId);
+  });
+
+  it("keys a deeper reply on the references root, matching the thread root", () => {
+    const rootId = buildThreadId(undefined, undefined, "<a@x.com>");
+    const thirdMessageId = buildThreadId(
+      "<a@x.com> <b@x.com>",
+      "<b@x.com>",
+      "<c@x.com>",
+    );
+    expect(rootId).toBe(thirdMessageId);
   });
 });

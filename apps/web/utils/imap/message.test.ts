@@ -17,6 +17,7 @@ function createFetchMessage(overrides: {
   uid?: number;
   messageId?: string;
   inReplyTo?: string;
+  references?: string;
 }): FetchMessageObject {
   return {
     uid: overrides.uid ?? 7,
@@ -29,6 +30,9 @@ function createFetchMessage(overrides: {
       messageId: overrides.messageId,
       inReplyTo: overrides.inReplyTo,
     },
+    ...(overrides.references && {
+      headers: Buffer.from(`References: ${overrides.references}\r\n`),
+    }),
   } as unknown as FetchMessageObject;
 }
 
@@ -69,6 +73,31 @@ describe("convertImapMessage", () => {
       }),
     );
     expect(parsed?.internalDate).toBe("2026-01-01T00:00:00.000Z");
+  });
+
+  it("derives the threadId from a References header carried in msg.headers when no body was fetched", async () => {
+    const parsed = await convertImapMessage(
+      createFetchMessage({
+        messageId: "<c@x.com>",
+        references: "<root@x.com> <b@x.com>",
+      }),
+    );
+    expect(parsed?.threadId).toBe(
+      buildThreadId("<root@x.com> <b@x.com>", undefined, undefined),
+    );
+  });
+
+  it("groups a root message and a header-only reply into the same thread", async () => {
+    const root = await convertImapMessage(
+      createFetchMessage({ messageId: "<root@x.com>" }),
+    );
+    const reply = await convertImapMessage(
+      createFetchMessage({
+        messageId: "<reply@x.com>",
+        references: "<root@x.com>",
+      }),
+    );
+    expect(root?.threadId).toBe(reply?.threadId);
   });
 });
 

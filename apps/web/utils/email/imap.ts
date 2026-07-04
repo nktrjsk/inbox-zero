@@ -172,6 +172,7 @@ export class ImapProvider implements EmailProvider {
           uid: true,
           envelope: true,
           flags: true,
+          headers: ["references"],
         })) {
           const parsed = await convertImapMessage(msg);
           if (parsed) messages.push(parsed);

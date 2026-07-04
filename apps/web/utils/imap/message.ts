@@ -71,6 +71,7 @@ export async function fetchRecentMessages(
     uid: true,
     envelope: true,
     flags: true,
+    headers: ["references"],
   })) {
     const parsed = await convertImapMessage(msg);
     if (parsed) messages.push(parsed);
@@ -132,7 +133,7 @@ export async function listMessagesWithFilters(
   const matching: { parsed: ParsedMessage; uid: number }[] = [];
   for await (const msg of client.fetch(
     `${bottom}:${top}`,
-    { uid: true, envelope: true, flags: true },
+    { uid: true, envelope: true, flags: true, headers: ["references"] },
     { uid: true },
   )) {
     // Real servers bound the fetch to the UID range; guard here too so the
@@ -190,6 +191,7 @@ export async function fetchMessagesByUids(
       uid: true,
       envelope: true,
       flags: true,
+      headers: ["references"],
     })) {
       const parsed = await convertImapMessage(msg);
       if (parsed) byUid.set(msg.uid, parsed);
@@ -469,7 +471,7 @@ export async function convertImapMessage(
 
     const textHtml = body?.textHtml;
     const textPlain = body?.textPlain;
-    const references = body?.references;
+    const references = body?.references ?? extractReferencesHeader(msg.headers);
 
     const fromAddr = envelope.from?.[0];
     const fromStr = fromAddr
