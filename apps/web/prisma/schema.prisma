@@ -210,6 +210,7 @@ model EmailAccount {
   categories       Category[]
   threadTrackers   ThreadTracker[]
   cleanupJobs      CleanupJob[]
+  bulkProcessJobs  BulkProcessJob[]
   cleanupThreads   CleanupThread[]
   emailMessages    EmailMessage[]
   emailTokens      EmailToken[]
@@ -980,6 +981,38 @@ model ThreadTracker {
   @@index([emailAccountId, resolved, sentAt, type])
   @@index([emailAccountId, type, resolved, sentAt])
   @@index([emailAccountId, type, resolved, followUpAppliedAt, sentAt])
+}
+
+// Server-side "Process Past Emails" run; survives the browser tab closing.
+model BulkProcessJob {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  status      BulkProcessJobStatus @default(RUNNING)
+  after       DateTime
+  before      DateTime?
+  includeRead Boolean              @default(false)
+  maxEmails   Int?
+
+  // Progress: threads examined vs threads that had rules run on them
+  processed Int     @default(0)
+  ruleRuns  Int     @default(0)
+  pageToken String?
+  error     String?
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  @@index([emailAccountId, status])
+  @@index([status, updatedAt])
+}
+
+enum BulkProcessJobStatus {
+  RUNNING
+  STOPPED
+  COMPLETED
+  FAILED
 }
 
 model CleanupJob {
