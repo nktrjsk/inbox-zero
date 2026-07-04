@@ -60,9 +60,12 @@ export async function executeBulkProcessPage({
       include: { actions: true },
     });
 
-    const remaining =
-      job.maxEmails == null ? undefined : job.maxEmails - job.processed;
-    if (remaining !== undefined && remaining <= 0) {
+    // The cap counts emails we actually run rules on (the costly LLM work),
+    // not emails merely inspected — threads already handled by a prior run are
+    // skipped for free and must not consume the budget.
+    const runBudget =
+      job.maxEmails == null ? undefined : job.maxEmails - job.ruleRuns;
+    if (runBudget !== undefined && runBudget <= 0) {
       await markCompleted(jobId);
       return;
     }
@@ -81,13 +84,14 @@ export async function executeBulkProcessPage({
       pageToken: job.pageToken || undefined,
     });
 
-    const threadsToProcess =
-      remaining === undefined ? threads : threads.slice(0, remaining);
-
     let ruleRuns = 0;
-    for (const thread of threadsToProcess) {
+    let checked = 0;
+    for (const thread of threads) {
+      if (runBudget !== undefined && ruleRuns >= runBudget) break;
+
       const message = thread.messages[thread.messages.length - 1];
       if (!message) continue;
+      checked++;
 
       // Skip threads already handled by a rule (mirrors the "no plan" filter
       // in the client flow and the runRulesAction dedupe).
@@ -117,15 +121,15 @@ export async function executeBulkProcessPage({
       }
     }
 
-    const processedTotal = job.processed + threadsToProcess.length;
-    const hitMax = job.maxEmails != null && processedTotal >= job.maxEmails;
+    const totalRuleRuns = job.ruleRuns + ruleRuns;
+    const hitMax = job.maxEmails != null && totalRuleRuns >= job.maxEmails;
     const done = !nextPageToken || hitMax;
 
     // Only advance a job that is still RUNNING, so a concurrent Stop wins.
     const updated = await prisma.bulkProcessJob.updateMany({
       where: { id: jobId, status: BulkProcessJobStatus.RUNNING },
       data: {
-        processed: processedTotal,
+        processed: { increment: checked },
         ruleRuns: { increment: ruleRuns },
         pageToken: nextPageToken ?? null,
         status: done ? BulkProcessJobStatus.COMPLETED : undefined,
@@ -139,7 +143,7 @@ export async function executeBulkProcessPage({
 
     logger.info("Bulk process page complete", {
       jobId,
-      pageThreads: threadsToProcess.length,
+      checked,
       ruleRuns,
       done,
     });

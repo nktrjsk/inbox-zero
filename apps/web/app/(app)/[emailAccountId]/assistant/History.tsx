@@ -200,11 +200,7 @@ function RuleCell({
         <ResultsDisplay results={executedRules} />
       </div>
       {message ? (
-        <FixWithChat
-          setInput={setInput}
-          message={message}
-          results={executedRules}
-        />
+        <FixWithChat message={message} results={executedRules} />
       ) : isMessageLoading ? (
         <Skeleton className="h-9 w-16" />
       ) : (

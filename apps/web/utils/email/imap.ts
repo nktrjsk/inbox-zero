@@ -26,6 +26,7 @@ import {
   listMessagesWithFilters,
   locateMessages,
   parseSearchQuery,
+  parseStructuredImapQuery,
   searchImapMessages,
 } from "@/utils/imap/message";
 import {
@@ -146,8 +147,9 @@ export class ImapProvider implements EmailProvider {
     fromEmail?: string;
   }): Promise<{ messages: ParsedMessage[]; nextPageToken?: string }> {
     return this.withConnection(async (client) => {
-      const folder = options.inboxOnly !== false ? "INBOX" : "INBOX";
-      const mailbox = await client.mailboxOpen(folder, { readOnly: true });
+      // IMAP has no universal "all mail" folder, so listing is always scoped
+      // to INBOX regardless of options.inboxOnly (which Gmail/Outlook honor).
+      const mailbox = await client.mailboxOpen("INBOX", { readOnly: true });
       const total = mailbox.exists || 0;
 
       const maxResults = options.maxResults || 20;
@@ -184,15 +186,34 @@ export class ImapProvider implements EmailProvider {
 
       // Structured filters (dates/unread/sender) are applied client-side:
       // index-backed servers (e.g. Stalwart) silently under-return SEARCH
-      // results for dates and sender.
+      // results for dates and sender. This branch's token is a UID
+      // watermark (lowest UID emitted so far), not a positional offset -
+      // see listMessagesWithFilters for why.
       if (!options.query) {
         return listMessagesWithFilters(client, {
-          offset,
+          cursorUid: options.pageToken ? Number(options.pageToken) : undefined,
           maxResults,
           before: options.before,
           after: options.after,
           unreadOnly: options.unreadOnly,
           fromEmail: options.fromEmail,
+        });
+      }
+
+      // A query that decomposes entirely into structured, envelope-matchable
+      // filters (from:/to:/subject:/is:/since:/before:) is routed through the
+      // same client-side path as the no-query branch above, for the same
+      // reason: index-backed servers (e.g. Stalwart) silently under-return
+      // SEARCH for these. Only queries with genuine free-text/body terms or
+      // operators we can't match client-side (label:, in:, etc.) fall through
+      // to SEARCH below, which is best-effort and IMAP-limited anyway.
+      const { filters: structuredFilters, fullyStructured } =
+        parseStructuredImapQuery(options.query);
+      if (fullyStructured) {
+        return listMessagesWithFilters(client, {
+          cursorUid: options.pageToken ? Number(options.pageToken) : undefined,
+          maxResults,
+          ...structuredFilters,
         });
       }
 
@@ -242,26 +263,15 @@ export class ImapProvider implements EmailProvider {
     });
   }
 
-  async getMessagesWithAttachments(options: {
+  async getMessagesWithAttachments(_options: {
     maxResults?: number;
     pageToken?: string;
   }): Promise<{ messages: ParsedMessage[]; nextPageToken?: string }> {
-    return this.withConnection(async (client) => {
-      await client.mailboxOpen("INBOX", { readOnly: true });
-      // Search for messages with attachments is not universally supported
-      // Fall back to text search
-      const uids = await searchImapMessages(
-        client,
-        { all: true },
-        options.maxResults || 20,
-      );
-      const messages = await fetchMessagesByUids(client, uids);
-      // Filter client-side for messages with attachments
-      const withAttachments = messages.filter(
-        (m) => m.attachments && m.attachments.length > 0,
-      );
-      return { messages: withAttachments };
-    });
+    // The IMAP parser never populates ParsedMessage.attachments, and
+    // getAttachment() is likewise unsupported, so the Drive attachment-filing
+    // feature cannot work here. Fail honestly rather than silently returning
+    // an empty list, which reads to callers as "no attachments found".
+    throw new UnsupportedImapOperationError("getMessagesWithAttachments");
   }
 
   // --- Thread Operations ---
@@ -330,21 +340,7 @@ export class ImapProvider implements EmailProvider {
       fromEmail: query?.fromEmail ?? undefined,
     });
 
-    // Group into threads
-    const threadMap = new Map<string, ParsedMessage[]>();
-    for (const msg of messages) {
-      const existing = threadMap.get(msg.threadId) || [];
-      existing.push(msg);
-      threadMap.set(msg.threadId, existing);
-    }
-
-    const threads = [...threadMap.entries()].map(([id, msgs]) => ({
-      id,
-      messages: msgs,
-      snippet: msgs[msgs.length - 1].snippet,
-    }));
-
-    return { threads, nextPageToken };
+    return { threads: groupMessagesIntoThreads(messages), nextPageToken };
   }
 
   async getThreadsWithLabel(options: {
@@ -360,18 +356,7 @@ export class ImapProvider implements EmailProvider {
       );
       const messages = await fetchMessagesByUids(client, uids);
 
-      const threadMap = new Map<string, ParsedMessage[]>();
-      for (const msg of messages) {
-        const existing = threadMap.get(msg.threadId) || [];
-        existing.push(msg);
-        threadMap.set(msg.threadId, existing);
-      }
-
-      return [...threadMap.entries()].map(([id, msgs]) => ({
-        id,
-        messages: msgs,
-        snippet: msgs[msgs.length - 1].snippet,
-      }));
+      return groupMessagesIntoThreads(messages);
     });
   }
 
@@ -384,18 +369,7 @@ export class ImapProvider implements EmailProvider {
       maxResults: options.maxThreads || 20,
     });
 
-    const threadMap = new Map<string, ParsedMessage[]>();
-    for (const msg of messages) {
-      const existing = threadMap.get(msg.threadId) || [];
-      existing.push(msg);
-      threadMap.set(msg.threadId, existing);
-    }
-
-    return [...threadMap.entries()].map(([id, msgs]) => ({
-      id,
-      messages: msgs,
-      snippet: msgs[msgs.length - 1].snippet,
-    }));
+    return groupMessagesIntoThreads(messages);
   }
 
   async getThreadsFromSenderWithSubject(
@@ -811,18 +785,7 @@ export class ImapProvider implements EmailProvider {
       return true;
     });
 
-    const threadMap = new Map<string, ParsedMessage[]>();
-    for (const msg of filtered) {
-      const existing = threadMap.get(msg.threadId) || [];
-      existing.push(msg);
-      threadMap.set(msg.threadId, existing);
-    }
-
-    return [...threadMap.entries()].map(([id, msgs]) => ({
-      id,
-      messages: msgs,
-      snippet: msgs[msgs.length - 1].snippet,
-    }));
+    return groupMessagesIntoThreads(filtered);
   }
 
   // --- Email Sending ---
@@ -1166,4 +1129,21 @@ ${email.textHtml || email.textPlain || ""}
   async unwatchEmails(_subscriptionId?: string): Promise<void> {
     // No-op for IMAP
   }
+}
+
+// Group a flat message list into threads, preserving arrival order within each
+// thread; the snippet is taken from the newest (last) message.
+function groupMessagesIntoThreads(messages: ParsedMessage[]): EmailThread[] {
+  const threadMap = new Map<string, ParsedMessage[]>();
+  for (const msg of messages) {
+    const existing = threadMap.get(msg.threadId) || [];
+    existing.push(msg);
+    threadMap.set(msg.threadId, existing);
+  }
+
+  return [...threadMap.entries()].map(([id, msgs]) => ({
+    id,
+    messages: msgs,
+    snippet: msgs[msgs.length - 1].snippet,
+  }));
 }

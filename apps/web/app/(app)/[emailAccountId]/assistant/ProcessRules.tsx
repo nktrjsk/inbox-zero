@@ -423,11 +423,7 @@ function ProcessRulesRow({
             {results ? (
               <>
                 <ResultsDisplay results={results} />
-                <FixWithChat
-                  setInput={setInput}
-                  message={message}
-                  results={results}
-                />
+                <FixWithChat message={message} results={results} />
                 <Button
                   variant="outline"
                   size="sm"

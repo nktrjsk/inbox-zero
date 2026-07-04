@@ -13,6 +13,12 @@ export async function watchGmail(gmail: gmail_v1.Gmail) {
       "GOOGLE_PUBSUB_VERIFICATION_TOKEN is required to watch Gmail",
     );
   }
+  // GOOGLE_PUBSUB_TOPIC_NAME defaults to "" so IMAP-only self-hosts boot
+  // without Google config; fail clearly here rather than sending an empty
+  // topic to the Gmail watch API and getting an opaque error back.
+  if (!env.GOOGLE_PUBSUB_TOPIC_NAME) {
+    throw new Error("GOOGLE_PUBSUB_TOPIC_NAME is required to watch Gmail");
+  }
 
   try {
     return await startGmailWatch(gmail);

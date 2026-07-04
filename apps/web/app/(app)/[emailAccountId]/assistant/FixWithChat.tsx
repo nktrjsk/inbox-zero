@@ -39,11 +39,9 @@ type FixWithChatResult = RunRulesResult & {
 };
 
 export function FixWithChat({
-  setInput,
   message,
   results,
 }: {
-  setInput: (input: string) => void;
   message: ParsedMessage;
   results: FixWithChatResult[];
 }) {
@@ -54,7 +52,7 @@ export function FixWithChat({
   const [showExplanation, setShowExplanation] = useState(false);
 
   const { setOpen } = useSidebar();
-  const { setContext } = useChat();
+  const { startFixChat } = useChat();
 
   const selectedRuleName = useMemo(() => {
     if (!data) return null;
@@ -76,18 +74,18 @@ export function FixWithChat({
     if (selectedRuleId === CONST_NEW_RULE_ID) {
       input = explanation?.trim()
         ? `Create a new rule for emails like this: ${explanation.trim()}`
-        : "Create a new rule for emails like this: ";
+        : "Create a new rule for emails like this.";
     } else if (selectedRuleId === CONST_NONE_RULE_ID) {
       input = explanation?.trim()
         ? `This email shouldn't have matched any rule because ${explanation.trim()}`
-        : "This email shouldn't have matched any rule because ";
+        : "This email shouldn't have matched any rule.";
     } else {
       const rulePart = selectedRuleName
         ? `the "${selectedRuleName}" rule`
         : "a different rule";
       input = explanation?.trim()
         ? `This email should have matched ${rulePart} because ${explanation.trim()}`
-        : `This email should have matched ${rulePart} because `;
+        : `This email should have matched ${rulePart}.`;
     }
 
     const context: MessageContext = {
@@ -124,9 +122,7 @@ export function FixWithChat({
                 name: selectedRuleName || "Unknown",
               },
     };
-    setContext(context);
-
-    setInput(input);
+    startFixChat({ text: input, context });
     setOpen((arr) => [...arr, "chat-sidebar"]);
     setIsModalOpen(false);
 

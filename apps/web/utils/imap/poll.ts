@@ -1,3 +1,4 @@
+import { runWithBoundedConcurrency } from "@/utils/async";
 import { createEmailProvider } from "@/utils/email/provider";
 import { withImapConnection } from "@/utils/imap/client";
 import { getImapCredentials } from "@/utils/imap/credential";
@@ -18,11 +19,25 @@ const defaultLogger = createScopedLogger("imap/poll");
 // advances past the messages we fetched, so a backlog drains across polls.
 const MAX_MESSAGES_PER_POLL = 25;
 
+// Poll several accounts at once, but bounded so a large deployment doesn't open
+// a connection per account simultaneously.
+const POLL_CONCURRENCY = 5;
+
 interface PollResult {
   emailAccountId: string;
   error?: string;
   newMessages: number;
   processedMessages: number;
+}
+
+// lastSeenUid isn't persisted until rules have run for these messages
+// without throwing, so highestUid is only set when there's something new
+// to advance past.
+interface ImapPollFetchResult {
+  credentialId: string;
+  highestUid?: number;
+  messages: ParsedMessage[];
+  newMessages: number;
 }
 
 /**
@@ -39,81 +54,96 @@ export async function pollImapAccount(
   try {
     const credentials = await getImapCredentials(emailAccountId);
 
-    const result = await withImapConnection(credentials, async (client) => {
-      const mailbox = await client.mailboxOpen("INBOX", { readOnly: true });
+    const result = await withImapConnection<ImapPollFetchResult>(
+      credentials,
+      async (client) => {
+        const mailbox = await client.mailboxOpen("INBOX", { readOnly: true });
 
-      // Get the stored last seen UID
-      const credential = await prisma.imapCredential.findFirst({
-        where: {
-          account: { emailAccount: { id: emailAccountId } },
-        },
-        select: { id: true, lastSeenUid: true },
-      });
-
-      if (!credential) {
-        throw new Error("IMAP credential not found");
-      }
-
-      const lastSeenUid = credential.lastSeenUid || 0;
-      const uidNext = (mailbox.uidNext as number) || 0;
-
-      // First poll for this account: start watching from the current state
-      // instead of running rules over the entire historic inbox.
-      if (!lastSeenUid) {
-        await prisma.imapCredential.update({
-          where: { id: credential.id },
-          data: {
-            lastSeenUid: Math.max(uidNext - 1, 0),
-            lastPolledAt: new Date(),
+        // Get the stored last seen UID
+        const credential = await prisma.imapCredential.findFirst({
+          where: {
+            account: { emailAccount: { id: emailAccountId } },
           },
+          select: { id: true, lastSeenUid: true },
         });
-        return { newMessages: 0, messages: [] };
-      }
 
-      if (uidNext <= lastSeenUid + 1) {
-        // No new messages
-        return { newMessages: 0, messages: [] };
-      }
+        if (!credential) {
+          throw new Error("IMAP credential not found");
+        }
 
-      // Search for messages with UID > lastSeenUid. An IMAP range `n:*`
-      // always matches the highest-UID message even when n exceeds it, so
-      // filter out anything at or below lastSeenUid.
-      const searchedUids = await searchImapMessages(client, {
-        uid: `${lastSeenUid + 1}:*`,
-      });
-      const newUids = searchedUids.filter((uid) => uid > lastSeenUid);
+        const lastSeenUid = credential.lastSeenUid || 0;
+        const uidNext = (mailbox.uidNext as number) || 0;
 
-      if (newUids.length === 0) {
-        return { newMessages: 0, messages: [] };
-      }
+        // First poll for this account: start watching from the current
+        // state instead of running rules over the entire historic inbox.
+        if (!lastSeenUid) {
+          await prisma.imapCredential.update({
+            where: { id: credential.id },
+            data: {
+              lastSeenUid: Math.max(uidNext - 1, 0),
+              lastPolledAt: new Date(),
+            },
+          });
+          return {
+            newMessages: 0,
+            messages: [],
+            credentialId: credential.id,
+          };
+        }
 
-      // Oldest first; leave anything past the cap for the next poll
-      const sortedUids = [...newUids].sort((a, b) => a - b);
-      const uidsToProcess = sortedUids.slice(0, MAX_MESSAGES_PER_POLL);
+        if (uidNext <= lastSeenUid + 1) {
+          // No new messages
+          return {
+            newMessages: 0,
+            messages: [],
+            credentialId: credential.id,
+          };
+        }
 
-      log.info("Found new IMAP messages", {
-        emailAccountId,
-        count: newUids.length,
-        processing: uidsToProcess.length,
-      });
+        // Search for messages with UID > lastSeenUid. An IMAP range `n:*`
+        // always matches the highest-UID message even when n exceeds it, so
+        // filter out anything at or below lastSeenUid.
+        const searchedUids = await searchImapMessages(client, {
+          uid: `${lastSeenUid + 1}:*`,
+        });
+        const newUids = searchedUids.filter((uid) => uid > lastSeenUid);
 
-      const messages: ParsedMessage[] = [];
-      for (const uid of uidsToProcess) {
-        const message = await fetchMessageByUid(client, uid);
-        if (message) messages.push(message);
-      }
+        if (newUids.length === 0) {
+          return {
+            newMessages: 0,
+            messages: [],
+            credentialId: credential.id,
+          };
+        }
 
-      const highestUid = uidsToProcess[uidsToProcess.length - 1];
-      await prisma.imapCredential.update({
-        where: { id: credential.id },
-        data: {
-          lastSeenUid: highestUid,
-          lastPolledAt: new Date(),
-        },
-      });
+        // Oldest first; leave anything past the cap for the next poll
+        const sortedUids = [...newUids].sort((a, b) => a - b);
+        const uidsToProcess = sortedUids.slice(0, MAX_MESSAGES_PER_POLL);
 
-      return { newMessages: uidsToProcess.length, messages };
-    });
+        log.info("Found new IMAP messages", {
+          emailAccountId,
+          count: newUids.length,
+          processing: uidsToProcess.length,
+        });
+
+        const messages: ParsedMessage[] = [];
+        for (const uid of uidsToProcess) {
+          const message = await fetchMessageByUid(client, uid);
+          if (message) messages.push(message);
+        }
+
+        // lastSeenUid is persisted only after rules run successfully (see
+        // below), so a transient failure doesn't permanently skip these
+        // messages.
+        const highestUid = uidsToProcess[uidsToProcess.length - 1];
+        return {
+          newMessages: uidsToProcess.length,
+          messages,
+          credentialId: credential.id,
+          highestUid,
+        };
+      },
+    );
 
     const processedMessages = await runRulesOnNewMessages({
       emailAccountId,
@@ -121,6 +151,16 @@ export async function pollImapAccount(
       messages: result.messages,
       log,
     });
+
+    if (result.highestUid !== undefined) {
+      await prisma.imapCredential.update({
+        where: { id: result.credentialId },
+        data: {
+          lastSeenUid: result.highestUid,
+          lastPolledAt: new Date(),
+        },
+      });
+    }
 
     return {
       emailAccountId,
@@ -163,13 +203,28 @@ export async function pollAllImapAccounts(
 
   log.info("Polling IMAP accounts", { count: imapAccounts.length });
 
-  const results: PollResult[] = [];
-  for (const account of imapAccounts) {
-    const result = await pollImapAccount(account.id, log);
-    results.push(result);
-  }
+  const settled = await runWithBoundedConcurrency({
+    items: imapAccounts,
+    concurrency: POLL_CONCURRENCY,
+    run: (account) => pollImapAccount(account.id, log),
+  });
 
-  return results;
+  // pollImapAccount catches its own errors and resolves to a PollResult, so a
+  // rejection here is unexpected; surface it as an error result rather than
+  // dropping the account silently.
+  return settled.map(({ item, result }) =>
+    result.status === "fulfilled"
+      ? result.value
+      : {
+          emailAccountId: item.id,
+          newMessages: 0,
+          processedMessages: 0,
+          error:
+            result.reason instanceof Error
+              ? result.reason.message
+              : "Unknown error",
+        },
+  );
 }
 
 async function runRulesOnNewMessages({

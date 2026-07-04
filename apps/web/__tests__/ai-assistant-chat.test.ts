@@ -653,10 +653,20 @@ describe("aiProcessAssistantChat", () => {
       role: "assistant",
       content: "assistant response",
     });
-    expect(args.messages[3].role).toBe("user");
-    expect(args.messages[3].content).toContain(
-      "Memories from previous conversations:",
-    );
+    // History precedes the injected context block, and the latest user message
+    // stays last. The context block carries the per-turn timestamp and the
+    // memories; both sit in the volatile tail past the cache boundary, so their
+    // relative order is caching-neutral. Assert the memories are present in the
+    // block rather than pinning them to an exact index.
+    const contextBlock = args.messages.slice(3, -1);
+    expect(
+      contextBlock.some(
+        (m: { role: string; content: unknown }) =>
+          m.role === "user" &&
+          typeof m.content === "string" &&
+          m.content.includes("Memories from previous conversations:"),
+      ),
+    ).toBe(true);
     expect(args.messages.at(-1)).toEqual({
       role: "user",
       content: "latest user message",

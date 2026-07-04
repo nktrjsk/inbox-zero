@@ -6,6 +6,7 @@ import {
   ArrowUpIcon,
   HistoryIcon,
   Loader2,
+  MailIcon,
   PaperclipIcon,
   PlusIcon,
   SquareIcon,
@@ -376,19 +377,25 @@ function ChatMessagesView({
         footer={
           <>
             {context ? (
-              <div className="mb-2 flex items-center gap-2">
-                <span className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
-                  Fix: {context.message.headers.subject.slice(0, 60)}
-                  {context.message.headers.subject.length > 60 ? "..." : ""}
-                  <button
-                    type="button"
-                    aria-label="Remove context"
-                    className="ml-1 rounded p-0.5 hover:bg-muted-foreground/10"
-                    onClick={() => setContext(null)}
-                  >
-                    ×
-                  </button>
-                </span>
+              <div className="mb-2 flex items-start gap-2 rounded-lg border bg-background px-3 py-2">
+                <MailIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <span className="text-xs font-medium text-foreground">
+                    Attached to this chat
+                  </span>
+                  <span className="truncate text-xs text-muted-foreground">
+                    {context.message.headers.from} &middot; &quot;
+                    {context.message.headers.subject}&quot;
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Remove context"
+                  className="shrink-0 rounded p-0.5 hover:bg-muted"
+                  onClick={() => setContext(null)}
+                >
+                  <XIcon className="size-3.5" />
+                </button>
               </div>
             ) : null}
             <div className="relative z-10">{inputArea}</div>

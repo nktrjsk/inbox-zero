@@ -45,6 +45,7 @@ type ChatContextType = {
   setChatId: (chatId: string | null) => void;
   setNewChat: () => void;
   submitTextMessage: (text: string) => Promise<void>;
+  startFixChat: (params: { text: string; context: MessageContext }) => void;
   handleSubmit: () => void;
   context: MessageContext | null;
   setContext: (context: MessageContext | null) => void;
@@ -60,13 +61,27 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
 
   const [input, setInput] = useState<string>("");
   const [chatId, setChatId] = useQueryState("chatId", parseAsString);
-  const [context, setContext] = useState<MessageContext | null>(null);
+  const [context, setContextState] = useState<MessageContext | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [inlineActions, setInlineActions] = useState<InlineEmailAction[]>([]);
   const inlineActionsRef = useRef(inlineActions);
   const pendingInlineActionsRef = useRef<InlineEmailAction[] | null>(null);
   const previousChatIdRef = useRef(chatId);
   const previousEmailAccountIdRef = useRef<string | null>(null);
+
+  // The send transport reads context at request time from this ref, not from
+  // React state, so a caller can set context and send in the same tick without
+  // the request closing over a stale value.
+  const contextRef = useRef<MessageContext | null>(null);
+  const setContext = useCallback((next: MessageContext | null) => {
+    contextRef.current = next;
+    setContextState(next);
+  }, []);
+
+  // A Fix send targets a brand-new chat, but the useAiChat instance only adopts
+  // the new id on a later render — so the send is queued here and fired by an
+  // effect once the fresh chat has settled.
+  const pendingFixRef = useRef<{ chatId: string; text: string } | null>(null);
 
   const { data } = useChatMessages(chatId);
   const persistedMessageIds = useMemo(
@@ -99,7 +114,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           body: {
             id,
             message: messages.at(-1),
-            context: context ?? undefined,
+            context: contextRef.current ?? undefined,
             inlineActions: pendingInlineActionsRef.current ?? undefined,
             ...body,
           },
@@ -167,7 +182,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     setContext(null);
     setAttachments([]);
     setInlineActions([]);
-  }, [chat.setMessages, emailAccountId, setChatId]);
+  }, [chat.setMessages, emailAccountId, setChatId, setContext]);
 
   const sendMessageParts = useCallback(
     async (
@@ -201,6 +216,44 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     },
     [sendMessageParts],
   );
+
+  const startFixChat = useCallback(
+    ({
+      text,
+      context: fixContext,
+    }: {
+      text: string;
+      context: MessageContext;
+    }) => {
+      const trimmedText = text.trim();
+      if (!trimmedText) return;
+
+      const newChatId = generateUUID();
+      setContext(fixContext);
+      pendingFixRef.current = { chatId: newChatId, text: trimmedText };
+      setChatId(newChatId);
+      setInput("");
+    },
+    [setChatId, setContext],
+  );
+
+  // Fire a queued Fix send once its fresh chat has fully settled: the query
+  // state, the useAiChat instance id, and the initial (empty) data load must
+  // all match the new chat. Waiting for the null data load means the
+  // data->messages effect above has already cleared the chat, so the optimistic
+  // send that follows isn't wiped.
+  useEffect(() => {
+    const pending = pendingFixRef.current;
+    if (!pending) return;
+    if (chatId !== pending.chatId) return;
+    if (chat.id !== pending.chatId) return;
+    if (data === undefined) return;
+
+    pendingFixRef.current = null;
+    sendMessageParts([{ type: "text", text: pending.text }]).catch(
+      captureException,
+    );
+  }, [chatId, chat.id, data, sendMessageParts]);
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();
@@ -238,6 +291,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         setChatId,
         setNewChat,
         submitTextMessage,
+        startFixChat,
         handleSubmit,
         context,
         setContext,

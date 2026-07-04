@@ -2,18 +2,21 @@ import { describe, expect, it, vi } from "vitest";
 import type { FetchMessageObject, ImapFlow } from "imapflow";
 import {
   convertImapMessage,
+  fetchMessagesByUids,
   fetchThreadMessagesAcrossFolders,
   findUidInSelectedMailbox,
   isLegacyUidMessageId,
   listMessagesWithFilters,
   locateMessages,
   parseSearchQuery,
+  parseStructuredImapQuery,
 } from "@/utils/imap/message";
 import { buildThreadId } from "@/utils/imap/thread";
 
 function createFetchMessage(overrides: {
   uid?: number;
   messageId?: string;
+  inReplyTo?: string;
 }): FetchMessageObject {
   return {
     uid: overrides.uid ?? 7,
@@ -24,6 +27,7 @@ function createFetchMessage(overrides: {
       subject: "Hello",
       date: new Date("2026-01-01T00:00:00Z"),
       messageId: overrides.messageId,
+      inReplyTo: overrides.inReplyTo,
     },
   } as unknown as FetchMessageObject;
 }
@@ -49,6 +53,23 @@ describe("convertImapMessage", () => {
     );
     expect(parsed?.id).toBe("42");
   });
+
+  it("sets internalDate to the envelope date for a standalone message with no In-Reply-To", async () => {
+    const parsed = await convertImapMessage(
+      createFetchMessage({ messageId: "<root@example.com>" }),
+    );
+    expect(parsed?.internalDate).toBe("2026-01-01T00:00:00.000Z");
+  });
+
+  it("sets internalDate to the envelope date for a reply with an In-Reply-To header", async () => {
+    const parsed = await convertImapMessage(
+      createFetchMessage({
+        messageId: "<reply@example.com>",
+        inReplyTo: "<root@example.com>",
+      }),
+    );
+    expect(parsed?.internalDate).toBe("2026-01-01T00:00:00.000Z");
+  });
 });
 
 describe("isLegacyUidMessageId", () => {
@@ -66,6 +87,8 @@ type FakeFolderMessage = {
   messageId?: string;
   date?: string;
   from?: string;
+  to?: string;
+  subject?: string;
   seen?: boolean;
   inReplyTo?: string;
   references?: string;
@@ -80,11 +103,17 @@ function createFakeClient(options: {
   const folderMessages = options.folderMessages ?? {};
   let selectedFolder = "INBOX";
 
+  const mailboxState = (folder: string) => {
+    const msgs = folderMessages[folder] ?? [];
+    const maxUid = msgs.reduce((max, m) => Math.max(max, m.uid), 0);
+    return { exists: msgs.length, uidNext: maxUid + 1 };
+  };
+
   const client = {
-    mailbox: { exists: folderMessages[selectedFolder]?.length ?? 0 },
+    mailbox: mailboxState(selectedFolder),
     mailboxOpen: vi.fn(async (folder: string) => {
       selectedFolder = folder;
-      client.mailbox = { exists: folderMessages[folder]?.length ?? 0 };
+      client.mailbox = mailboxState(folder);
     }),
     search: vi.fn(async (criteria: { header?: Record<string, string> }) => {
       const messageId = criteria.header?.["Message-ID"];
@@ -102,7 +131,8 @@ function createFakeClient(options: {
             messageId: msg.messageId,
             date: msg.date ? new Date(msg.date) : undefined,
             from: msg.from ? [{ address: msg.from }] : undefined,
-            subject: "Test",
+            to: msg.to ? [{ address: msg.to }] : undefined,
+            subject: msg.subject ?? "Test",
             inReplyTo: msg.inReplyTo,
           },
           headers: msg.references
@@ -377,7 +407,6 @@ describe("listMessagesWithFilters", () => {
     const client = createFakeClient({ folderMessages: { INBOX: inbox } });
 
     const { messages } = await listMessagesWithFilters(client, {
-      offset: 0,
       maxResults: 20,
       after: new Date("2026-06-25T00:00:00Z"),
       before: new Date("2026-06-29T00:00:00Z"),
@@ -390,7 +419,6 @@ describe("listMessagesWithFilters", () => {
     const client = createFakeClient({ folderMessages: { INBOX: inbox } });
 
     const { messages } = await listMessagesWithFilters(client, {
-      offset: 0,
       maxResults: 20,
       unreadOnly: true,
     });
@@ -402,7 +430,6 @@ describe("listMessagesWithFilters", () => {
     const client = createFakeClient({ folderMessages: { INBOX: inbox } });
 
     const { messages } = await listMessagesWithFilters(client, {
-      offset: 0,
       maxResults: 20,
       fromEmail: "alice@example.com",
     });
@@ -417,7 +444,6 @@ describe("listMessagesWithFilters", () => {
     const client = createFakeClient({ folderMessages: { INBOX: inbox } });
 
     const page1 = await listMessagesWithFilters(client, {
-      offset: 0,
       maxResults: 2,
       after: new Date("2026-05-01T00:00:00Z"),
     });
@@ -425,10 +451,10 @@ describe("listMessagesWithFilters", () => {
       "new-unread@example.com",
       "new-read@example.com",
     ]);
-    expect(page1.nextPageToken).toBe("2");
+    expect(page1.nextPageToken).toBe("3");
 
     const page2 = await listMessagesWithFilters(client, {
-      offset: Number(page1.nextPageToken),
+      cursorUid: Number(page1.nextPageToken),
       maxResults: 2,
       after: new Date("2026-05-01T00:00:00Z"),
     });
@@ -437,6 +463,290 @@ describe("listMessagesWithFilters", () => {
       "old@example.com",
     ]);
     expect(page2.nextPageToken).toBeUndefined();
+  });
+
+  it("does not skip messages when earlier ones are marked read between pages", async () => {
+    // Regression test for the bulk-process data-loss bug: the old offset-based
+    // cursor sliced by position, so when rules marked page-1 messages read
+    // between pages, the unread set shrank and page 2 skipped messages that
+    // shifted into the now-vacated earlier positions. A UID watermark cursor
+    // is immune to this because it filters by UID, not position.
+    const mutableInbox: FakeFolderMessage[] = [
+      { uid: 1, messageId: "<old@example.com>", seen: false },
+      { uid: 2, messageId: "<mid@example.com>", seen: false },
+      { uid: 3, messageId: "<new-read@example.com>", seen: false },
+      { uid: 4, messageId: "<new-unread@example.com>", seen: false },
+    ];
+    const client = createFakeClient({
+      folderMessages: { INBOX: mutableInbox },
+    });
+
+    const page1 = await listMessagesWithFilters(client, {
+      maxResults: 2,
+      unreadOnly: true,
+    });
+    expect(page1.messages.map((m) => m.id)).toEqual([
+      "new-unread@example.com",
+      "new-read@example.com",
+    ]);
+    expect(page1.nextPageToken).toBe("3");
+
+    // Simulate rules marking the page-1 messages read between pages
+    mutableInbox[2].seen = true;
+    mutableInbox[3].seen = true;
+
+    const page2 = await listMessagesWithFilters(client, {
+      cursorUid: Number(page1.nextPageToken),
+      maxResults: 2,
+      unreadOnly: true,
+    });
+    // The old offset code returned [] here — a silent skip of these messages.
+    expect(page2.messages.map((m) => m.id)).toEqual([
+      "mid@example.com",
+      "old@example.com",
+    ]);
+  });
+
+  it("filters by subject", async () => {
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          { uid: 1, messageId: "<a@example.com>", subject: "Invoice #1" },
+          { uid: 2, messageId: "<b@example.com>", subject: "Meeting notes" },
+        ],
+      },
+    });
+
+    const { messages } = await listMessagesWithFilters(client, {
+      maxResults: 20,
+      subject: "invoice",
+    });
+
+    expect(messages.map((m) => m.id)).toEqual(["a@example.com"]);
+  });
+
+  it("filters by recipient", async () => {
+    const client = createFakeClient({
+      folderMessages: {
+        INBOX: [
+          { uid: 1, messageId: "<a@example.com>", to: "alice@example.com" },
+          { uid: 2, messageId: "<b@example.com>", to: "bob@example.com" },
+        ],
+      },
+    });
+
+    const { messages } = await listMessagesWithFilters(client, {
+      maxResults: 20,
+      to: "alice@example.com",
+    });
+
+    expect(messages.map((m) => m.id)).toEqual(["a@example.com"]);
+  });
+
+  it("keeps only seen messages when seenOnly is set", async () => {
+    const client = createFakeClient({ folderMessages: { INBOX: inbox } });
+
+    const { messages } = await listMessagesWithFilters(client, {
+      maxResults: 20,
+      seenOnly: true,
+    });
+
+    expect(messages.map((m) => m.id)).toEqual([
+      "new-read@example.com",
+      "mid@example.com",
+      "old@example.com",
+    ]);
+  });
+
+  it("paginates a large mailbox across windows without skipping or duplicating", async () => {
+    // 20 messages, page size 2 => scan window of 8 UIDs per page, so a full
+    // walk spans several windows. Every message must appear exactly once, in
+    // newest-first order, with no gaps at window boundaries.
+    const many: FakeFolderMessage[] = Array.from({ length: 20 }, (_, i) => ({
+      uid: i + 1,
+      messageId: `<m${i + 1}@example.com>`,
+      date: "2026-06-01T10:00:00Z",
+      seen: false,
+    }));
+    const client = createFakeClient({ folderMessages: { INBOX: many } });
+
+    const collected: string[] = [];
+    let cursorUid: number | undefined;
+    for (let guard = 0; guard < 100; guard++) {
+      const { messages, nextPageToken } = await listMessagesWithFilters(
+        client,
+        {
+          maxResults: 2,
+          cursorUid,
+          unreadOnly: true,
+        },
+      );
+      collected.push(...messages.map((m) => m.id));
+      if (!nextPageToken) break;
+      cursorUid = Number(nextPageToken);
+    }
+
+    const expected = Array.from(
+      { length: 20 },
+      (_, i) => `m${20 - i}@example.com`,
+    );
+    expect(collected).toEqual(expected);
+    expect(new Set(collected).size).toBe(20);
+  });
+
+  it("returns a short page and advances past a sparsely-matching window", async () => {
+    // Only the newest and oldest messages match; the middle window matches
+    // nothing. The scan must still advance the cursor past each window so the
+    // oldest match is eventually reached.
+    const many: FakeFolderMessage[] = Array.from({ length: 20 }, (_, i) => ({
+      uid: i + 1,
+      messageId: `<m${i + 1}@example.com>`,
+      from: i === 0 || i === 19 ? "match@example.com" : "other@example.com",
+    }));
+    const client = createFakeClient({ folderMessages: { INBOX: many } });
+
+    const collected: string[] = [];
+    let cursorUid: number | undefined;
+    for (let guard = 0; guard < 100; guard++) {
+      const { messages, nextPageToken } = await listMessagesWithFilters(
+        client,
+        {
+          maxResults: 2,
+          cursorUid,
+          fromEmail: "match@example.com",
+        },
+      );
+      collected.push(...messages.map((m) => m.id));
+      if (!nextPageToken) break;
+      cursorUid = Number(nextPageToken);
+    }
+
+    expect(collected).toEqual(["m20@example.com", "m1@example.com"]);
+  });
+});
+
+describe("parseStructuredImapQuery", () => {
+  it("parses from:", () => {
+    expect(parseStructuredImapQuery("from:alice@example.com")).toEqual({
+      filters: { from: "alice@example.com" },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses to:", () => {
+    expect(parseStructuredImapQuery("to:bob@example.com")).toEqual({
+      filters: { to: "bob@example.com" },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses subject:", () => {
+    expect(parseStructuredImapQuery("subject:invoice")).toEqual({
+      filters: { subject: "invoice" },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses a quoted subject: phrase, stripping the quotes", () => {
+    expect(parseStructuredImapQuery('subject:"quarterly report"')).toEqual({
+      filters: { subject: "quarterly report" },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses is:unread", () => {
+    expect(parseStructuredImapQuery("is:unread")).toEqual({
+      filters: { unreadOnly: true },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses is:read", () => {
+    expect(parseStructuredImapQuery("is:read")).toEqual({
+      filters: { seenOnly: true },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses since:", () => {
+    expect(parseStructuredImapQuery("since:2026-06-01")).toEqual({
+      filters: { after: new Date("2026-06-01") },
+      fullyStructured: true,
+    });
+  });
+
+  it("parses before:", () => {
+    expect(parseStructuredImapQuery("before:2026-06-30")).toEqual({
+      filters: { before: new Date("2026-06-30") },
+      fullyStructured: true,
+    });
+  });
+
+  it("combines multiple structured filters", () => {
+    expect(
+      parseStructuredImapQuery("from:alice@example.com is:unread"),
+    ).toEqual({
+      filters: { from: "alice@example.com", unreadOnly: true },
+      fullyStructured: true,
+    });
+  });
+
+  it("treats has:attachment as a recognized no-op that stays structured", () => {
+    expect(
+      parseStructuredImapQuery("from:alice@example.com has:attachment"),
+    ).toEqual({
+      filters: { from: "alice@example.com" },
+      fullyStructured: true,
+    });
+  });
+
+  it("is not fully structured when has:attachment is the only token", () => {
+    expect(parseStructuredImapQuery("has:attachment")).toEqual({
+      filters: {},
+      fullyStructured: false,
+    });
+  });
+
+  it("is not fully structured when a bare word is present", () => {
+    expect(parseStructuredImapQuery("invoice")).toEqual({
+      filters: {},
+      fullyStructured: false,
+    });
+  });
+
+  it("is not fully structured when mixed with a bare word", () => {
+    expect(parseStructuredImapQuery("from:alice@example.com invoice")).toEqual({
+      filters: { from: "alice@example.com" },
+      fullyStructured: false,
+    });
+  });
+
+  it("is not fully structured for unsupported operators like label:", () => {
+    expect(parseStructuredImapQuery("label:work")).toEqual({
+      filters: {},
+      fullyStructured: false,
+    });
+  });
+
+  it("is not fully structured for an empty query", () => {
+    expect(parseStructuredImapQuery("")).toEqual({
+      filters: {},
+      fullyStructured: false,
+    });
+  });
+
+  it("is not fully structured for a whitespace-only query", () => {
+    expect(parseStructuredImapQuery("   ")).toEqual({
+      filters: {},
+      fullyStructured: false,
+    });
+  });
+
+  it("is not fully structured when since: has an invalid date", () => {
+    expect(parseStructuredImapQuery("since:not-a-date")).toEqual({
+      filters: {},
+      fullyStructured: false,
+    });
   });
 });
 
@@ -481,5 +791,79 @@ describe("parseSearchQuery", () => {
   it("treats bare text as body search", () => {
     const result = parseSearchQuery("important");
     expect(result).toEqual({ body: "important" });
+  });
+});
+
+describe("fetchMessagesByUids", () => {
+  // uid -> seq store; search resolves a UID set to seq numbers in one call,
+  // fetch yields the messages for a seq set in one call.
+  function createFakeClient(store: { uid: number; messageId: string }[]) {
+    const bySeq = new Map<number, { uid: number; messageId: string }>();
+    const seqByUid = new Map<number, number>();
+    store.forEach((msg, index) => {
+      const seq = index + 1;
+      bySeq.set(seq, msg);
+      seqByUid.set(msg.uid, seq);
+    });
+
+    const search = vi.fn(async (criteria: { uid?: string }) => {
+      const requested = (criteria.uid ?? "").split(",").map(Number);
+      return requested
+        .map((uid) => seqByUid.get(uid))
+        .filter((seq): seq is number => seq !== undefined);
+    });
+
+    const fetch = vi.fn(async function* (range: string) {
+      for (const seqStr of range.split(",")) {
+        const msg = bySeq.get(Number(seqStr));
+        if (!msg) continue;
+        yield {
+          seq: Number(seqStr),
+          uid: msg.uid,
+          flags: new Set<string>(),
+          envelope: { messageId: msg.messageId, subject: "Test" },
+        };
+      }
+    });
+
+    const client = { search, fetch };
+    return { client: client as unknown as ImapFlow, search, fetch };
+  }
+
+  it("returns empty without hitting the server for no UIDs", async () => {
+    const { client, search, fetch } = createFakeClient([]);
+    expect(await fetchMessagesByUids(client, [])).toEqual([]);
+    expect(search).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("resolves and fetches all UIDs in a single round trip each", async () => {
+    const { client, search, fetch } = createFakeClient([
+      { uid: 10, messageId: "<a@ex.com>" },
+      { uid: 20, messageId: "<b@ex.com>" },
+      { uid: 30, messageId: "<c@ex.com>" },
+    ]);
+
+    const result = await fetchMessagesByUids(client, [10, 20, 30]);
+
+    expect(result.map((m) => m.id)).toEqual([
+      "a@ex.com",
+      "b@ex.com",
+      "c@ex.com",
+    ]);
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the requested UID order and drops missing UIDs", async () => {
+    const { client } = createFakeClient([
+      { uid: 10, messageId: "<a@ex.com>" },
+      { uid: 20, messageId: "<b@ex.com>" },
+    ]);
+
+    // Request in a different order, with a UID that isn't in the mailbox.
+    const result = await fetchMessagesByUids(client, [20, 99, 10]);
+
+    expect(result.map((m) => m.id)).toEqual(["b@ex.com", "a@ex.com"]);
   });
 });

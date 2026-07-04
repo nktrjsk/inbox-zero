@@ -100,33 +100,3 @@ export function getThreadIdCandidates(
 
   return candidates;
 }
-
-/**
- * Extract all Message-IDs in a thread's reference chain,
- * useful for searching related messages.
- */
-export function getAllThreadMessageIds(
-  references: string | undefined,
-  inReplyTo: string | undefined,
-  messageId: string | undefined,
-): string[] {
-  const ids = new Set<string>();
-
-  if (references) {
-    for (const id of parseMessageIdList(references)) {
-      ids.add(id);
-    }
-  }
-
-  if (inReplyTo) {
-    for (const id of parseMessageIdList(inReplyTo)) {
-      ids.add(id);
-    }
-  }
-
-  if (messageId) {
-    ids.add(messageId.replace(/^<|>$/g, ""));
-  }
-
-  return [...ids];
-}

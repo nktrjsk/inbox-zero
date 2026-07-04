@@ -86,47 +86,87 @@ export async function fetchRecentMessages(
  * client-side by date range, unread state, and sender. Index-backed servers
  * (e.g. Stalwart) silently under-return SEARCH results for dates and sender,
  * so only data fetched directly from the messages is trusted here.
+ *
+ * Paginates via a UID watermark (`cursorUid`), not a positional offset: rules
+ * mark messages read / move them out of the mailbox between pages, which
+ * would shift a position-based slice and silently skip messages that moved
+ * into the earlier positions. A UID window is stable under those mutations.
  */
+// Each page scans a bounded window of UIDs below the cursor rather than the
+// whole `1:*` range. This keeps a single page's work (and its serverless
+// maxDuration) bounded, and deep pagination ~O(N) instead of O(N^2). The
+// window is sized as a multiple of the page so a page that matches densely
+// only re-scans a small overlap; a sparsely-matching window returns a short
+// page and advances the cursor past the window so the next page continues
+// older (callers already tolerate short/empty pages behind nextPageToken).
+const FILTER_SCAN_WINDOW_MULTIPLIER = 4;
+
 export async function listMessagesWithFilters(
   client: ImapFlow,
   options: {
-    offset: number;
+    cursorUid?: number;
     maxResults: number;
     before?: Date;
     after?: Date;
     unreadOnly?: boolean;
+    seenOnly?: boolean;
     fromEmail?: string;
+    subject?: string;
+    to?: string;
   },
 ): Promise<{ messages: ParsedMessage[]; nextPageToken?: string }> {
-  const exists = typeof client.mailbox === "object" ? client.mailbox.exists : 0;
-  if (!exists) return { messages: [] };
+  const mailbox = typeof client.mailbox === "object" ? client.mailbox : null;
+  if (!mailbox?.exists) return { messages: [] };
 
-  const matching: ParsedMessage[] = [];
-  for await (const msg of client.fetch("1:*", {
-    uid: true,
-    envelope: true,
-    flags: true,
-  })) {
+  const { cursorUid, maxResults } = options;
+  if (cursorUid !== undefined && cursorUid <= 1) return { messages: [] };
+
+  // Emit uid <= top (i.e. uid < cursorUid); start from the newest UID on page 1.
+  const highestUid = mailbox.uidNext - 1;
+  const top = cursorUid !== undefined ? cursorUid - 1 : highestUid;
+  if (top < 1) return { messages: [] };
+
+  const windowSize = maxResults * FILTER_SCAN_WINDOW_MULTIPLIER;
+  const bottom = Math.max(1, top - windowSize + 1);
+
+  const matching: { parsed: ParsedMessage; uid: number }[] = [];
+  for await (const msg of client.fetch(
+    `${bottom}:${top}`,
+    { uid: true, envelope: true, flags: true },
+    { uid: true },
+  )) {
+    // Real servers bound the fetch to the UID range; guard here too so the
+    // window is honored regardless (and stays correct under sparse UIDs).
+    if (msg.uid < bottom || msg.uid > top) continue;
     const parsed = await convertImapMessage(msg);
-    if (parsed && messageMatchesFilters(parsed, options)) matching.push(parsed);
+    if (parsed && messageMatchesFilters(parsed, options)) {
+      matching.push({ parsed, uid: msg.uid });
+    }
   }
-  // IMAP sequence order is oldest-first
-  matching.reverse();
+  // Newest first, keyed by UID (stable under mark-read/move mutations)
+  matching.sort((a, b) => b.uid - a.uid);
 
-  const { offset, maxResults } = options;
-  const messages = matching.slice(offset, offset + maxResults);
-  const nextOffset = offset + maxResults;
-  return {
-    messages,
-    nextPageToken:
-      nextOffset < matching.length ? String(nextOffset) : undefined,
-  };
+  let page: { parsed: ParsedMessage; uid: number }[];
+  let frontier: number;
+  if (matching.length > maxResults) {
+    // More matches remain inside this window; resume just below the last one.
+    page = matching.slice(0, maxResults);
+    frontier = page[page.length - 1].uid;
+  } else {
+    // Whole window consumed; resume below it (bottom === 1 means we reached the
+    // oldest message, so there is nothing left to page).
+    page = matching;
+    frontier = bottom;
+  }
+
+  const nextPageToken = frontier > 1 ? String(frontier) : undefined;
+  return { messages: page.map((m) => m.parsed), nextPageToken };
 }
 
 /**
  * Fetch multiple messages by UIDs - envelope only (no body).
- * Uses UID-based SEARCH to find each message's sequence number,
- * then fetches by sequence range (WorkMail-compatible).
+ * Resolves the UIDs to sequence numbers with one SEARCH, then fetches them
+ * with one sequence-range FETCH (WorkMail-compatible).
  */
 export async function fetchMessagesByUids(
   client: ImapFlow,
@@ -134,32 +174,34 @@ export async function fetchMessagesByUids(
 ): Promise<ParsedMessage[]> {
   if (uids.length === 0) return [];
 
-  // Find the sequence numbers for these UIDs via SEARCH
-  // Then fetch by sequence range which works on all servers
-  const messages: ParsedMessage[] = [];
+  // Resolve UIDs to sequence numbers in one SEARCH, then fetch them in one
+  // sequence-range FETCH. Fetching by sequence (rather than UID) keeps this
+  // working on servers like WorkMail that mishandle UID FETCH, while batching
+  // avoids the per-UID round trips this used to make.
+  try {
+    const seqNums = await client.search(
+      { uid: uids.join(",") },
+      { uid: false },
+    );
+    if (!seqNums || seqNums.length === 0) return [];
 
-  for (const uid of uids) {
-    try {
-      // SEARCH UID <uid> returns matching sequence numbers
-      const seqNums = await client.search({ uid: `${uid}` }, { uid: false });
-      if (!seqNums || seqNums.length === 0) continue;
-
-      const seq = seqNums[0];
-      const msg = await client.fetchOne(String(seq), {
-        uid: true,
-        envelope: true,
-        flags: true,
-      });
-      if (msg) {
-        const parsed = await convertImapMessage(msg);
-        if (parsed) messages.push(parsed);
-      }
-    } catch {
-      // Skip messages that fail to fetch
+    const byUid = new Map<number, ParsedMessage>();
+    for await (const msg of client.fetch(seqNums.join(","), {
+      uid: true,
+      envelope: true,
+      flags: true,
+    })) {
+      const parsed = await convertImapMessage(msg);
+      if (parsed) byUid.set(msg.uid, parsed);
     }
-  }
 
-  return messages;
+    // Preserve the caller's UID order; drop UIDs that didn't come back.
+    return uids
+      .map((uid) => byUid.get(uid))
+      .filter((m): m is ParsedMessage => m !== undefined);
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -498,7 +540,7 @@ export async function convertImapMessage(
       textPlain,
       labelIds,
       inline: [],
-      ...(inReplyTo && { internalDate: date }),
+      internalDate: date,
     };
   } catch {
     return null;
@@ -556,24 +598,134 @@ export function parseSearchQuery(query: string): Record<string, unknown> {
   return { and: criteria };
 }
 
+export interface StructuredImapQueryFilters {
+  after?: Date;
+  before?: Date;
+  from?: string;
+  seenOnly?: boolean;
+  subject?: string;
+  to?: string;
+  unreadOnly?: boolean;
+}
+
+/**
+ * Parse a query string into filters that can be applied client-side via
+ * listMessagesWithFilters, entirely bypassing IMAP SEARCH. `fullyStructured`
+ * is true only when every token is a recognized structured filter (or the
+ * `has:attachment` no-op) and at least one real filter was produced -
+ * anything else (free text, unsupported operators) must keep using SEARCH.
+ */
+export function parseStructuredImapQuery(query: string): {
+  filters: StructuredImapQueryFilters;
+  fullyStructured: boolean;
+} {
+  const filters: StructuredImapQueryFilters = {};
+  const parts = query.match(/(\w+:[^\s]+|"[^"]*"|\S+)/g) || [];
+
+  if (parts.length === 0) return { filters, fullyStructured: false };
+
+  let sawUnrecognized = false;
+  let sawFilter = false;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.startsWith("from:")) {
+      filters.from = part.slice(5);
+      sawFilter = true;
+    } else if (part.startsWith("to:")) {
+      filters.to = part.slice(3);
+      sawFilter = true;
+    } else if (part.startsWith("subject:")) {
+      // The shared tokenizer only treats a `"..."` phrase as one token when
+      // it isn't glued to a `word:` prefix, so `subject:"foo bar"` splits
+      // into `subject:"foo` and `bar"` - re-join tokens until the closing
+      // quote to recover the full phrase.
+      let raw = part.slice(8);
+      if (raw.startsWith('"') && !raw.endsWith('"')) {
+        let j = i + 1;
+        while (j < parts.length && !parts[j].endsWith('"')) j++;
+        if (j < parts.length) {
+          raw = [raw, ...parts.slice(i + 1, j + 1)].join(" ");
+          i = j;
+        }
+      }
+      filters.subject = stripQuotes(raw);
+      sawFilter = true;
+    } else if (part === "is:unread") {
+      filters.unreadOnly = true;
+      sawFilter = true;
+    } else if (part === "is:read") {
+      filters.seenOnly = true;
+      sawFilter = true;
+    } else if (part === "has:attachment") {
+      // Recognized but dropped: IMAP has no client-side attachment signal
+      // without downloading the body, so this can't be filtered here.
+    } else if (part.startsWith("since:") || part.startsWith("after:")) {
+      const dateStr = part.split(":")[1] || "";
+      const date = new Date(dateStr);
+      if (Number.isNaN(date.getTime())) {
+        sawUnrecognized = true;
+      } else {
+        filters.after = date;
+        sawFilter = true;
+      }
+    } else if (part.startsWith("before:")) {
+      const date = new Date(part.slice(7));
+      if (Number.isNaN(date.getTime())) {
+        sawUnrecognized = true;
+      } else {
+        filters.before = date;
+        sawFilter = true;
+      }
+    } else {
+      sawUnrecognized = true;
+    }
+  }
+
+  return { filters, fullyStructured: !sawUnrecognized && sawFilter };
+}
+
+function stripQuotes(value: string): string {
+  if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
 function messageMatchesFilters(
   message: ParsedMessage,
   filters: {
     before?: Date;
     after?: Date;
     unreadOnly?: boolean;
+    seenOnly?: boolean;
     fromEmail?: string;
+    subject?: string;
+    to?: string;
   },
 ): boolean {
   const date = new Date(message.date);
   if (filters.after && date < filters.after) return false;
   if (filters.before && date >= filters.before) return false;
   if (filters.unreadOnly && message.labelIds?.includes("\\Seen")) return false;
+  if (filters.seenOnly && !message.labelIds?.includes("\\Seen")) return false;
   if (
     filters.fromEmail &&
     !message.headers.from
       .toLowerCase()
       .includes(filters.fromEmail.toLowerCase())
+  ) {
+    return false;
+  }
+  if (
+    filters.to &&
+    !message.headers.to.toLowerCase().includes(filters.to.toLowerCase())
+  ) {
+    return false;
+  }
+  if (
+    filters.subject &&
+    !message.subject.toLowerCase().includes(filters.subject.toLowerCase())
   ) {
     return false;
   }

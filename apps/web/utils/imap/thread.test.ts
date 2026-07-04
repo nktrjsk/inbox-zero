@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   buildThreadId,
-  getAllThreadMessageIds,
   getRootMessageId,
   parseMessageIdList,
 } from "@/utils/imap/thread";
@@ -89,33 +88,5 @@ describe("buildThreadId", () => {
   it("returns a 24-character hex string", () => {
     const id = buildThreadId("<msg@ex.com>", undefined, undefined);
     expect(id).toMatch(/^[0-9a-f]{24}$/);
-  });
-});
-
-describe("getAllThreadMessageIds", () => {
-  it("collects all unique message IDs from headers", () => {
-    const ids = getAllThreadMessageIds(
-      "<a@ex.com> <b@ex.com>",
-      "<b@ex.com>",
-      "<c@ex.com>",
-    );
-    expect(ids).toContain("a@ex.com");
-    expect(ids).toContain("b@ex.com");
-    expect(ids).toContain("c@ex.com");
-    expect(ids).toHaveLength(3);
-  });
-
-  it("deduplicates IDs across headers", () => {
-    const ids = getAllThreadMessageIds(
-      "<same@ex.com>",
-      "<same@ex.com>",
-      "<same@ex.com>",
-    );
-    expect(ids).toHaveLength(1);
-  });
-
-  it("returns empty array when all headers are missing", () => {
-    const ids = getAllThreadMessageIds(undefined, undefined, undefined);
-    expect(ids).toHaveLength(0);
   });
 });

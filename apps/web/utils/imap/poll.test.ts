@@ -10,7 +10,7 @@ import {
   getWebhookEmailAccount,
   validateWebhookAccount,
 } from "@/utils/webhook/validate-webhook-account";
-import { pollImapAccount } from "./poll";
+import { pollAllImapAccounts, pollImapAccount } from "./poll";
 
 vi.mock("server-only", () => ({}));
 vi.mock("@/utils/prisma");
@@ -190,6 +190,26 @@ describe("pollImapAccount", () => {
     expect(result).toMatchObject({ newMessages: 2, processedMessages: 0 });
   });
 
+  it("does not advance lastSeenUid when rule setup throws", async () => {
+    mockMailbox({ uidNext: 13 });
+    mockStoredUid(10);
+    vi.mocked(searchImapMessages).mockResolvedValue([11, 12]);
+    vi.mocked(getWebhookEmailAccount).mockRejectedValue(
+      new Error("transient DB error"),
+    );
+
+    const result = await pollImapAccount(EMAIL_ACCOUNT_ID);
+
+    expect(processHistoryItem).not.toHaveBeenCalled();
+    expect(prisma.imapCredential.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ lastSeenUid: 12 }),
+      }),
+    );
+    expect(result).toMatchObject({ newMessages: 0, processedMessages: 0 });
+    expect(result.error).toBeDefined();
+  });
+
   it("continues processing when a single message fails", async () => {
     mockMailbox({ uidNext: 13 });
     mockStoredUid(10);
@@ -202,5 +222,46 @@ describe("pollImapAccount", () => {
 
     expect(processHistoryItem).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({ newMessages: 2, processedMessages: 1 });
+  });
+});
+
+describe("pollAllImapAccounts", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getImapCredentials).mockResolvedValue({
+      email: "user@example.com",
+      emailAccountId: EMAIL_ACCOUNT_ID,
+    } as never);
+    vi.mocked(withImapConnection).mockImplementation(async (_config, fn) =>
+      fn(fakeClient as never),
+    );
+    prisma.imapCredential.update.mockResolvedValue({} as never);
+    // Every account is on its first poll (no new mail), so each just
+    // initializes lastSeenUid and returns a zero-work result.
+    mockMailbox({ uidNext: 100 });
+    mockStoredUid(null);
+  });
+
+  it("returns a result for every active account", async () => {
+    prisma.emailAccount.findMany.mockResolvedValue([
+      { id: "acct-1" },
+      { id: "acct-2" },
+      { id: "acct-3" },
+    ] as never);
+
+    const results = await pollAllImapAccounts();
+
+    expect(results).toHaveLength(3);
+    expect(results.map((r) => r.emailAccountId).sort()).toEqual([
+      "acct-1",
+      "acct-2",
+      "acct-3",
+    ]);
+    expect(results.every((r) => r.error === undefined)).toBe(true);
+  });
+
+  it("returns an empty list when there are no active accounts", async () => {
+    prisma.emailAccount.findMany.mockResolvedValue([] as never);
+    expect(await pollAllImapAccounts()).toEqual([]);
   });
 });
