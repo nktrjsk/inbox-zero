@@ -2,10 +2,9 @@
 
 import { z } from "zod";
 import prisma from "@/utils/prisma";
-import {
-  runRules,
-  type RunRulesResult,
-} from "@/utils/ai/choose-rule/run-rules";
+import type { RunRulesResult } from "@/utils/ai/choose-rule/run-rules";
+import { runRules } from "@/utils/ai/choose-rule/run-rules";
+import { runRulesOnMessage } from "@/utils/ai/choose-rule/run-rules-on-message";
 import {
   runRulesBody,
   testAiCustomContentBody,
@@ -30,162 +29,40 @@ export const runRulesAction = actionClient
 
       logger.info("runRulesAction started", { isTest, rerun });
 
-      logger.info("Loading email account for rule execution");
-      const emailAccount = await getEmailAccountForRuleExecution({
-        emailAccountId,
-      }).catch((error) => {
-        logger.error("Failed to load email account for rule execution", {
-          error,
-        });
-        return flushAndRethrowRunRulesActionError({
-          logger,
-          error,
+      try {
+        const result = await runRulesOnMessage({
+          emailAccountId,
+          provider,
+          messageId,
+          threadId,
           isTest,
-          stage: "load-email-account",
-        });
-      });
-      logger.info("Loaded email account for rule execution", {
-        emailAccountFound: Boolean(emailAccount),
-      });
-
-      if (!emailAccount) throw new SafeError("Email account not found");
-      if (!provider) throw new SafeError("Provider not found");
-
-      logger.info("Creating email provider");
-      const emailProvider = await createEmailProvider({
-        emailAccountId,
-        provider,
-        logger,
-      }).catch((error) => {
-        logger.warn("Failed to create email provider", { error });
-        return flushAndRethrowRunRulesActionError({
+          rerun: rerun ?? undefined,
           logger,
-          error,
-          isTest,
-          stage: "create-email-provider",
         });
-      });
-      logger.info("Created email provider");
 
-      logger.info("Fetching message for rule execution");
-      const message = await emailProvider
-        .getMessage(messageId)
-        .catch((error) => {
-          logger.warn("Failed to fetch message for rule execution", { error });
-          return flushAndRethrowRunRulesActionError({
-            logger,
-            error,
-            isTest,
-            stage: "fetch-message",
+        logger.info("runRulesAction completed", {
+          resultCount: result.length,
+          matchedCount: result.filter((item) => !!item.rule).length,
+          skippedCount: result.filter((item) => !item.rule).length,
+        });
+
+        if (isTest) {
+          await flushLoggerSafely(logger, {
+            action: "runRules",
+            flushReason: "test-mode",
           });
-        });
-      logger.info("Fetched message for rule execution", {
-        fetchedThreadId: message.threadId,
-      });
+        }
 
-      const fetchExecutedRule = !isTest && !rerun;
-
-      logger.info("Loading existing executed rules", { fetchExecutedRule });
-      const executedRules = await (fetchExecutedRule
-        ? prisma.executedRule.findMany({
-            where: {
-              emailAccountId,
-              threadId,
-              messageId,
-            },
-            select: {
-              id: true,
-              reason: true,
-              actionItems: true,
-              rule: true,
-              createdAt: true,
-              status: true,
-            },
-          })
-        : Promise.resolve([])
-      ).catch((error) => {
-        logger.error("Failed to load existing executed rules", { error });
+        return result;
+      } catch (error) {
+        logger.error("runRulesAction failed", { error });
         return flushAndRethrowRunRulesActionError({
           logger,
           error,
           isTest,
-          stage: "load-existing-executed-rules",
-        });
-      });
-      logger.info("Loaded existing executed rules", {
-        executedRuleCount: executedRules.length,
-      });
-
-      if (executedRules.length > 0) {
-        logger.info("Skipping. Rule already exists.");
-
-        return executedRules.map((executedRule) => ({
-          rule: executedRule.rule,
-          actionItems: executedRule.actionItems,
-          reason: executedRule.reason,
-          existing: true,
-          createdAt: executedRule.createdAt,
-          status: executedRule.status,
-        }));
-      }
-
-      logger.info("Loading enabled rules for execution");
-      const rules = await prisma.rule
-        .findMany({
-          where: {
-            emailAccountId,
-            enabled: true,
-          },
-          include: {
-            actions: true,
-          },
-        })
-        .catch((error) => {
-          logger.error("Failed to load enabled rules for execution", { error });
-          return flushAndRethrowRunRulesActionError({
-            logger,
-            error,
-            isTest,
-            stage: "load-enabled-rules",
-          });
-        });
-      logger.info("Loaded enabled rules for execution", {
-        ruleCount: rules.length,
-      });
-
-      logger.info("Invoking runRules");
-      const result = await runRules({
-        isTest,
-        provider: emailProvider,
-        message,
-        rules,
-        emailAccount,
-        logger,
-        modelType: "chat",
-      }).catch((error) => {
-        logger.error("runRules failed", { error });
-        return flushAndRethrowRunRulesActionError({
-          logger,
-          error,
-          isTest,
-          stage: "run-rules",
-        });
-      });
-
-      logger.info("runRules completed", {
-        resultCount: result.length,
-        matchedCount: result.filter((item) => !!item.rule).length,
-        skippedCount: result.filter((item) => !item.rule).length,
-      });
-
-      if (isTest) {
-        await flushLoggerSafely(logger, {
-          action: "runRules",
-          flushReason: "test-mode",
+          stage: "run-rules-on-message",
         });
       }
-
-      return result;
     },
   );
 

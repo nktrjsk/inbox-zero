@@ -184,7 +184,7 @@ describe("runRulesAction", () => {
       expect.objectContaining({
         action: "runRules",
         flushReason: "test-mode-error",
-        stage: "create-email-provider",
+        stage: "run-rules-on-message",
       }),
     );
   });

@@ -11,6 +11,7 @@ import { isConversationStatusType } from "@/utils/reply-tracker/conversation-sta
 import prisma from "@/utils/prisma";
 import type { SystemType } from "@/generated/prisma/enums";
 import { addToKnowledgeBaseTool } from "./tools/rules/add-to-knowledge-base-tool";
+import { applyRulesToMessageTool } from "./tools/rules/apply-rules-to-message-tool";
 import { createRuleTool } from "./tools/rules/create-rule-tool";
 import { getLearnedPatternsTool } from "./tools/rules/get-learned-patterns-tool";
 import { getRuleExecutionForMessageTool } from "./tools/rules/get-rule-execution-for-message-tool";
@@ -157,6 +158,15 @@ export async function aiProcessAssistantChat({
     logger.warn("Failed to load fresh rule state for chat", { error });
   }
 
+  const fixContext =
+    context?.type === "fix-rule"
+      ? {
+          messageId: context.message.id,
+          threadId: context.message.threadId,
+          expected: context.expected,
+        }
+      : undefined;
+
   const hasConversationStatusInResults =
     context?.type === "fix-rule"
       ? context.results.some((result) =>
@@ -210,7 +220,13 @@ export async function aiProcessAssistantChat({
               `Expected outcome: ${formatFixRuleExpectedOutcome(context)}` +
               (isConversationStatusFixContext(context, expectedFixSystemType)
                 ? "\n\nThis fix is about conversation status classification. Prefer updating conversation rule instructions with updateRule (for example, To Reply/FYI rules)."
-                : ""),
+                : "") +
+              "\n\nProtocol for resolving this fix — you MUST follow it:\n" +
+              "1. After you create or update a rule, call applyRulesToMessage with dryRun=true to check whether this email now classifies as the Expected outcome.\n" +
+              "2. Only tell the user the issue is resolved if the result's matchesExpected is true. If it is false, do NOT claim success — read the returned reason, correct the rule, and check again.\n" +
+              '3. If the Expected outcome is that no rule should match, you are done once dryRun shows status "no_match"; there is nothing to apply.\n' +
+              "4. Otherwise, once dryRun confirms matchesExpected is true, call applyRulesToMessage with dryRun=false to apply the classification to this email.\n" +
+              "Never state how this email classifies unless an applyRulesToMessage result confirms it.",
           },
         ]
       : [];
@@ -263,6 +279,10 @@ export async function aiProcessAssistantChat({
     manageInbox: manageInboxTool(toolOptions),
     getUserRulesAndSettings: getUserRulesAndSettingsTool(toolOptions),
     getRuleExecutionForMessage: getRuleExecutionForMessageTool(toolOptions),
+    applyRulesToMessage: applyRulesToMessageTool({
+      ...toolOptions,
+      fixContext,
+    }),
     getLearnedPatterns: getLearnedPatternsTool(toolOptions),
     createRule: createRuleTool(toolOptions),
     updateRule: updateRuleTool(toolOptions),
