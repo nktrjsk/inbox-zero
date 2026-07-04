@@ -30,7 +30,7 @@ import { cn } from "@/utils";
 import { TestCustomEmailForm } from "@/app/(app)/[emailAccountId]/assistant/TestCustomEmailForm";
 import { ResultsDisplay } from "@/app/(app)/[emailAccountId]/assistant/ResultDisplay";
 import { useAccount } from "@/providers/EmailAccountProvider";
-import { FixWithChat } from "@/app/(app)/[emailAccountId]/assistant/FixWithChat";
+import { FixRule } from "@/app/(app)/[emailAccountId]/assistant/FixRule";
 import { MutedText } from "@/components/Typography";
 import { createClientLogger } from "@/utils/logger-client";
 import { isDefined } from "@/utils/types";
@@ -431,7 +431,11 @@ function ProcessRulesRow({
             {results ? (
               <>
                 <ResultsDisplay results={results} />
-                <FixWithChat message={message} results={results} />
+                <FixRule
+                  message={message}
+                  results={results}
+                  onApplied={() => onRun()}
+                />
                 <Button
                   variant="outline"
                   size="sm"

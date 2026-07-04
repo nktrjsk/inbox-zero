@@ -14,12 +14,11 @@ import { TablePagination } from "@/components/TablePagination";
 import { Badge } from "@/components/Badge";
 import { RulesSelect } from "@/app/(app)/[emailAccountId]/assistant/RulesSelect";
 import { useAccount } from "@/providers/EmailAccountProvider";
-import { useChat } from "@/providers/ChatProvider";
 import { useExecutedRules } from "@/hooks/useExecutedRules";
 import { useMessagesBatch } from "@/hooks/useMessagesBatch";
 import type { ParsedMessage } from "@/utils/types";
 import { EmailMessageCell } from "@/components/EmailMessageCell";
-import { FixWithChat } from "@/app/(app)/[emailAccountId]/assistant/FixWithChat";
+import { FixRule } from "@/app/(app)/[emailAccountId]/assistant/FixRule";
 import { ResultsDisplay } from "@/app/(app)/[emailAccountId]/assistant/ResultDisplay";
 
 type ExecutedRuleResult = GetExecutedRulesResponse["results"][number];
@@ -83,7 +82,6 @@ function HistoryTable({
   messagesLoading: boolean;
 }) {
   const { userEmail } = useAccount();
-  const { setInput } = useChat();
   const groups = useMemo(() => groupByDate(data), [data]);
 
   return (
@@ -124,7 +122,6 @@ function HistoryTable({
                       <RuleCell
                         executedRules={er.executedRules}
                         message={message}
-                        setInput={setInput}
                         isMessageLoading={isMessageLoading}
                       />
                     </TableCell>
@@ -186,12 +183,10 @@ function EmailCell({
 function RuleCell({
   executedRules,
   message,
-  setInput,
   isMessageLoading,
 }: {
   executedRules: GetExecutedRulesResponse["results"][number]["executedRules"];
   message?: ParsedMessage;
-  setInput: (input: string) => void;
   isMessageLoading: boolean;
 }) {
   return (
@@ -200,7 +195,7 @@ function RuleCell({
         <ResultsDisplay results={executedRules} />
       </div>
       {message ? (
-        <FixWithChat message={message} results={executedRules} />
+        <FixRule message={message} results={executedRules} />
       ) : isMessageLoading ? (
         <Skeleton className="h-9 w-16" />
       ) : (
