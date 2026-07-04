@@ -119,3 +119,7 @@ eval-results/
 
 # Local Claude Code instructions (machine-specific)
 CLAUDE.local.md
+
+# Playwright MCP scratch output and local screenshots
+.playwright-mcp/
+indicator-running.png
