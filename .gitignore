@@ -116,3 +116,6 @@ eval-results/
 .agent-worktrees/
 .context/
 .deepsec/
+
+# Local Claude Code instructions (machine-specific)
+CLAUDE.local.md
